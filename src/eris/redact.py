@@ -32,6 +32,7 @@ from typing import Any
 
 MIN_EXACT_VALUE_LEN = 8
 MIN_B64_RUN = 32
+Span = tuple[int, int, str]
 
 
 @dataclass(frozen=True)
@@ -82,10 +83,13 @@ _ANSI_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC
     r"|\x1b[PX^_][^\x1b]*\x1b\\"  # DCS/SOS/PM/APC
+    r"|\x1b[ -/]+[0-~]"  # nF sequences, e.g. charset designation ESC ( B
     r"|\x1b[@-Z\\-_]"  # other two-byte ESC sequences
     r"|[\x80-\x9f]"  # C1 controls
 )
-_FOLD_RE = re.compile(r"[\r\n]+[ \t]*")
+# A fold is exactly ONE line break (+ continuation indentation). A blank line
+# ends a wrapped token, so text after it is never joined.
+_FOLD_RE = re.compile(r"(?<![\r\n])(?:\r\n|\n|\r)(?![\r\n])[ \t]*")
 _B64_RE = re.compile(r"[A-Za-z0-9+/_-]{%d,}={0,2}" % MIN_B64_RUN)
 
 
@@ -182,8 +186,13 @@ class RedactResult:
 
 
 class Redactor:
-    """Pattern + exact-value redactor. Instances are reusable and stateless
-    across calls except for nothing: ordinals restart per call."""
+    """Pattern + exact-value redactor. Reusable; ordinals restart per call.
+
+    Two matching passes: the original text, then the folded view where only
+    matches that actually CROSS a removed line break are accepted (trimmed
+    back to the last fold boundary at which the candidate still fully
+    matches, so a secret at end-of-line does not swallow the next line).
+    """
 
     def __init__(self, exact_values: Iterable[str] = ()) -> None:
         self._exact = tuple(v for v in exact_values if len(v) >= MIN_EXACT_VALUE_LEN)
@@ -193,60 +202,128 @@ class Redactor:
     def exact_value_count(self) -> int:
         return len(self._exact)
 
-    def _spans(self, folded: str) -> list[tuple[int, int, str]]:
-        spans: list[tuple[int, int, str]] = []
-        for m in self._rx.finditer(folded):
+    # -- pattern spans -----------------------------------------------------
+
+    def _direct_spans(self, text: str) -> list[Span]:
+        spans: list[Span] = []
+        for m in self._rx.finditer(text):
             pid = _match_id(m)
             group = _GROUP_FOR[pid]
             spans.append((m.start(group), m.end(group), pid))
         return spans
 
-    def _b64_spans(self, folded: str) -> list[tuple[int, int, str]]:
-        spans: list[tuple[int, int, str]] = []
-        for m in _B64_RE.finditer(folded):
-            run = m.group(0)
-            decoded = _try_b64(run)
-            if decoded is None:
-                continue
-            inner = self._rx.search(decoded)
-            if inner is None:
-                continue
-            spans.append((m.start(), m.end(), "b64_" + _match_id(inner)))
+    def _folded_spans(self, folded: str, anchors: list[tuple[int, int]]) -> list[Span]:
+        fold_points = [f for f, _ in anchors[1:]]
+        spans: list[Span] = []
+        for m in self._rx.finditer(folded):
+            s, e = m.start(), m.end()
+            lo = bisect_right(fold_points, s)
+            hi = bisect_right(fold_points, e - 1)
+            inner = fold_points[lo:hi]
+            if not inner:
+                continue  # does not cross a line break: the direct pass owns it
+            pid = _match_id(m)
+            chosen = m
+            for cut in reversed(inner):
+                cand = self._rx.fullmatch(folded, s, cut)
+                if cand is not None and _match_id(cand) == pid:
+                    chosen = cand
+                    break
+            group = _GROUP_FOR[pid]
+            fs, fe = chosen.start(group), chosen.end(group)
+            spans.append(
+                (_to_original(anchors, fs, end=False), _to_original(anchors, fe, end=True), pid)
+            )
         return spans
+
+    # -- base64 spans ------------------------------------------------------
+
+    def _b64_hit(self, run: str) -> str | None:
+        decoded = _try_b64(run)
+        if decoded is None:
+            return None
+        inner = self._rx.search(decoded)
+        return None if inner is None else "b64_" + _match_id(inner)
+
+    def _direct_b64_spans(self, text: str) -> list[Span]:
+        spans: list[Span] = []
+        for m in _B64_RE.finditer(text):
+            pid = self._b64_hit(m.group(0))
+            if pid is not None:
+                spans.append((m.start(), m.end(), pid))
+        return spans
+
+    def _folded_b64_spans(self, folded: str, anchors: list[tuple[int, int]]) -> list[Span]:
+        fold_points = [f for f, _ in anchors[1:]]
+        spans: list[Span] = []
+        for m in _B64_RE.finditer(folded):
+            s, e = m.start(), m.end()
+            inner = fold_points[bisect_right(fold_points, s) : bisect_right(fold_points, e - 1)]
+            if not inner:
+                continue
+            for cut in (e, *reversed(inner)):
+                pid = self._b64_hit(folded[s:cut])
+                if pid is not None:
+                    spans.append(
+                        (
+                            _to_original(anchors, s, end=False),
+                            _to_original(anchors, cut, end=True),
+                            pid,
+                        )
+                    )
+                    break
+        return spans
+
+    # -- assembly ----------------------------------------------------------
 
     def redact(self, data: str | bytes) -> RedactResult:
         text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
         text = strip_ansi(text)
+        direct = self._direct_spans(text) + self._direct_b64_spans(text)
         folded, anchors = _fold(text)
-        spans = self._spans(folded) + self._b64_spans(folded)
-        if not spans:
+        crossing: list[Span] = []
+        if len(anchors) > 1:
+            crossing = self._folded_spans(folded, anchors) + self._folded_b64_spans(folded, anchors)
+        accepted = _merge_spans(direct, crossing)
+        if not accepted:
             return RedactResult(text, {})
-        spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
-        merged: list[tuple[int, int, str]] = []
-        cursor = -1
-        for start, end, pid in spans:
-            if start < cursor:
-                continue  # overlaps an earlier (longer) span
-            merged.append((start, end, pid))
-            cursor = end
         out: list[str] = []
         counts: dict[str, int] = {}
         pos = 0
-        for start, end, pid in merged:
-            o_start = _to_original(anchors, start, end=False)
-            o_end = _to_original(anchors, end, end=True)
-            if o_start < pos:
-                continue
+        for start, end, pid in accepted:
             counts[pid] = counts.get(pid, 0) + 1
-            out.append(text[pos:o_start])
+            out.append(text[pos:start])
             out.append(f"[REDACTED:{pid}#{counts[pid]}]")
-            pos = o_end
+            pos = end
         out.append(text[pos:])
         return RedactResult("".join(out), counts)
 
     def redact_bytes(self, data: bytes) -> tuple[bytes, dict[str, int]]:
         result = self.redact(data)
         return result.text.encode("utf-8"), result.counts
+
+
+def _merge_spans(direct: list[Span], crossing: list[Span]) -> list[Span]:
+    """Non-overlapping spans. Direct (unfolded) matches have priority; a
+    line-crossing match is kept only where it overlaps no direct match."""
+    accepted: list[Span] = []
+    cursor = -1
+    for span in sorted(direct, key=lambda sp: (sp[0], -(sp[1] - sp[0]))):
+        if span[0] >= cursor:
+            accepted.append(span)
+            cursor = span[1]
+    starts = [sp[0] for sp in accepted]
+    extra: list[Span] = []
+    for span in sorted(crossing, key=lambda sp: (sp[0], -(sp[1] - sp[0]))):
+        i = bisect_right(starts, span[0])
+        if i > 0 and accepted[i - 1][1] > span[0]:
+            continue  # overlaps the direct span before it
+        if i < len(accepted) and accepted[i][0] < span[1]:
+            continue  # overlaps the direct span after it
+        if extra and extra[-1][1] > span[0]:
+            continue
+        extra.append(span)
+    return sorted(accepted + extra, key=lambda sp: sp[0])
 
 
 def _try_b64(run: str) -> str | None:
