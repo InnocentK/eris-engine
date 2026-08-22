@@ -1,0 +1,89 @@
+# Security model (Milestone 1)
+
+Single-user, self-hosted. The threat model is accidental: a worker CLI that
+reads or writes where it should not, a secret that reaches the ledger, a
+repository that injects instructions, a model-proposed command that executes.
+Adversarial repositories are OUT of scope until containers (Phase 3).
+
+## Boundaries that code enforces
+
+### Worker processes (`launch.py`)
+* Read-only flags per CLI, verified by experiment on 2026-08-21
+  (`tests/fixtures/envelopes/*/*.meta.json`): claude `--safe-mode
+  --permission-mode plan --tools <list>`; codex `exec -s read-only --ephemeral
+  --ignore-user-config --ignore-rules -c project_doc_max_bytes=0`; grok
+  `--permission-mode plan --disable-web-search`; gemini `--approval-mode plan`
+  (UNVERIFIED: the CLI was unusable here).
+* `--bare`, `bypassPermissions`, `workspace-write`, `danger-full-access`,
+  `yolo`, `--dangerously-skip-permissions`, `--full-auto`, `acceptEdits`,
+  `--skip-trust`, `--allow-all` are refused anywhere in argv, case-insensitive.
+* Env built from `{}`. NEVER list: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+  `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`, `PYTEST_ADDOPTS`,
+  `PYTEST_PLUGINS`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `NODE_OPTIONS`,
+  `NODE_PATH`, `PERL5OPT`, `BASH_ENV`, `ENV`, `ZDOTDIR`,
+  `GEMINI_CLI_TRUST_WORKSPACE`, `EDITOR`, `VISUAL`, and prefixes `LD_`,
+  `DYLD_`, `GIT_`, `AWS_`, `PYTEST_`, `CODEX_SANDBOX`. The only `GIT_*`
+  allowed are Eris's own four hardening values.
+* Pinned executable path + sha256 checked immediately before spawn; a changed
+  binary is refused. Pins are machine-specific (`policies/pins.yaml`).
+* `stdin=DEVNULL`, `shell=False`, `start_new_session=True`, stdout and stderr
+  byte caps drained concurrently, SIGTERM then SIGKILL to the process group.
+* A worker's prompt may not start with `-`.
+
+### Secrets (`redact.py`, `writer.py`, `policy.py`, `doctor.py`)
+* Secrets live only in `.env`. A secret-shaped value in any policy or pins
+  YAML refuses the load.
+* The writer redacts BEFORE hashing. Pattern set: Anthropic, OpenAI, xAI,
+  Google, AWS access key id, GitHub, Slack, JWT, PEM private key blocks,
+  `Bearer` tokens, URL userinfo, `key/secret/token/password = value`
+  assignments, plus exact values from `.env` and the declared credential
+  files (held in memory only). ANSI/C1 stripped first; line-wrapped tokens
+  folded; base64 runs >= 32 decoded and re-matched.
+* Placeholders are `[REDACTED:<pattern_id>#<ordinal>]` - no hash, no prefix,
+  no length of the secret.
+* `eris doctor` prints key NAMES only.
+
+Known limits of the redactor (documented, tested):
+* A wrapped secret immediately followed by an alphanumeric line is
+  indistinguishable from a longer secret; the following word is swallowed
+  (over-redaction). A blank line ends a wrapped token.
+* Whole-buffer semantics: `StreamRedactor` buffers until `flush`. Output size
+  is bounded by the launcher caps.
+* Patterns are shapes, not knowledge: an unusual secret with no recognisable
+  prefix that is not in `.env` or a credential file will not be caught.
+* Throughput is roughly 3 MB/s (50 MB in ~16 s on this machine).
+
+### Mechanical verification (`verify.py`)
+Allowlist, not denylist: unknown flags are refused. Executable realpath +
+sha256 pinned; subcommand lists; literal flags; `flag value` / `flag=value`
+regexes; positional paths must realpath-resolve inside the snapshot and never
+into `.git/`; response files, `-`, control characters refused. A per-tool
+hard deny list (git `-c`/`-C`/`--exec-path`/`--git-dir`/`--work-tree`/
+`--ext-diff`/`--textconv`/`-O`/`--output`; pytest `-c`/`-p <plugin>`/`-o`/
+`--rootdir`/`--import-mode`/`--basetemp`/`--pdb*`/`--junit-xml`/`--cov*`;
+ruff `--config`/`--fix*`/`--add-noqa`; mypy `--config-file`/`--plugins`/
+`--install-types`/`-c`/`-p`/`-m`/report flags) applies even if a policy
+allowlists them. `pytest` executes repository code (conftest.py) and is
+refused unless the policy is `trusted: true`.
+
+### Snapshots (`snapshot.py`)
+History-truncated clones: `--no-local --depth N --single-branch`, origin
+removed, `FETCH_HEAD`/`ORIG_HEAD`/hooks removed, no alternates. The verifier
+proves every future commit fails `git cat-file -e`.
+
+### Ledger (`writer.py`)
+One writer per run (`flock`), temp+fsync+rename for blobs and manifest,
+append+fsync for events, hash chain, torn-tail truncation only on explicit
+resume, malformed middle line = INVALID. Failures raise.
+
+## Residual risks (UNKNOWN / not enforced)
+* Whether a worker can READ outside the snapshot (answer keys, the Athena
+  tree, vendor memory stores) is UNKNOWN - a canary-read smoke test is
+  required before corpus runs (`docs/EVAL-PLAN.md`).
+* Worker CLIs run on the host with the user's OAuth state (`HOME` is passed).
+  Relocating with `CLAUDE_CONFIG_DIR`/`CODEX_HOME` may break auth: UNKNOWN.
+* `pytest` verification on trusted repos runs that repo's code as the user.
+* Supply chain: exact pins, `pip-audit` blocking in CI. Vendor CLI binaries
+  are pinned by sha256 but the CLIs themselves can auto-update outside Eris;
+  the doctor reports a changed hash as FAIL.
+* macOS `flock` is advisory.
