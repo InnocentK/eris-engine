@@ -1,0 +1,28 @@
+{
+  "cli": "claude",
+  "version": "2.1.239",
+  "experiment": "E9",
+  "argv": [
+    "claude",
+    "-p",
+    "Answer with answer=ok and n=7",
+    "--safe-mode",
+    "--permission-mode",
+    "plan",
+    "--tools",
+    "",
+    "--no-session-persistence",
+    "--output-format",
+    "json",
+    "--json-schema",
+    "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"}},\"required\":[\"answer\",\"n\"]}",
+    "--max-budget-usd",
+    "0.50"
+  ],
+  "argv_source": "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "E9. Inline --json-schema confirmed for claude 2.1.239: structured_output object, result is the JSON text, stop_reason tool_use, 2 turns, two models in modelUsage (haiku helper + primary)."
+}

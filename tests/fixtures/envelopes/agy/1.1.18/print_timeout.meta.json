@@ -1,0 +1,26 @@
+{
+  "cli": "agy",
+  "version": "1.1.18",
+  "experiment": "A7",
+  "argv": [
+    "agy",
+    "-p",
+    "Reply with exactly the single word: ok",
+    "--model",
+    "gemini-3.1-pro-high",
+    "--mode",
+    "plan",
+    "--sandbox",
+    "--output-format",
+    "json",
+    "--disable-slash-commands",
+    "--print-timeout",
+    "5s"
+  ],
+  "argv_source": "reconstructed by the synthesizer from the experiment script; not mechanically captured",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "A7 (WITHOUT --add-dir; predates the workspace flag). agy's own --print-timeout 5s fired: status ERROR, error 'timeout waiting for response', rc 1, zero usage, still a parseable envelope. Eris derives --print-timeout as max(30, timeout_s-30)s so this path, not the process-group kill, is the usual timeout outcome."
+}

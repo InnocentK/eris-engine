@@ -1,0 +1,26 @@
+{
+  "cli": "claude",
+  "version": "2.1.239",
+  "experiment": "E8b",
+  "argv": [
+    "claude",
+    "-p",
+    "Reply with exactly the single word: ok",
+    "--safe-mode",
+    "--permission-mode",
+    "plan",
+    "--tools",
+    "",
+    "--no-session-persistence",
+    "--output-format",
+    "json",
+    "--max-budget-usd",
+    "0.50"
+  ],
+  "argv_source": "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "E8b. --tools \"\" with a pure-text prompt: result ok, 1 turn, $0.04. (E8: the same flags with a prompt that NEEDS a tool hung 240 s with empty stdout - no fixture possible.)"
+}

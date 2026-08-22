@@ -13,6 +13,7 @@ from eris.schemas import (
     Adjudication,
     Claim,
     Event,
+    Invocation,
     Origin,
     Record,
     Task,
@@ -185,6 +186,81 @@ def test_committed_goldens_are_immutable() -> None:
 def test_current_schema_version_has_a_manifest_entry() -> None:
     assert SCHEMA_VERSION in _manifest()
     assert sorted(_manifest()[SCHEMA_VERSION]) == sorted(f"{n}.json" for n in example_records())
+
+
+# sha256 of the canonical JSON of EVERY committed manifest block, including
+# the current version: committed = immutable. These pin the manifest entries
+# themselves so that editing a golden together with its manifest line is
+# still caught. The next serialization change goes to a NEW version (0.1.3)
+# with a new line here; an existing line is never edited.
+PINNED_MANIFEST_BLOCKS = {
+    "0.1.0": "46df57acc986804a99037db9fb21e8070e4c7944a31cf21e88d90752fb3b5c0c",
+    "0.1.1": "715e86bccfd674c7743c4e722bdd3f5081060002608a312cc0314b8a154c464e",
+    "0.1.2": "290f7f1c9e253dec5d619ddd4dfa20c9a8acb17bc411f270509a521847c661da",
+}
+
+
+def _assert_goldens_pinned(root: Path, manifest: dict[str, dict[str, str]]) -> None:
+    import hashlib
+
+    for version, expected in PINNED_MANIFEST_BLOCKS.items():
+        block = json.dumps(manifest[version], sort_keys=True, separators=(",", ":")).encode()
+        assert hashlib.sha256(block).hexdigest() == expected, f"manifest block {version} edited"
+        for name, digest in manifest[version].items():
+            on_disk = hashlib.sha256((root / version / name).read_bytes()).hexdigest()
+            assert on_disk == digest, f"{version}/{name} edited"
+
+
+def test_committed_goldens_are_byte_identical_to_their_pinned_manifest() -> None:
+    """Every committed version (0.1.0, 0.1.1 AND the current 0.1.2) must
+    never change: its manifest block hashes to the value pinned here, and
+    every file on disk still hashes to its manifest line."""
+    _assert_goldens_pinned(RECORDS_ROOT, _manifest())
+    assert SCHEMA_VERSION in PINNED_MANIFEST_BLOCKS  # the current version is pinned too
+    assert set(PINNED_MANIFEST_BLOCKS) == set(_manifest())  # nothing committed is unpinned
+
+
+def test_editing_a_current_golden_or_its_manifest_line_fails_without_a_bump(
+    tmp_path: Path,
+) -> None:
+    """Simulated tamper on a copy: flipping a byte in a 0.1.2 golden fails; so
+    does 'fixing' its manifest line to match (the block hash is pinned)."""
+    import hashlib
+    import shutil
+
+    copy = tmp_path / "records"
+    shutil.copytree(RECORDS_ROOT, copy)
+    manifest = json.loads((copy / "MANIFEST.json").read_text())
+    _assert_goldens_pinned(copy, manifest)  # the copy is faithful
+    target = copy / SCHEMA_VERSION / "task.json"
+    target.write_bytes(target.read_bytes().replace(b"t_01", b"t_02"))
+    with pytest.raises(AssertionError, match=f"{SCHEMA_VERSION}/task.json edited"):
+        _assert_goldens_pinned(copy, manifest)
+    manifest[SCHEMA_VERSION]["task.json"] = hashlib.sha256(target.read_bytes()).hexdigest()
+    with pytest.raises(AssertionError, match=f"manifest block {SCHEMA_VERSION} edited"):
+        _assert_goldens_pinned(copy, manifest)
+
+
+def test_invocation_0_1_2_fields() -> None:
+    """0.1.2 added ``conversation_id`` and ``worker_reported_duration_ms``
+    (both optional, default None). The 0.1.2 golden exercises them; the 0.1.1
+    golden has no such keys (the serialization changed, hence the bump)."""
+    inv = example_records()["invocation"]
+    data = json.loads(canonical_bytes(inv))
+    assert data["conversation_id"] == "ed889929-a04c-457f-91d1-194be848aa04"
+    assert data["worker_reported_duration_ms"] == 2646 and data["duration_ms"] == 300250
+    old = json.loads((RECORDS_ROOT / "0.1.1" / "invocation.json").read_bytes())
+    assert "conversation_id" not in old and "worker_reported_duration_ms" not in old
+    bare = Invocation.model_validate(
+        {
+            k: v
+            for k, v in data.items()
+            if k not in ("conversation_id", "worker_reported_duration_ms")
+        }
+    )
+    assert bare.conversation_id is None and bare.worker_reported_duration_ms is None
+    with pytest.raises(ValidationError):
+        Invocation.model_validate({**data, "worker_reported_duration_ms": -1})
 
 
 def test_old_schema_versions_are_rejected_on_parse() -> None:

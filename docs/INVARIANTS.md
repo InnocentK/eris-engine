@@ -12,6 +12,13 @@ CHANGELOG entry.
 | Sockets cannot connect, bind or resolve; httpx is blocked | `test_hermeticity.py::test_sockets_cannot_connect_or_resolve`, `::test_httpx_is_blocked_at_the_socket` |
 | `real_subprocess` releases only `sys.executable`/`sleep` (+ explicit `allow`); never `shell=True` | `test_hermeticity.py::test_marker_releases_only_sys_executable_and_sleep`, `::test_marker_allow_extends_the_list` |
 | Production code resolves `shutil.which` at call time, never as a default argument | `test_hermeticity.py::test_guard_reaches_call_time_which_lookups` |
+| `agy` is a guarded worker binary (`gemini` stays in the set) | `test_hermeticity.py::test_agy_is_a_guarded_worker_binary` |
+
+## Fixtures (`tests/fixtures/`)
+| Rule | Test |
+|---|---|
+| No file under `tests/fixtures` (name or body) contains a user path: any `/Users/<name>` or `/home/<name>` with `<name>` not a placeholder (`USER`/`user`), or any `/private/tmp/claude-*/-Users-*` session path, fails (portable pattern scan; no username literal in the repository); the `/Users/USER` and `/private/tmp/OUTSIDE` placeholders are present. Additional local check: the account running the suite is absent too (skipped when it cannot be determined) | `test_fixtures.py::test_no_fixture_contains_a_user_path`, `::test_no_fixture_contains_the_local_user` |
+| Every captured envelope has a `.meta.json` sidecar whose argv is either mechanically recorded by the battery script or explicitly labelled `argv_source: reconstructed by the synthesizer …; not mechanically captured` (A7/A8/A10b/A14/A15/A16 are reconstructed); agy sidecars list flags in the canonical builder order and say when a run had no `--add-dir` | `test_fixtures.py::test_every_capture_has_a_meta_sidecar_with_argv`, `::test_agy_sidecars_state_the_canonical_argv_order` |
 
 Exception (stated in AGENTS.md as well): the marker accepts `allow=["git"]`
 and its single call site is `test_snapshot.py::test_snapshot_has_no_future`
@@ -24,6 +31,8 @@ the allow list is honoured). No other test may spawn `git`.
 | Canonical bytes of every record type are pinned per `SCHEMA_VERSION` | `test_schemas.py::test_golden_bytes_pinned`, `::test_every_record_type_has_a_golden_file` |
 | Committed goldens are IMMUTABLE (`tests/fixtures/records/MANIFEST.json` pins every file of every version); any serialization change = new `SCHEMA_VERSION` dir + manifest entry, and bump `eris.version` + CHANGELOG in the same commit | `test_schemas.py::test_committed_goldens_are_immutable`, `::test_current_schema_version_has_a_manifest_entry` |
 | Records from any other `schema_version` are refused at parse time (no 0.x migrations) | `test_schemas.py::test_old_schema_versions_are_rejected_on_parse` |
+| EVERY committed golden directory (0.1.0, 0.1.1 and the current 0.1.2) AND its manifest block are byte-identical to what was committed (block hashes pinned as constants in the test; committed = immutable; the next serialization change goes to 0.1.3 with a new constant). Editing a current golden, or its manifest line to match, fails | `test_schemas.py::test_committed_goldens_are_byte_identical_to_their_pinned_manifest`, `::test_editing_a_current_golden_or_its_manifest_line_fails_without_a_bump` |
+| 0.1.2: `Invocation.conversation_id` / `worker_reported_duration_ms` are optional (default None, `>= 0`); `duration_ms` stays Eris's clock figure | `test_schemas.py::test_invocation_0_1_2_fields`, `test_launch.py::test_run_worker_agy_success_threads_conversation_and_duration`, `test_run_hermetic.py::test_invoke_agy_persists_conversation_id_and_worker_duration` |
 | Every record carries `origin` and `schema_version`; extras forbidden; frozen | `test_schemas.py::test_every_record_carries_origin_and_schema_version`, `::test_extra_fields_are_forbidden`, `::test_records_are_frozen`, `::test_record_base_requires_origin` |
 | Timestamps are RFC 3339 `Z`; NaN refused | `test_schemas.py::test_timestamps_must_be_rfc3339_z`, `::test_canonical_bytes_refuse_nan` |
 | `dissent`/`residual_risks` are required keys but may be empty | `test_schemas.py::test_adjudication_allows_empty_dissent_and_risks` |
@@ -44,9 +53,12 @@ the allow list is honoured). No other test may spawn `git`.
 | Rule | Test |
 |---|---|
 | `executable_sha256`, `timeout_s`, `max_stdout_bytes`, `vendors_allowed` required; unknown keys refused | `test_policy.py::test_missing_required_worker_field_refuses`, `::test_missing_vendors_allowed_refuses`, `::test_unknown_key_refuses` |
+| `timeout_s` (strict int in `[1, 86400]`), `max_stdout_bytes`, `max_stderr_bytes` (strict ints `> 0`): no `"60"`/`60.0`/`true` coercion | `test_policy.py::test_worker_int_limits_are_strict` |
 | `trusted` defaults to False | `test_policy.py::test_repo_default_policy_loads_and_is_untrusted_and_unpinned` |
 | Secret-shaped value in policy or pins refuses the load | `test_policy.py::test_secret_shaped_value_refuses_load`, `::test_secret_in_pins_file_refuses` |
 | API hosts allowlisted; https only except loopback | `test_policy.py::test_api_worker_host_and_scheme_rules` |
+| `CliName` is claude/codex/agy/grok: `cli: gemini` is refused | `test_policy.py::test_gemini_cli_is_no_longer_a_valid_cli_name`, `test_no_gemini.py::test_no_gemini_builder_parser_or_cli_name` |
+| Lineage guard (SYNTACTIC only): an `agy` worker must declare a model matching `^gemini-\S+$` — bare `gemini-`, ` gemini-x`, `GEMINI-x`, `xgemini-y`, `""`, None refused (agy also serves other vendors' ids and may silently default; the executed model is unobservable); the repo policy's agy entry is google / gemini-* / `AGY_CLI_DISABLE_AUTO_UPDATE` and declares `~/.gemini/antigravity-cli/settings.json` | `test_policy.py::test_agy_lineage_guard_refuses_non_gemini_models`, `::test_agy_lineage_guard_accepts_gemini_ids`, `::test_agy_loads_with_a_gemini_model`, `::test_repo_default_policy_agy_entry` |
 | Provider must be in `vendors_allowed` | `test_policy.py::test_provider_not_in_vendors_refuses` |
 | `eris policy pin` uses only `which` + hashlib; missing executable is a recorded absence | `test_policy.py::test_pin_executables_hermetic`, `::test_pin_missing_executable_is_recorded_absence` |
 
@@ -76,8 +88,18 @@ the allow list is honoured). No other test may spawn `git`.
 ## Launcher (`src/eris/launch.py`)
 | Rule | Test |
 |---|---|
-| argv per CLI exactly as specified | `test_launch.py::test_claude_argv_exactly_as_specified`, `::test_codex_argv_exactly_as_specified`, `::test_gemini_and_grok_argv_exactly_as_specified` |
-| Forbidden tokens refused in every argv element EXCEPT the prompt (which may quote them); prompts starting with `-` refused | `test_launch.py::test_forbidden_tokens_are_refused_outside_the_prompt`, `::test_argv_hygiene` |
+| argv per CLI exactly as specified | `test_launch.py::test_claude_argv_exactly_as_specified`, `::test_codex_argv_exactly_as_specified`, `::test_agy_argv_exactly_as_specified`, `::test_grok_argv_exactly_as_specified` |
+| The agy builder never emits `-c`, `--continue`, `--conversation`, accept-edits or `--dangerously-skip-permissions` (exact-element check; `-c` is deliberately not a substring token) | `test_launch.py::test_agy_argv_never_contains_continue_or_edit_flags` |
+| agy `--add-dir` is REQUIRED, appears exactly once (outside the prompt) and equals the spawn cwd's realpath (A14: no workspace → agy cannot read its own cwd; A16: with it, reads outside are denied); `plan_call` re-checks element by element and refuses a second, missing or different workspace; the harness records the same path on the Invocation | `test_launch.py::test_agy_add_dir_is_the_workspace_realpath_exactly_once`, `::test_plan_call_agy_refuses_a_tampered_workspace`, `::test_plan_call_per_cli`, `::test_run_worker_agy_success_threads_conversation_and_duration`, `test_run_hermetic.py::test_invoke_agy_persists_conversation_id_and_worker_duration` |
+| The `--add-dir` battery fixtures parse (A14 denied inside without workspace; A15 SUCCESS with the injected `MANGO KIWI` prefix on record; A16 denied outside with workspace, no canary) | `test_launch.py::test_parse_agy_add_dir_battery_fixtures` |
+| agy `--print-timeout` = `timeout_s - 30` above 60 s else `max(1, timeout_s // 2)`, ALWAYS strictly below `timeout_s` (boundary values 1, 2, 30, 31, 60, 61, 86400); `timeout_s < 2` is refused for agy; rendered `<N>s` after `--disable-slash-commands` (canonical order: `-p … --model … --mode plan --sandbox --add-dir … --output-format json --disable-slash-commands --print-timeout Ns [--json-schema …]`) | `test_launch.py::test_agy_print_timeout_derivation`, `::test_agy_print_timeout_is_strictly_before_eris_timeout`, `::test_run_worker_agy_refuses_one_second_timeout`, `::test_plan_call_agy_print_timeout_tracks_policy_timeout`, `::test_agy_argv_exactly_as_specified` |
+| `worker_reported_duration_ms` accepts only finite `duration_seconds` in `[0, 1e7]` (Infinity/NaN/1e309/huge ints/negatives/strings → None, never an exception); a parser exception is contained in `_execute` → FAILED `<cli>: parser failure: …` (`run_worker` never raises) | `test_launch.py::test_parse_agy_duration_is_contained`, `::test_run_worker_never_raises_on_a_parser_bug` |
+| Forbidden tokens (incl. the agy additions) refused in every argv element EXCEPT the prompt (which may quote them); prompts starting with `-` refused | `test_launch.py::test_forbidden_tokens_are_refused_outside_the_prompt`, `::test_argv_hygiene` |
+| NEVER list includes the Google/Antigravity credential names and the `ANTIGRAVITY_` prefix; `AGY_` is not blanket-banned; agy's env carries `AGY_CLI_DISABLE_AUTO_UPDATE=1` | `test_launch.py::test_never_list_names_are_refused`, `::test_agy_env_disables_auto_update_and_agy_prefix_is_not_banned` |
+| `parse_agy` matches every captured agy 1.1.18 fixture: `status != SUCCESS` → `is_error` with `agy: <error>`, usage RETAINED on error, empty response → `text None`, `structured_output` preferred (any shape, extra keys kept), no model id / cost, `conversation_id` + `duration_seconds` captured | `test_launch.py::test_parse_agy_plain_fixture`, `::test_parse_agy_schema_fixture_structured_output_is_exact`, `::test_parse_agy_error_fixtures_retain_usage`, `::test_parse_agy_auth_failed_has_no_conversation`, `::test_parse_agy_bad_shapes`, `::test_parse_agy_structured_output_any_shape_and_extra_keys`, `::test_parse_agy_strips_ansi` |
+| `run_worker` reports an agy `status ERROR` envelope as FAILED even with exit code 0; agy's own print-timeout envelope is FAILED (not TIMEOUT) with zero usage retained; an Eris timeout is TIMEOUT with `usage None` | `test_launch.py::test_run_worker_agy_status_error_is_failed_even_with_exit_code_zero`, `::test_run_worker_agy_print_timeout_envelope_is_failed_with_zero_usage`, `::test_run_worker_agy_eris_timeout_has_no_usage` |
+| `parse_grok` prefers `structuredOutput` (camelCase) over parsing `text`; claude schema / no-tools fixtures parse | `test_launch.py::test_parse_grok_schema_fixture_prefers_structured_output`, `::test_parse_claude_schema_and_notools_fixtures` |
+| `PARSERS` covers exactly the `CliName` set | `test_launch.py::test_parsers_table_matches_cli_names` |
 | `model_executed` is None unless `modelUsage` names exactly one model; all names in `models_used` | `test_launch.py::test_parse_claude_safemode_two_models_means_unknown_model` |
 | The pinned path is resolved to its realpath, the realpath is hashed and is what goes in argv[0]; symlink to another file or retargeted symlink is refused | `test_launch.py::test_preflight_hashes_and_executes_the_realpath` |
 | Codex `-o` output is read into memory and deleted; no raw output file or schema remains on disk after `run_worker` (also on spawn failure) | `test_launch.py::test_run_worker_codex_output_file_never_stays_on_disk`, `::test_run_worker_codex_scratch_removed_even_on_spawn_failure` |
@@ -92,9 +114,10 @@ the allow list is honoured). No other test may spawn `git`.
 | stdout AND stderr caps | `test_launch.py::test_spawn_caps_stdout_and_stderr`, `::test_real_caps_and_stdin_devnull` |
 | Timeout: SIGTERM to the group, then ALWAYS a SIGKILL sweep of the group (members may ignore TERM or outlive the leader) | `test_launch.py::test_timeout_kills_process_group_sigterm_then_reaps`, `::test_timeout_escalates_to_sigkill`, `::test_timeout_process_already_gone`, `::test_real_process_group_kill_reaches_grandchildren`, `::test_real_group_kill_sweeps_members_that_ignore_sigterm` |
 | Pinned executable sha256 checked before spawn | `test_launch.py::test_preflight_executable`, `::test_run_worker_absences_are_statuses_not_exceptions` |
-| Envelope parsers match the captured fixtures; claude `is_error` before shape; codex `model_executed=None` | `test_launch.py::test_parse_claude_*`, `::test_parse_codex_*`, `::test_parse_grok_*`, `::test_parse_gemini_defensive_modes` |
+| Envelope parsers match the captured fixtures; claude `is_error` before shape; codex and agy `model_executed=None` | `test_launch.py::test_parse_claude_*`, `::test_parse_codex_*`, `::test_parse_grok_*`, `::test_parse_agy_*` |
 | `run_worker` never raises; absence is a status | `test_launch.py::test_run_worker_absences_are_statuses_not_exceptions`, `::test_run_worker_failures` |
 | Idempotency key excludes arm, includes repeat_index | `test_launch.py::test_idempotency_key_excludes_arm_includes_repeat` |
+| No gemini builder, parser, CLI name or literal remains under `src/eris` (allowed: NEVER-list env names containing GEMINI, `~/.gemini/` paths, the `"gemini-"` model prefix of the lineage guard) | `test_no_gemini.py::test_no_gemini_literal_in_source`, `::test_no_gemini_builder_parser_or_cli_name`, `::test_the_allowed_gemini_occurrences_are_the_only_ones` |
 
 ## Verification allowlist (`src/eris/verify.py`)
 | Rule | Test |
@@ -123,6 +146,7 @@ the allow list is honoured). No other test may spawn `git`.
 | Missing worker is WARN; changed binary is FAIL | `test_doctor.py::test_missing_worker_is_warn_not_fail`, `::test_changed_binary_is_fail` |
 | `--probe` never executes an unpinned or hash-mismatched binary; probe output is passed through the redactor before printing | `test_doctor.py::test_probe_output_is_redacted_and_mismatched_binary_is_never_probed` |
 | After a credential-file parse failure NO worker is probed (the redactor would lack those values) | `test_doctor.py::test_probe_skipped_entirely_on_credential_parse_failure` |
+| The doctor reports the size of agy's `~/.gemini/antigravity-cli/{brain,conversations}` (byte counts only, never file names or content; WARN ≥ 256 MiB); Eris never deletes vendor state | `test_doctor.py::test_agy_state_dir_size_is_reported_and_warns_when_large` |
 | A declared credential file that is missing is WARN; one that exists but cannot be parsed is FAIL (doctor) / refuses the run (harness) | `test_doctor.py::test_unparsable_credential_file_is_fail_missing_is_warn`, `test_redact.py::test_load_credential_values_from_json_files`, `test_run_hermetic.py::test_invoke_refuses_unparsable_credential_file` |
 | Run ids match `^[A-Za-z0-9_-]{1,64}$` and are validated BEFORE any path is built; the run dir must sit directly under the runs dir | `test_run_hermetic.py::test_invoke_refuses_unsafe_run_ids_before_touching_disk`, `::test_run_id_helpers` |
 | flock probe | `test_doctor.py::test_doctor_never_prints_secret_values`, `::test_flock_probe_failure_is_fail` |

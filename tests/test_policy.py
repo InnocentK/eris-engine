@@ -54,12 +54,115 @@ def test_repo_default_policy_loads_and_is_untrusted_and_unpinned() -> None:
     loaded = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml"))
     pol = loaded.policy
     assert pol.trusted is False
-    assert set(pol.workers) == {"claude", "codex", "grok", "gemini", "openai-api"}
+    assert set(pol.workers) == {"claude", "codex", "grok", "agy", "openai-api"}
     assert all(not w.pinned for w in pol.workers.values())
     assert loaded.sha256 == hashlib.sha256(REPO_POLICY.read_bytes()).hexdigest()
     assert loaded.pins_sha256 is None
     assert pol.verify.commands["pytest"].requires_trusted is True
     assert "--bare" not in str(pol.workers["claude"])
+
+
+def test_repo_default_policy_agy_entry() -> None:
+    """The Google lineage is Antigravity `agy` (the `gemini` CLI is gone):
+    provider google, a gemini-* model, the auto-update opt-out env, and the
+    agy settings file among the credential files."""
+    pol = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml")).policy
+    agy = pol.workers["agy"]
+    assert agy.cli == "agy" and agy.provider == "google"
+    assert agy.model is not None and agy.model.startswith("gemini-")
+    assert agy.env == {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"} and agy.timeout_s == 600
+    assert "~/.gemini/antigravity-cli/settings.json" in pol.credential_files
+    assert "~/.gemini/oauth_creds.json" in pol.credential_files  # harmless, kept
+    assert not any(w.cli == "gemini" for w in pol.workers.values())  # type: ignore[comparison-overlap]
+
+
+def _agy(model: str | None) -> dict[str, object]:
+    worker: dict[str, object] = {
+        "transport": "cli",
+        "cli": "agy",
+        "provider": "google",
+        "executable_sha256": UNPINNED,
+        "timeout_s": 60,
+        "max_stdout_bytes": 1000,
+    }
+    if model is not None:
+        worker["model"] = model
+    return minimal_policy(vendors_allowed=["google"], workers={"agy": worker})
+
+
+def test_gemini_cli_is_no_longer_a_valid_cli_name(tmp_path: Path) -> None:
+    data = _agy("gemini-3.1-pro-high")
+    workers = data["workers"]
+    assert isinstance(workers, dict)
+    workers["agy"]["cli"] = "gemini"
+    with pytest.raises(PolicyError, match="cli"):
+        load_policy(write(tmp_path, data))
+
+
+def test_agy_loads_with_a_gemini_model(tmp_path: Path) -> None:
+    loaded = load_policy(write(tmp_path, _agy("gemini-3.1-pro-high")))
+    assert loaded.policy.workers["agy"].model == "gemini-3.1-pro-high"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        None,
+        "",
+        "claude-fable-5",
+        "gpt-oss-120b",
+        "Gemini-3",
+        "gemini",
+        "gemini-",  # at least one char after the dash
+        "gemini- ",
+        " gemini-x",  # nothing before the prefix
+        "GEMINI-x",  # exact lowercase prefix
+        "xgemini-y",
+        "gemini-3 pro",  # no whitespace inside an id
+    ],
+)
+def test_agy_lineage_guard_refuses_non_gemini_models(tmp_path: Path, model: str | None) -> None:
+    """agy also serves Claude and GPT-OSS ids: an agy worker without a
+    gemini-* model is refused at policy load with a clear message. The guard
+    is SYNTACTIC: it cannot prove which model executed."""
+    with pytest.raises(PolicyError, match="lineage guard: cli `agy` requires `model`"):
+        load_policy(write(tmp_path, _agy(model)))
+    # other CLIs are not subject to the guard
+    loaded = load_policy(write(tmp_path, minimal_policy(), "other.yaml"))
+    assert loaded.policy.workers["claude"].model is None
+
+
+@pytest.mark.parametrize("model", ["gemini-3.1-pro-high", "gemini-x", "gemini-2.5-flash_preview"])
+def test_agy_lineage_guard_accepts_gemini_ids(tmp_path: Path, model: str) -> None:
+    assert load_policy(write(tmp_path, _agy(model))).policy.workers["agy"].model == model
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout_s", "60"),
+        ("timeout_s", 60.0),
+        ("timeout_s", True),
+        ("timeout_s", 0),
+        ("timeout_s", 86_401),
+        ("max_stdout_bytes", "1000"),
+        ("max_stdout_bytes", 1000.0),
+        ("max_stdout_bytes", True),
+        ("max_stderr_bytes", "1"),
+        ("max_stderr_bytes", 1.0),
+    ],
+)
+def test_worker_int_limits_are_strict(tmp_path: Path, field: str, value: object) -> None:
+    """timeout_s / max_*_bytes feed timers and caps: no string, float or bool
+    coercion, and timeout_s is bounded to [1, 86400]."""
+    data = minimal_policy()
+    workers = data["workers"]
+    assert isinstance(workers, dict)
+    workers["claude"][field] = value
+    with pytest.raises(PolicyError, match=field):
+        load_policy(write(tmp_path, data))
+    workers["claude"][field] = 86_400 if field == "timeout_s" else 7
+    assert load_policy(write(tmp_path, data, "ok.yaml")).policy.workers["claude"]
 
 
 def test_minimal_policy_loads_with_defaults(tmp_path: Path) -> None:

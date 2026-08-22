@@ -1,0 +1,23 @@
+{
+  "cli": "grok",
+  "version": "1.0.5",
+  "experiment": "E9",
+  "argv": [
+    "grok",
+    "-p",
+    "Answer with answer=ok and n=7",
+    "--permission-mode",
+    "plan",
+    "--disable-web-search",
+    "--output-format",
+    "json",
+    "--json-schema",
+    "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"}},\"required\":[\"answer\",\"n\"]}"
+  ],
+  "argv_source": "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "E9. Inline --json-schema confirmed for grok 1.0.5: the object is under the camelCase key structuredOutput; text holds the same JSON as a string; stopReason end_turn."
+}

@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.2.0 - Milestone 2a: Antigravity `agy` worker, E-experiment results (2026-08-22)
+
+Added
+* `agy` (Antigravity CLI 1.1.18) replaces the uninstalled `gemini` CLI as the
+  Google lineage. `build_argv_agy`: `-p <prompt> --model <m> --mode plan
+  --sandbox --add-dir <snapshot realpath> --output-format json
+  --disable-slash-commands --print-timeout <N>s [--json-schema <inline>]`
+  (canonical order) with `N = timeout_s - 30` above 60 s else
+  `max(1, timeout_s // 2)`, always strictly below `timeout_s` (`timeout_s`
+  < 2 refused for agy); `parse_agy` (status ERROR → FAILED with the worker's
+  message, usage retained, `structured_output` preferred, no model id / cost;
+  `duration_seconds` accepted only when finite in `[0, 1e7]`). Nine captured
+  agy envelopes are fixtures (A7/A8/A10b/A14/A15/A16 sidecars carry
+  reconstructed, labelled argv).
+* Advisor fixes (Codex, MERGE-AFTER-FIXES): parser exceptions are contained
+  in `_execute` (`run_worker` never raises); `timeout_s`/`max_*_bytes` are
+  strict ints (`timeout_s` in `[1, 86400]`); the 0.1.2 manifest block is
+  pinned by hash like 0.1.0/0.1.1 (committed = immutable); the lineage guard
+  is `^gemini-\S+$` and documented as syntactic; the fixture username guard
+  is a portable path-pattern scan.
+* `--add-dir` is REQUIRED for agy (A14: without a declared workspace agy
+  cannot read even its own cwd; A16: with it, reads outside are denied — the
+  valid E1 pass). Exactly one, equal to the spawn cwd, re-checked element by
+  element in `plan_call` (`assert_agy_workspace`).
+* `eris.policy`: `CliName` is `claude|codex|agy|grok`; lineage guard - an agy
+  worker must declare a `gemini-*` model. `policies/default.yaml`: agy entry
+  (google, `gemini-3.1-pro-high`, `AGY_CLI_DISABLE_AUTO_UPDATE=1`),
+  `~/.gemini/antigravity-cli/settings.json` among the credential files.
+* `FORBIDDEN_ARGV_TOKENS` += `accept-edits`, `--continue`, `--conversation`,
+  `--prompt-interactive`, `--input-format`, `--new-project`, `--project`,
+  `--agent`, `--log-file`; an exact-element test proves the agy builder never
+  emits `-c`. NEVER env += `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_GEMINI_BASE_URL`, `AGY_ADC_AUTH`,
+  prefix `ANTIGRAVITY_`.
+* `parse_grok` reads `structuredOutput` (E9 capture); claude E9/E8b captures
+  added as fixtures.
+* `SCHEMA_VERSION` 0.1.1 → **0.1.2**: `Invocation.conversation_id` and
+  `Invocation.worker_reported_duration_ms` (optional). New goldens under
+  `tests/fixtures/records/0.1.2/` + manifest entry; 0.1.0/0.1.1 untouched and
+  their manifest blocks are now pinned by hash in the test.
+* `eris doctor`: `worker.<id>.state` reports the size of agy's
+  brain/conversations directories (WARN ≥ 256 MiB); never deletes them.
+* Suite-wide fixture guards (`tests/test_fixtures.py`): no redaction literal
+  (home dir / username, derived from the environment) under `tests/fixtures`;
+  every capture has a `.meta.json` with its argv. `tests/test_no_gemini.py`:
+  no gemini builder/parser/literal in `src/eris`.
+* Docs: EVAL-PLAN results for E1/E1b/E2/E7/E8/E8b/E9 and A1–A11; SECURITY
+  E1 consequence + containment options (USER DECISION, option 1 recommended)
+  and the agy section; INVARIANTS rows for every new test.
+
+Removed
+* `build_argv_gemini`, `parse_gemini`, `first_balanced_json` (its only
+  caller), the `gemini` worker and `PER_CLI_ENV["gemini"]`.
+
+Known caveats (documented, not resolved)
+* **agy injects the declared workspace's `AGENTS.md`/`GEMINI.md` rules**
+  (A15 replied `MANGO KIWI`); no opt-out flag. A9/A11's "no injection" was
+  vacuous (no workspace declared). Mitigation — per-worker snapshot
+  sanitization (strip `AGENTS.md`/`GEMINI.md`/`CLAUDE.md`/`.agents/` from the
+  agy worktree copy, recorded in the manifest) — is Milestone 2b
+  (`TODO(m2b)` at `build_argv_agy`). Until then agy output is exposed to
+  repo-authored instructions, same class as grok.
+* agy prints `warning: --mode plan has no effect while slash command
+  expansion is disabled.` under the required argv; the observed denials come
+  from its non-interactive permission check. Re-verify on version change.
+* `AGY_CLI_DISABLE_AUTO_UPDATE` name from binary strings; effect ASSUMPTION.
+* Which model agy executed is unobservable (`model_executed=None`).
+
 ## 0.1.1 - schema versioning discipline (2026-08-22)
 
 * `SCHEMA_VERSION` 0.1.0 -> 0.1.1. The `Invocation` record gained four optional

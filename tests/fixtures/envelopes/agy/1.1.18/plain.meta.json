@@ -1,0 +1,18 @@
+{
+  "cli": "agy",
+  "version": "1.1.18",
+  "experiment": "A1",
+  "argv": [
+    "agy",
+    "-p",
+    "Reply with exactly the single word: ok",
+    "--output-format",
+    "json"
+  ],
+  "argv_source": "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "A1. NO --mode plan, NO --sandbox. status SUCCESS, response 'ok\\n'. No model id and no cost in the envelope; usage has thinking_tokens/cache_read_tokens/total_tokens."
+}

@@ -26,5 +26,19 @@
     "proposal.json": "762fbedf226669da09ef29017a7bf9208e11fb2b2cf21088f9107fc34123f767",
     "task.json": "077bd5e64cd64bbfe1fb05068470fa43489a5433faa2ee76c6401aea5e3bc271",
     "verification.json": "76a419edaf4e37a12c43abf18c66346c053371a351ba069145e7c5b6e6acd900"
+  },
+  "0.1.2": {
+    "adjudication.json": "b7e28c2ccaef1950997b6a040db819362894fb9dbbeb60c43eccb0019637dbd2",
+    "approval.json": "778720bb716faac5084d539c8e717d47b83b5f402515f205edc4b273a1c6dd43",
+    "challenge.json": "285ca6dcb277464b438112be894be0473e0f22f979346c0dfcf29b89b5aa868d",
+    "claim.json": "a2c3a5c571c5231d84a534e68dd0d6a9384e049b01822538419c5184e66342d6",
+    "cost.json": "18873f9569ed1c17c1bcba6b0f6f6b44a29a493dd11581a7073e35056fc00a20",
+    "critique.json": "19fbcd1582da0ac036c38f82c678ea468f982b56801e16dc813ab64a9c541dcb",
+    "event.json": "c381f63e7a8c32b5a0157e726d5446a2217eb01ee7b31e75a5ed2ca7d623a569",
+    "evidence.json": "d591aa80422e4c71b38581a48f4f99fab87c80e952c658fd916f0b48dad04162",
+    "invocation.json": "6904c5fc1aba4dce6c47fa1f87a70a9890c6e5f697ed693e3449fec36af29a69",
+    "proposal.json": "45f8655c35441672706c1c3faae6d6ec55e67bfae53a56787c596c9efe942a20",
+    "task.json": "a122f6e1d63d29ac39cd41f6145af4928945f44b0b9b18096f80e2a88454d789",
+    "verification.json": "8629b2a0c124812427eb86db0f22ab319ab883b17fe5ad1ce237e709aa9d6ce2"
   }
 }

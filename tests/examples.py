@@ -96,6 +96,8 @@ def example_records() -> dict[str, Record]:
             cost_usd=0.011819,
             stdout_sha256=SHA_D,
             stderr_sha256=None,
+            conversation_id="ed889929-a04c-457f-91d1-194be848aa04",
+            worker_reported_duration_ms=2646,
         ),
         "claim": claim,
         "proposal": Proposal(

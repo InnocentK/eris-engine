@@ -1,0 +1,22 @@
+{
+  "cli": "agy",
+  "version": "1.1.18",
+  "experiment": "A3",
+  "argv": [
+    "agy",
+    "-p",
+    "Answer with answer=ok and n=7",
+    "--mode",
+    "plan",
+    "--output-format",
+    "json",
+    "--json-schema",
+    "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"}},\"required\":[\"answer\",\"n\"]}"
+  ],
+  "argv_source": "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "redaction": "the capturing user's home directory -> /Users/USER",
+  "note": "A3. Inline --json-schema works: structured_output is EXACTLY the schema object; the toolAction/toolSummary extras appear only inside the prose response. json_schema is echoed. Plan mode wrote an implementation_plan.md under the brain dir (home path redacted to /Users/USER)."
+}

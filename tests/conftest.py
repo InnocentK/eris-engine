@@ -2,8 +2,8 @@
 
 Three autouse guards apply to EVERY test:
 
-1. ``shutil.which`` returns ``None`` for worker binaries (claude, codex, gemini,
-   grok, hermes, opencode, ollama) so a declared worker is never found.
+1. ``shutil.which`` returns ``None`` for worker binaries (claude, codex, agy,
+   gemini, grok, hermes, opencode, ollama) so a declared worker is never found.
 2. Every subprocess entry point raises :class:`HermeticityViolation`:
    ``subprocess.Popen`` (which also covers ``run``/``call``/``check_*``,
    ``os.popen`` and asyncio's unix transport), the ``subprocess`` module
@@ -37,8 +37,17 @@ from typing import Any
 import pytest
 
 WORKER_BINARIES: frozenset[str] = frozenset(
-    {"claude", "codex", "gemini", "grok", "hermes", "opencode", "ollama"}
+    {"claude", "codex", "agy", "gemini", "grok", "hermes", "opencode", "ollama"}
 )
+
+# Fixture redaction placeholders. Captured envelopes are rewritten before they
+# are committed: the capturing user's home directory becomes /Users/USER and
+# the experiment directory (whose name embedded the username) becomes
+# /private/tmp/OUTSIDE. tests/test_fixtures.py scans every fixture for any
+# OTHER /Users/<name>, /home/<name> or /private/tmp/claude-501/-Users-<...>
+# path (portable: no username literal anywhere in the repository).
+FIXTURE_HOME_PLACEHOLDER = "/Users/USER"
+FIXTURE_OUTSIDE_PLACEHOLDER = "/private/tmp/OUTSIDE"
 
 _ORIG_WHICH = shutil.which
 _ORIG_POPEN_INIT = subprocess.Popen.__init__

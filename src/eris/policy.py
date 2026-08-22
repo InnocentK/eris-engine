@@ -31,7 +31,15 @@ from eris.redact import scan
 from eris.schemas import SHA256_PATTERN, Transport, now_ts
 
 UNPINNED = "UNPINNED"
-CliName = Literal["claude", "codex", "gemini", "grok"]
+CliName = Literal["claude", "codex", "agy", "grok"]
+# Lineage guard: Antigravity's `agy` also serves Claude and GPT-OSS model ids
+# (`agy models`, 2026-08-22). An agy worker must pin a Google model or the
+# Google lineage of a panel could silently collapse into another vendor's.
+# SYNTACTIC only: exact lowercase prefix, at least one non-space char after
+# the dash, nothing before it. agy reports no executed model and may silently
+# default (A9 log), so this cannot prove which model ran.
+AGY_MODEL_PREFIX = "gemini-"
+_AGY_MODEL_RE = re.compile(rf"^{re.escape(AGY_MODEL_PREFIX)}\S+$")
 _SHA_RE = re.compile(SHA256_PATTERN)
 _LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -52,9 +60,10 @@ class WorkerPolicy(_Strict):
     cli: CliName | None = None
     executable: str | None = None
     executable_sha256: str = Field(pattern=rf"^(?:{UNPINNED}|[0-9a-f]{{64}})$")
-    timeout_s: int = Field(gt=0)
-    max_stdout_bytes: int = Field(gt=0)
-    max_stderr_bytes: int = Field(default=1_000_000, gt=0)
+    # strict: "60", 60.0 and true are refused, not coerced (they feed timers and caps)
+    timeout_s: int = Field(strict=True, ge=1, le=86_400)
+    max_stdout_bytes: int = Field(strict=True, gt=0)
+    max_stderr_bytes: int = Field(default=1_000_000, strict=True, gt=0)
     max_budget_usd: float | None = Field(default=None, gt=0)
     tools: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
@@ -72,6 +81,12 @@ class WorkerPolicy(_Strict):
                 raise ValueError("`executable` must be an absolute path")
             if self.base_url or self.api_key_env:
                 raise ValueError("cli transport must not set base_url/api_key_env")
+            if self.cli == "agy" and not _AGY_MODEL_RE.fullmatch(self.model or ""):
+                raise ValueError(
+                    f"lineage guard: cli `agy` requires `model` to start with "
+                    f"{AGY_MODEL_PREFIX!r} (got {self.model!r}); agy also serves non-Google "
+                    "models and an unpinned default would break the Google lineage"
+                )
         else:
             if not self.base_url or not self.api_key_env:
                 raise ValueError("api transport requires `base_url` and `api_key_env`")

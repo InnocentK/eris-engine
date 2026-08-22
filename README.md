@@ -21,7 +21,8 @@ harness in this repository exists to run that experiment honestly:
   SUPPORTED only by evidence that exists, is mechanically observed, and is not
   stale. Model agreement alone is UNSUPPORTED.
 - `src/eris/launch.py` — hardened, read-only invocation of worker CLIs
-  (Claude Code, Codex, Gemini CLI, Grok) and OpenAI-compatible APIs.
+  (Claude Code, Codex, Antigravity `agy` for the Google lineage, Grok) and
+  OpenAI-compatible APIs.
 - `src/eris/redact.py` + `writer.py` — the single, redacting, fail-loud path
   to the run ledger.
 - `src/eris/verify.py` — allowlisted mechanical verification commands.

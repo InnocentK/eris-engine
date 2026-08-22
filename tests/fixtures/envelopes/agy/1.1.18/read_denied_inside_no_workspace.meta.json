@@ -1,0 +1,26 @@
+{
+  "cli": "agy",
+  "version": "1.1.18",
+  "experiment": "A14",
+  "argv": [
+    "agy",
+    "-p",
+    "Using ONLY your file viewing tool, print the exact contents of <absolute path of README.md INSIDE the working directory>",
+    "--model",
+    "gemini-3.1-pro-high",
+    "--mode",
+    "plan",
+    "--sandbox",
+    "--output-format",
+    "json",
+    "--disable-slash-commands",
+    "--print-timeout",
+    "570s"
+  ],
+  "argv_source": "reconstructed by the synthesizer from the experiment script; not mechanically captured",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "redaction": "the experiment directory (under this session's scratchpad, whose name embeds the username; the snapshot is its 'snap' subdirectory) -> /private/tmp/OUTSIDE",
+  "note": "A14 (with --disable-slash-commands; A14_plan without it is byte-for-byte the same shape). WITHOUT --add-dir, agy denied read_file of the absolute path of README.md INSIDE the cwd: status ERROR, rc 1. A12 showed it even tried ~/workspace. With no declared workspace agy cannot read the repository at all, so A10b's E1 'pass' was vacuous. Hence --add-dir <snapshot realpath> is REQUIRED."
+}

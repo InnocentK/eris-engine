@@ -25,7 +25,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "0.1.1"
+SCHEMA_VERSION = "0.1.2"
 
 TS_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -248,6 +248,13 @@ class Invocation(Record):
     output_file_truncated: bool = False
     output_file_size: int | None = Field(default=None, ge=0)
     cleanup_error: str | None = None
+    # 0.1.2: the worker's own session handle (agy ``conversation_id``; lets
+    # ``~/.gemini/antigravity-cli/brain/<id>/`` be derived at read time for
+    # cross-run contamination audits) and the duration the worker itself
+    # reported (agy ``duration_seconds``). ``duration_ms`` stays clock-derived
+    # by Eris and is never overwritten by the worker's figure.
+    conversation_id: str | None = None
+    worker_reported_duration_ms: int | None = Field(default=None, ge=0)
 
 
 class Claim(Record):

@@ -1,6 +1,6 @@
 """Hardened, read-only invocation of worker CLIs.
 
-The flags are load-bearing (verified 2026-08-21 on this machine, see
+The flags are load-bearing (verified 2026-08-21/22 on this machine, see
 tests/fixtures/envelopes/*/*.meta.json and docs/EVAL-PLAN.md):
 
 * claude: ``-p <prompt> --safe-mode --permission-mode plan --tools <list|"">
@@ -9,8 +9,17 @@ tests/fixtures/envelopes/*/*.meta.json and docs/EVAL-PLAN.md):
 * codex: ``exec -C <cwd> -s read-only --ephemeral --ignore-user-config
   --ignore-rules -c project_doc_max_bytes=0 --skip-git-repo-check -m <model>
   --json [--output-schema F] [-o F] <prompt>``.
-* gemini: ``-p <prompt> -m <model> --approval-mode plan -o json`` (CLI
-  unusable here on 2026-08-21; builder kept, absence recorded).
+* agy (Antigravity 1.1.18, the Google lineage): ``-p <prompt> --model <m>
+  --mode plan --sandbox --add-dir <snapshot realpath> --output-format json
+  --disable-slash-commands --print-timeout <N>s [--json-schema S]`` (this
+  order is canonical) with ``N = timeout_s - 30`` above 60 s, else
+  ``max(1, timeout_s // 2)`` - always strictly less than ``timeout_s`` so
+  agy's own timer fires first and still emits a parseable envelope; the Eris
+  timeout + process-group kill is the backstop (``timeout_s < 2`` refused). ``--add-dir`` is REQUIRED and appears exactly once, equal to the
+  spawn cwd: without a declared workspace agy cannot read the repository at
+  all (A14), with it reads are confined to that workspace (A16). ``--sandbox``
+  must be DROPPED if Eris ever wraps agy in its own sandbox-exec (nested
+  seatbelt fails). The builder never emits ``-c`` (continue a conversation).
 * grok: ``-p <prompt> -m <model> --permission-mode plan --disable-web-search
   --output-format json [--json-schema S]``.
 
@@ -27,6 +36,7 @@ never a substitution. ``run_worker`` does not raise.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -62,6 +72,22 @@ FORBIDDEN_ARGV_TOKENS: tuple[str, ...] = (
     "acceptedits",
     "--skip-trust",
     "--allow-all",
+    # agy (Antigravity): edit mode, conversation resumption, interactive/stream
+    # input, project/agent selection, log redirection. `--add-dir` is NOT
+    # forbidden: it is REQUIRED (exactly once, = the snapshot) and checked
+    # element by element in plan_call. `-c` (continue) is deliberately NOT a
+    # substring token - it would hit codex `-c project_doc_max_bytes=0` and
+    # git `--cached`; an exact-element test proves the agy builder never
+    # emits it.
+    "accept-edits",
+    "--continue",
+    "--conversation",
+    "--prompt-interactive",
+    "--input-format",
+    "--new-project",
+    "--project",
+    "--agent",
+    "--log-file",
 )
 
 
@@ -86,7 +112,7 @@ def assert_argv_safe(argv: Iterable[str], *, exempt: Iterable[int] = ()) -> None
                 raise LaunchRefused(f"forbidden token {token!r} in argv[{i}]")
 
 
-# Index of the prompt in claude/gemini/grok argv (`<exe> -p <prompt> ...`).
+# Index of the prompt in claude/agy/grok argv (`<exe> -p <prompt> ...`).
 CLI_PROMPT_INDEX = 2
 
 
@@ -165,20 +191,90 @@ def build_argv_codex(
     return argv
 
 
-def build_argv_gemini(executable: str, prompt: str, *, model: str) -> list[str]:
+AGY_PRINT_TIMEOUT_MARGIN_S = 30
+AGY_MIN_TIMEOUT_S = 2
+
+
+def agy_print_timeout_s(timeout_s: int) -> int:
+    """agy's own ``--print-timeout`` in whole seconds, ALWAYS strictly less
+    than Eris's ``timeout_s`` so agy's timer fires first and still emits a
+    parseable ERROR envelope (A7); the Eris timeout + group kill remains the
+    backstop: ``timeout_s - 30`` above 60 s, else ``max(1, timeout_s // 2)``.
+    With integer seconds a 1 s policy timeout has no strictly smaller positive
+    value, so ``timeout_s < 2`` is refused rather than letting the two timers
+    coincide."""
+    timeout_s = int(timeout_s)
+    if timeout_s < AGY_MIN_TIMEOUT_S:
+        raise LaunchRefused(
+            f"agy needs timeout_s >= {AGY_MIN_TIMEOUT_S} so its --print-timeout can fire "
+            f"before Eris's timeout (got {timeout_s})"
+        )
+    if timeout_s > 60:
+        return timeout_s - AGY_PRINT_TIMEOUT_MARGIN_S
+    return max(1, timeout_s // 2)
+
+
+def build_argv_agy(
+    executable: str,
+    prompt: str,
+    *,
+    model: str,
+    workspace: Path,
+    print_timeout_s: int,
+    schema_json: str | None = None,
+) -> list[str]:
+    """``workspace`` MUST be the snapshot that becomes the spawn cwd: agy only
+    reads inside declared workspaces (A14: without ``--add-dir`` even
+    ``README.md`` in the cwd is denied; A16: with it, reads outside are
+    denied). Exactly one ``--add-dir``, resolved to its realpath.
+
+    TODO(m2b): a declared workspace also gets its AGENTS.md / GEMINI.md rules
+    injected into the model's context (A15 replied "MANGO KIWI"); there is no
+    opt-out flag. Mitigation = per-worker snapshot sanitization (strip
+    AGENTS.md/GEMINI.md/CLAUDE.md/.agents/ from the agy worktree copy, recorded
+    in the manifest). Until then agy output is exposed to repo-authored
+    instructions, same class as grok.
+    """
+    if print_timeout_s < 1:
+        raise LaunchRefused("agy --print-timeout must be >= 1s")
     argv = [
         executable,
         "-p",
         _prompt_ok(prompt),
-        "-m",
+        "--model",
         model,
-        "--approval-mode",
+        "--mode",
         "plan",
-        "-o",
+        "--sandbox",
+        "--add-dir",
+        str(Path(workspace).resolve()),
+        "--output-format",
         "json",
+        "--disable-slash-commands",
+        "--print-timeout",
+        f"{int(print_timeout_s)}s",
     ]
+    if schema_json is not None:
+        argv += ["--json-schema", schema_json]
     assert_argv_safe(argv, exempt=(CLI_PROMPT_INDEX,))
     return argv
+
+
+def assert_agy_workspace(argv: list[str], cwd: Path) -> None:
+    """Exact-element check, applied in ``plan_call`` right before the plan is
+    returned: ``--add-dir`` occurs exactly once (outside the prompt) and its
+    value is the spawn cwd's realpath. A second workspace, a missing one, or
+    one pointing elsewhere refuses the call."""
+    positions = [i for i, a in enumerate(argv) if a == "--add-dir" and i != CLI_PROMPT_INDEX]
+    if len(positions) != 1:
+        raise LaunchRefused(f"agy argv must carry exactly one --add-dir (found {len(positions)})")
+    i = positions[0]
+    expected = str(Path(cwd).resolve())
+    if i + 1 >= len(argv) or argv[i + 1] != expected:
+        raise LaunchRefused(
+            f"agy --add-dir must equal the spawn cwd {expected!r} (got "
+            f"{argv[i + 1] if i + 1 < len(argv) else None!r})"
+        )
 
 
 def build_argv_grok(
@@ -224,9 +320,24 @@ NEVER_ENV_EXACT: frozenset[str] = frozenset(
         "GEMINI_CLI_TRUST_WORKSPACE",
         "EDITOR",
         "VISUAL",
+        # Google / Antigravity credential and endpoint overrides. `AGY_` is NOT
+        # blanket-banned: the policy sets AGY_CLI_DISABLE_AUTO_UPDATE.
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GEMINI_BASE_URL",
+        "AGY_ADC_AUTH",
     }
 )
-NEVER_ENV_PREFIXES: tuple[str, ...] = ("LD_", "DYLD_", "GIT_", "AWS_", "PYTEST_", "CODEX_SANDBOX")
+NEVER_ENV_PREFIXES: tuple[str, ...] = (
+    "LD_",
+    "DYLD_",
+    "GIT_",
+    "AWS_",
+    "PYTEST_",
+    "CODEX_SANDBOX",
+    "ANTIGRAVITY_",
+)
 
 # Eris's own hardening. These are the ONLY GIT_* names allowed, set by Eris.
 GIT_HARDENING: dict[str, str] = {
@@ -253,7 +364,9 @@ PER_CLI_ENV: dict[str, dict[str, str]] = {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     },
     "codex": {},
-    "gemini": {},
+    # Name taken from the binary's strings (1.1.18); effect is an ASSUMPTION.
+    # agy spawns a background auto-updater that would change the pinned binary.
+    "agy": {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
     "grok": {},
 }
 
@@ -462,6 +575,8 @@ class Envelope:
     structured: Any = None
     models_used: list[str] = field(default_factory=list)
     raw: Any = None
+    conversation_id: str | None = None  # agy: the worker's own session handle
+    worker_reported_duration_ms: int | None = None  # agy duration_seconds; never the clock
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -474,6 +589,25 @@ def _int_or_none(value: Any) -> int | None:
 
 def _float_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+WORKER_DURATION_MAX_S = 10_000_000.0  # ~115 days; anything beyond is not a duration
+
+
+def _duration_ms_or_none(value: Any) -> int | None:
+    """A worker-reported duration in seconds -> whole milliseconds. Only a
+    finite number in ``[0, 1e7]`` is accepted; ``Infinity``/``NaN``/``1e309``,
+    huge ints (``float()`` overflow), negatives, bools and strings record
+    ``None`` - never an exception (``run_worker`` never raises)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(seconds) or not 0.0 <= seconds <= WORKER_DURATION_MAX_S:
+        return None
+    return int(round(seconds * 1000))
 
 
 def _pick_model(model_usage: Any) -> tuple[str | None, list[str]]:
@@ -646,7 +780,9 @@ def parse_codex(stdout: bytes) -> Envelope:
 
 
 def parse_grok(stdout: bytes) -> Envelope:
-    """grok 1.0.5 ``--output-format json``: text, modelUsage, usage, total_cost_usd."""
+    """grok 1.0.5 ``--output-format json``: text, modelUsage, usage,
+    total_cost_usd; with ``--json-schema`` the object is under the camelCase
+    key ``structuredOutput`` (E9) and is preferred over parsing ``text``."""
     data, bad = _json_object(stdout, "grok")
     if data is None:
         assert bad is not None
@@ -666,6 +802,9 @@ def parse_grok(stdout: bytes) -> Envelope:
     model, names = _pick_model(data.get("modelUsage"))
     stop = data.get("stopReason")
     is_error = stop == "error"
+    structured = data.get("structuredOutput")
+    if structured is None:
+        structured = _structured_from_text(text)
     return Envelope(
         text=text,
         model_executed=model,
@@ -676,100 +815,70 @@ def parse_grok(stdout: bytes) -> Envelope:
         if stop not in (None, "stop", "end_turn", "completed")
         else None,
         parse_mode="json",
-        structured=_structured_from_text(text),
+        structured=structured,
         models_used=names,
         raw=data,
     )
 
 
-def first_balanced_json(text: str) -> str | None:
-    """The first balanced ``{...}`` in ``text`` (string-aware), or None."""
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_str = False
-        escape = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_str:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-        start = text.find("{", start + 1)
-    return None
-
-
-def parse_gemini(stdout: bytes) -> Envelope:
-    """gemini ``-o json`` - shape UNKNOWN (not capturable on 2026-08-21).
-    Defensive: whole-stdout JSON, else the first balanced JSON object, else
-    plain text. ``parse_mode`` records which path was taken."""
-    text = strip_ansi(stdout.decode("utf-8", errors="replace"))
-    data: Any = None
-    mode = "none"
-    try:
-        data = json.loads(text)
-        mode = "json"
-    except ValueError:
-        candidate = first_balanced_json(text)
-        if candidate is not None:
-            try:
-                data = json.loads(candidate)
-                mode = "balanced_extract"
-            except ValueError:
-                data = None
-    if not isinstance(data, dict):
-        stripped = text.strip()
-        return Envelope(
-            stripped or None,
-            None,
-            None,
-            None,
-            not stripped,
-            None if stripped else "gemini: empty stdout",
-            "none",
-            raw=text[:2000],
-        )
-    response: Any = None
-    for key in ("response", "text", "result", "output"):
-        if isinstance(data.get(key), str):
-            response = data[key]
-            break
-    stats = _dict(data.get("stats"))
-    models = _dict(stats.get("models"))
-    model = next(iter(models), None) if models else None
-    err = data.get("error")
+def parse_agy(stdout: bytes) -> Envelope:
+    """agy 1.1.18 ``--output-format json``: one object with ``status``
+    (SUCCESS|ERROR), ``response``, ``error``, ``conversation_id``,
+    ``duration_seconds``, ``usage`` and, with ``--json-schema``,
+    ``structured_output`` (+ a ``json_schema`` echo). No model id and no cost
+    are emitted: ``model_executed`` is None (unknown, never guessed) and
+    ``cost_usd`` is None. Usage is retained even on ERROR (A5: a denied shell
+    command still consumed 45k input tokens)."""
+    data, bad = _json_object(stdout, "agy")
+    if data is None:
+        assert bad is not None
+        return bad
+    status = data.get("status")
+    response = data.get("response")
+    text = response if isinstance(response, str) and response else None
+    u = _dict(data.get("usage"))
+    usage = Usage(
+        input_tokens=_int_or_none(u.get("input_tokens")),
+        output_tokens=_int_or_none(u.get("output_tokens")),
+        cached_input_tokens=_int_or_none(u.get("cache_read_tokens")),
+        reasoning_tokens=_int_or_none(u.get("thinking_tokens")),
+    )
+    conv = data.get("conversation_id")
+    conversation_id = conv if isinstance(conv, str) and conv else None
+    reported_ms = _duration_ms_or_none(data.get("duration_seconds"))
+    error: str | None
+    if status == "SUCCESS":
+        error = None
+    elif isinstance(data.get("error"), str) and data["error"]:
+        error = f"agy: {data['error']}"
+    elif status is None:
+        error = "agy: status missing"
+    else:
+        error = f"agy: status={status!r}"
+    structured = data.get("structured_output")  # any shape is recorded; extra keys kept
+    if structured is None:
+        structured = _structured_from_text(text)
     return Envelope(
-        text=response,
-        model_executed=str(model) if model else None,
-        usage=None,
+        text=text,
+        model_executed=None,
+        usage=usage,
         cost_usd=None,
-        is_error=err is not None or response is None,
-        error=str(err)
-        if err is not None
-        else (None if response is not None else "gemini: no response text"),
-        parse_mode=mode,
-        structured=_structured_from_text(response),
+        is_error=error is not None,
+        error=error,
+        parse_mode="json",
+        structured=structured,
+        models_used=[],
         raw=data,
+        conversation_id=conversation_id,
+        worker_reported_duration_ms=reported_ms,
     )
 
 
 PARSERS: dict[str, Callable[[bytes], Envelope]] = {
     "claude": parse_claude,
     "codex": parse_codex,
+    "agy": parse_agy,
     "grok": parse_grok,
-    "gemini": parse_gemini,
 }
 
 
@@ -867,10 +976,18 @@ def plan_call(call: WorkerCall) -> Plan:
             output_path=output_path,
         )
         prompt_index = len(argv) - 1
-    elif w.cli == "gemini":
+    elif w.cli == "agy":
         if not w.model:
-            raise LaunchRefused("gemini requires a model in policy")
-        argv = build_argv_gemini(w.executable, call.prompt, model=w.model)
+            raise LaunchRefused("agy requires a model in policy")
+        argv = build_argv_agy(
+            w.executable,
+            call.prompt,
+            model=w.model,
+            workspace=cwd,
+            print_timeout_s=agy_print_timeout_s(w.timeout_s),
+            schema_json=schema_json,
+        )
+        assert_agy_workspace(argv, cwd)  # exactly one --add-dir, == the spawn cwd
     else:
         if not w.model:
             raise LaunchRefused("grok requires a model in policy")
@@ -949,6 +1066,8 @@ class WorkerResult:
     output_file_truncated: bool = False  # True when the `-o` file exceeded max_stdout_bytes
     output_file_size: int | None = None  # original size of the `-o` file
     cleanup_error: str | None = None  # scratch removal failed: a raw file MAY remain on disk
+    conversation_id: str | None = None  # agy session handle (brain dir derivable at read time)
+    worker_reported_duration_ms: int | None = None  # the worker's own figure; duration_ms is ours
 
 
 def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -> WorkerResult:
@@ -1124,7 +1243,19 @@ def _execute(
             # the two (ELOOP) or any other open/read failure is a refusal.
             output_refusal = f"worker output {plan.output_path} could not be read safely: {exc}"
     assert w.cli is not None
-    envelope = PARSERS[w.cli](spawned.stdout)
+    try:
+        envelope = PARSERS[w.cli](spawned.stdout)
+    except Exception as exc:  # noqa: BLE001 - a parser bug must never escape run_worker
+        envelope = Envelope(
+            None,
+            None,
+            None,
+            None,
+            True,
+            f"{w.cli}: parser failure: {exc!s:.120}",
+            "none",
+            raw=spawned.stdout[:2000],
+        )
     if envelope.structured is None and output_file:
         envelope.structured = _structured_from_text(output_file.decode("utf-8", errors="replace"))
     error: str | None
@@ -1171,4 +1302,6 @@ def _execute(
         output_file=output_file,
         output_file_truncated=output_truncated,
         output_file_size=output_size,
+        conversation_id=envelope.conversation_id,
+        worker_reported_duration_ms=envelope.worker_reported_duration_ms,
     )
