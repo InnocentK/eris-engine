@@ -430,6 +430,10 @@ def test_invoke_agy_persists_conversation_id_and_worker_duration(
         "--print-timeout" in inv.argv and inv.argv[inv.argv.index("--print-timeout") + 1] == "570s"
     )
     assert "-c" not in inv.argv and "AGY_CLI_DISABLE_AUTO_UPDATE" in inv.env_names
+    # the declared workspace on record is the snapshot realpath = the spawn cwd
+    assert inv.argv.count("--add-dir") == 1
+    assert inv.argv[inv.argv.index("--add-dir") + 1] == inv.cwd == str(w["snapshot"].resolve())
+    assert factory.instances[0].popen_kwargs["cwd"] == inv.cwd
     # a grok invocation records neither field
     grok = json.loads((FIX / "grok" / "1.0.5" / "plan.json").read_bytes())
     grok["stopReason"] = "stop"

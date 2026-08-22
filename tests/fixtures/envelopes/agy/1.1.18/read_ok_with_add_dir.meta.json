@@ -1,0 +1,28 @@
+{
+  "cli": "agy",
+  "version": "1.1.18",
+  "experiment": "A15",
+  "argv": [
+    "agy",
+    "-p",
+    "Using ONLY your file viewing tool, print the exact contents of <absolute path of README.md INSIDE the working directory>",
+    "--model",
+    "gemini-3.1-pro-high",
+    "--mode",
+    "plan",
+    "--sandbox",
+    "--output-format",
+    "json",
+    "--disable-slash-commands",
+    "--print-timeout",
+    "570s",
+    "--add-dir",
+    "<snapshot realpath>"
+  ],
+  "argv_source": "argv reconstructed from the experiment notes in eris-m2a-plan.md; this run was launched by hand after the batch script and its exact command line was not captured",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "A15. With --add-dir <cwd> the same read succeeded: status SUCCESS, response 'MANGO KIWI\\nhello\\n' (README.md is 'hello'). The leading 'MANGO KIWI' are the marker instructions from the workspace's AGENTS.md and GEMINI.md: rules injection from a DECLARED workspace is CONFIRMED (A9/A11 saw none only because no workspace was declared). No opt-out flag exists; mitigation is per-worker snapshot sanitization (Milestone 2b)."
+}

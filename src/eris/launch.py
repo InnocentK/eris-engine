@@ -10,12 +10,15 @@ tests/fixtures/envelopes/*/*.meta.json and docs/EVAL-PLAN.md):
   --ignore-rules -c project_doc_max_bytes=0 --skip-git-repo-check -m <model>
   --json [--output-schema F] [-o F] <prompt>``.
 * agy (Antigravity 1.1.18, the Google lineage): ``-p <prompt> --model <m>
-  --mode plan --sandbox --output-format json --disable-slash-commands
-  --print-timeout <N>s [--json-schema S]`` with ``N = max(30, timeout_s - 30)``
-  so agy's own timer fires first and still emits a parseable envelope; the
-  Eris timeout + process-group kill is the backstop. ``--sandbox`` must be
-  DROPPED if Eris ever wraps agy in its own sandbox-exec (nested seatbelt
-  fails). The builder never emits ``-c`` (continue a conversation).
+  --mode plan --sandbox --add-dir <snapshot realpath> --output-format json
+  --disable-slash-commands --print-timeout <N>s [--json-schema S]`` with
+  ``N = max(30, timeout_s - 30)`` so agy's own timer fires first and still
+  emits a parseable envelope; the Eris timeout + process-group kill is the
+  backstop. ``--add-dir`` is REQUIRED and appears exactly once, equal to the
+  spawn cwd: without a declared workspace agy cannot read the repository at
+  all (A14), with it reads are confined to that workspace (A16). ``--sandbox``
+  must be DROPPED if Eris ever wraps agy in its own sandbox-exec (nested
+  seatbelt fails). The builder never emits ``-c`` (continue a conversation).
 * grok: ``-p <prompt> -m <model> --permission-mode plan --disable-web-search
   --output-format json [--json-schema S]``.
 
@@ -67,15 +70,16 @@ FORBIDDEN_ARGV_TOKENS: tuple[str, ...] = (
     "acceptedits",
     "--skip-trust",
     "--allow-all",
-    # agy (Antigravity): edit mode, conversation resumption, extra directories,
-    # interactive/stream input, project/agent selection, log redirection.
-    # `-c` (continue) is deliberately NOT a substring token - it would hit
-    # codex `-c project_doc_max_bytes=0` and git `--cached`; an exact-element
-    # test proves the agy builder never emits it.
+    # agy (Antigravity): edit mode, conversation resumption, interactive/stream
+    # input, project/agent selection, log redirection. `--add-dir` is NOT
+    # forbidden: it is REQUIRED (exactly once, = the snapshot) and checked
+    # element by element in plan_call. `-c` (continue) is deliberately NOT a
+    # substring token - it would hit codex `-c project_doc_max_bytes=0` and
+    # git `--cached`; an exact-element test proves the agy builder never
+    # emits it.
     "accept-edits",
     "--continue",
     "--conversation",
-    "--add-dir",
     "--prompt-interactive",
     "--input-format",
     "--new-project",
@@ -201,9 +205,22 @@ def build_argv_agy(
     prompt: str,
     *,
     model: str,
+    workspace: Path,
     print_timeout_s: int,
     schema_json: str | None = None,
 ) -> list[str]:
+    """``workspace`` MUST be the snapshot that becomes the spawn cwd: agy only
+    reads inside declared workspaces (A14: without ``--add-dir`` even
+    ``README.md`` in the cwd is denied; A16: with it, reads outside are
+    denied). Exactly one ``--add-dir``, resolved to its realpath.
+
+    TODO(m2b): a declared workspace also gets its AGENTS.md / GEMINI.md rules
+    injected into the model's context (A15 replied "MANGO KIWI"); there is no
+    opt-out flag. Mitigation = per-worker snapshot sanitization (strip
+    AGENTS.md/GEMINI.md/CLAUDE.md/.agents/ from the agy worktree copy, recorded
+    in the manifest). Until then agy output is exposed to repo-authored
+    instructions, same class as grok.
+    """
     if print_timeout_s < 1:
         raise LaunchRefused("agy --print-timeout must be >= 1s")
     argv = [
@@ -215,6 +232,8 @@ def build_argv_agy(
         "--mode",
         "plan",
         "--sandbox",
+        "--add-dir",
+        str(Path(workspace).resolve()),
         "--output-format",
         "json",
         "--disable-slash-commands",
@@ -225,6 +244,23 @@ def build_argv_agy(
         argv += ["--json-schema", schema_json]
     assert_argv_safe(argv, exempt=(CLI_PROMPT_INDEX,))
     return argv
+
+
+def assert_agy_workspace(argv: list[str], cwd: Path) -> None:
+    """Exact-element check, applied in ``plan_call`` right before the plan is
+    returned: ``--add-dir`` occurs exactly once (outside the prompt) and its
+    value is the spawn cwd's realpath. A second workspace, a missing one, or
+    one pointing elsewhere refuses the call."""
+    positions = [i for i, a in enumerate(argv) if a == "--add-dir" and i != CLI_PROMPT_INDEX]
+    if len(positions) != 1:
+        raise LaunchRefused(f"agy argv must carry exactly one --add-dir (found {len(positions)})")
+    i = positions[0]
+    expected = str(Path(cwd).resolve())
+    if i + 1 >= len(argv) or argv[i + 1] != expected:
+        raise LaunchRefused(
+            f"agy --add-dir must equal the spawn cwd {expected!r} (got "
+            f"{argv[i + 1] if i + 1 < len(argv) else None!r})"
+        )
 
 
 def build_argv_grok(
@@ -915,9 +951,11 @@ def plan_call(call: WorkerCall) -> Plan:
             w.executable,
             call.prompt,
             model=w.model,
+            workspace=cwd,
             print_timeout_s=agy_print_timeout_s(w.timeout_s),
             schema_json=schema_json,
         )
+        assert_agy_workspace(argv, cwd)  # exactly one --add-dir, == the spawn cwd
     else:
         if not w.model:
             raise LaunchRefused("grok requires a model in policy")

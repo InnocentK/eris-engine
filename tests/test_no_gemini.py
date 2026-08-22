@@ -8,7 +8,9 @@ Allowed occurrences (each is about something that still exists):
   ``launch.NEVER_ENV_EXACT`` itself, so the allowance cannot outlive the entry;
 * ``~/.gemini/`` / ``.gemini/`` - paths: agy stores its state and the old
   OAuth file there (credential_files, brain-dir derivation);
-* the model-id prefix ``"gemini-"`` - the agy lineage guard in policy.py.
+* the model-id prefix ``"gemini-"`` - the agy lineage guard in policy.py;
+* ``GEMINI.md`` - the repository rules file agy injects from a declared
+  workspace (A15), named in the ``TODO(m2b)`` sanitization note.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ ALLOWED: tuple[str, ...] = (
     "~/.gemini/",
     ".gemini/",
     '"gemini-"',
+    "GEMINI.md",
 )
 _GEMINI = re.compile(r"gemini", re.IGNORECASE)
 
@@ -68,3 +71,4 @@ def test_the_allowed_gemini_occurrences_are_the_only_ones() -> None:
     )
     assert '"gemini-"' in text  # AGY_MODEL_PREFIX
     assert ".gemini/" in text  # brain-dir / credential paths
+    assert "GEMINI.md" in text and "TODO(m2b)" in text  # the sanitization note

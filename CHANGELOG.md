@@ -5,18 +5,23 @@
 Added
 * `agy` (Antigravity CLI 1.1.18) replaces the uninstalled `gemini` CLI as the
   Google lineage. `build_argv_agy`: `-p <prompt> --model <m> --mode plan
-  --sandbox --output-format json --disable-slash-commands --print-timeout
-  <max(30, timeout_s-30)>s [--json-schema <inline>]`; `parse_agy` (status
-  ERROR → FAILED with the worker's message, usage retained, `structured_output`
-  preferred, no model id / cost). Six captured agy envelopes are fixtures.
+  --sandbox --add-dir <snapshot realpath> --output-format json
+  --disable-slash-commands --print-timeout <max(30, timeout_s-30)>s
+  [--json-schema <inline>]`; `parse_agy` (status ERROR → FAILED with the
+  worker's message, usage retained, `structured_output` preferred, no model
+  id / cost). Nine captured agy envelopes are fixtures.
+* `--add-dir` is REQUIRED for agy (A14: without a declared workspace agy
+  cannot read even its own cwd; A16: with it, reads outside are denied — the
+  valid E1 pass). Exactly one, equal to the spawn cwd, re-checked element by
+  element in `plan_call` (`assert_agy_workspace`).
 * `eris.policy`: `CliName` is `claude|codex|agy|grok`; lineage guard - an agy
   worker must declare a `gemini-*` model. `policies/default.yaml`: agy entry
   (google, `gemini-3.1-pro-high`, `AGY_CLI_DISABLE_AUTO_UPDATE=1`),
   `~/.gemini/antigravity-cli/settings.json` among the credential files.
 * `FORBIDDEN_ARGV_TOKENS` += `accept-edits`, `--continue`, `--conversation`,
-  `--add-dir`, `--prompt-interactive`, `--input-format`, `--new-project`,
-  `--project`, `--agent`, `--log-file`; an exact-element test proves the agy
-  builder never emits `-c`. NEVER env += `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+  `--prompt-interactive`, `--input-format`, `--new-project`, `--project`,
+  `--agent`, `--log-file`; an exact-element test proves the agy builder never
+  emits `-c`. NEVER env += `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
   `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_GEMINI_BASE_URL`, `AGY_ADC_AUTH`,
   prefix `ANTIGRAVITY_`.
 * `parse_grok` reads `structuredOutput` (E9 capture); claude E9/E8b captures
@@ -40,6 +45,13 @@ Removed
   caller), the `gemini` worker and `PER_CLI_ENV["gemini"]`.
 
 Known caveats (documented, not resolved)
+* **agy injects the declared workspace's `AGENTS.md`/`GEMINI.md` rules**
+  (A15 replied `MANGO KIWI`); no opt-out flag. A9/A11's "no injection" was
+  vacuous (no workspace declared). Mitigation — per-worker snapshot
+  sanitization (strip `AGENTS.md`/`GEMINI.md`/`CLAUDE.md`/`.agents/` from the
+  agy worktree copy, recorded in the manifest) — is Milestone 2b
+  (`TODO(m2b)` at `build_argv_agy`). Until then agy output is exposed to
+  repo-authored instructions, same class as grok.
 * agy prints `warning: --mode plan has no effect while slash command
   expansion is disabled.` under the required argv; the observed denials come
   from its non-interactive permission check. Re-verify on version change.

@@ -21,6 +21,7 @@ from eris.launch import (
     LaunchRefused,
     WorkerCall,
     agy_print_timeout_s,
+    assert_agy_workspace,
     assert_argv_safe,
     assert_env_safe,
     build_argv_agy,
@@ -111,9 +112,27 @@ def test_codex_argv_exactly_as_specified(tmp_path: Path) -> None:
     ]
 
 
-def test_agy_argv_exactly_as_specified() -> None:
+def _agy_argv(tmp_path: Path, **kw: Any) -> list[str]:
+    prompt = kw.pop("prompt", PROMPT)
+    base: dict[str, Any] = {
+        "model": "gemini-3.1-pro-high",
+        "workspace": tmp_path,
+        "print_timeout_s": 30,
+    }
+    base.update(kw)
+    return build_argv_agy("/x/agy", prompt, **base)
+
+
+def test_agy_argv_exactly_as_specified(tmp_path: Path) -> None:
+    ws = tmp_path / "snap"
+    ws.mkdir()
     argv = build_argv_agy(
-        "/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=570, schema_json="{}"
+        "/x/agy",
+        PROMPT,
+        model="gemini-3.1-pro-high",
+        workspace=ws,
+        print_timeout_s=570,
+        schema_json="{}",
     )
     assert argv == [
         "/x/agy",
@@ -124,6 +143,8 @@ def test_agy_argv_exactly_as_specified() -> None:
         "--mode",
         "plan",
         "--sandbox",
+        "--add-dir",
+        str(ws.resolve()),
         "--output-format",
         "json",
         "--disable-slash-commands",
@@ -132,21 +153,56 @@ def test_agy_argv_exactly_as_specified() -> None:
         "--json-schema",
         "{}",
     ]
-    bare = build_argv_agy("/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=30)
+    bare = build_argv_agy(
+        "/x/agy", PROMPT, model="gemini-3.1-pro-high", workspace=ws, print_timeout_s=30
+    )
     assert bare == argv[:-4] + ["--print-timeout", "30s"] and "--json-schema" not in bare
     with pytest.raises(LaunchRefused, match="print-timeout"):
-        build_argv_agy("/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=0)
+        build_argv_agy(
+            "/x/agy", PROMPT, model="gemini-3.1-pro-high", workspace=ws, print_timeout_s=0
+        )
 
 
-def test_agy_argv_never_contains_continue_or_edit_flags() -> None:
+def test_agy_add_dir_is_the_workspace_realpath_exactly_once(tmp_path: Path) -> None:
+    """--add-dir is REQUIRED (A14: without it agy cannot read its own cwd) and
+    must be exactly the spawn cwd (A16: reads outside it are denied). A
+    symlinked workspace is resolved; the check is element-exact."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    argv = _agy_argv(tmp_path, workspace=link)
+    assert argv.count("--add-dir") == 1
+    assert argv[argv.index("--add-dir") + 1] == str(real.resolve())
+    assert_agy_workspace(argv, link)  # same cwd via the link resolves equal
+    assert_agy_workspace(argv, real)
+    with pytest.raises(LaunchRefused, match="must equal the spawn cwd"):
+        assert_agy_workspace(argv, tmp_path)  # points elsewhere
+    with pytest.raises(LaunchRefused, match="exactly one --add-dir"):
+        assert_agy_workspace(argv + ["--add-dir", str(real)], real)  # a second workspace
+    with pytest.raises(LaunchRefused, match="exactly one --add-dir"):
+        assert_agy_workspace([a for a in argv if a != "--add-dir"], real)  # none
+    truncated = argv[: argv.index("--add-dir") + 1]
+    with pytest.raises(LaunchRefused, match="must equal"):
+        assert_agy_workspace(truncated, real)  # flag without a value
+    # the prompt may mention --add-dir without counting as a workspace ...
+    quoted = _agy_argv(tmp_path, workspace=real, prompt="is --add-dir safe?")
+    assert quoted[2] == "is --add-dir safe?" and quoted.count("--add-dir") == 1
+    assert_agy_workspace(quoted, real)
+    # ... and even an element that IS exactly "--add-dir" at the prompt index is
+    # not a workspace (the builder refuses such a prompt anyway: starts with '-')
+    spoofed = list(argv)
+    spoofed[2] = "--add-dir"
+    assert_agy_workspace(spoofed, real)
+
+
+def test_agy_argv_never_contains_continue_or_edit_flags(tmp_path: Path) -> None:
     """`-c` (continue a conversation) is not a substring token (it would hit
     codex `-c project_doc_max_bytes=0` and git `--cached`), so the agy builder
     is checked element by element: no `-c`, no `--continue`, no accept-edits,
     no `--dangerously-skip-permissions`, with and without a schema."""
     for schema in (None, "{}", '{"type":"object"}'):
-        argv = build_argv_agy(
-            "/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=30, schema_json=schema
-        )
+        argv = _agy_argv(tmp_path, schema_json=schema)
         for element in argv[1:]:
             assert element != "-c"
             assert element != "--continue" and element != "--conversation"
@@ -154,10 +210,12 @@ def test_agy_argv_never_contains_continue_or_edit_flags() -> None:
             assert element != "--dangerously-skip-permissions"
         assert argv[argv.index("--mode") + 1] == "plan"
         assert argv.count("--mode") == 1 and argv.count("--print-timeout") == 1
+        assert argv.count("--add-dir") == 1
     # and the substring scan does refuse the long forms outside the prompt
-    for bad in ("--continue", "--conversation", "accept-edits", "--add-dir", "--agent"):
+    for bad in ("--continue", "--conversation", "accept-edits", "--project", "--agent"):
         with pytest.raises(LaunchRefused, match="forbidden token"):
-            build_argv_agy("/x/agy", PROMPT, model=f"gemini-{bad}", print_timeout_s=30)
+            _agy_argv(tmp_path, model=f"gemini-{bad}")
+    assert "--add-dir" not in FORBIDDEN_ARGV_TOKENS  # required, not forbidden (A14/A16)
 
 
 @pytest.mark.parametrize(
@@ -197,17 +255,24 @@ def test_forbidden_tokens_are_refused_outside_the_prompt(token: str) -> None:
         build_argv_claude(f"/x/{token}/claude", "hi")
     with pytest.raises(LaunchRefused):
         build_argv_grok("/x/grok", "hi", model=f"m-{token}")
+    ws = Path("/")
     with pytest.raises(LaunchRefused):
-        build_argv_agy("/x/agy", "hi", model=f"gemini-{token}", print_timeout_s=30)
+        build_argv_agy("/x/agy", "hi", model=f"gemini-{token}", workspace=ws, print_timeout_s=30)
     with pytest.raises(LaunchRefused):
-        build_argv_agy("/x/agy", "hi", model="gemini-x", print_timeout_s=30, schema_json=token)
+        build_argv_agy(
+            "/x/agy", "hi", model="gemini-x", workspace=ws, print_timeout_s=30, schema_json=token
+        )
+    with pytest.raises(LaunchRefused):
+        build_argv_agy("/x/agy", "hi", model="gemini-x", workspace=ws / token, print_timeout_s=30)
     # The prompt element is exempt: reviewers legitimately quote these flags.
     argv = build_argv_claude("/x/claude", f"Is using {token} here defensible?")
     assert argv[2] == f"Is using {token} here defensible?"
     codex = build_argv_codex("/x/codex", f"Explain {token}", cwd=Path("/"), model="m")
     assert codex[-1] == f"Explain {token}"
     assert build_argv_grok("/x/grok", f"review {token}", model="m")[2] == f"review {token}"
-    agy = build_argv_agy("/x/agy", f"review {token}", model="gemini-x", print_timeout_s=30)
+    agy = build_argv_agy(
+        "/x/agy", f"review {token}", model="gemini-x", workspace=ws, print_timeout_s=30
+    )
     assert agy[2] == f"review {token}"
     # spawn honours the same exemption, and only for the declared index
     with pytest.raises(LaunchRefused):
@@ -223,7 +288,7 @@ def test_argv_hygiene() -> None:
     with pytest.raises(LaunchRefused, match="starts with '-'"):
         build_argv_grok("/x/grok", "--help", model="m")
     with pytest.raises(LaunchRefused, match="starts with '-'"):
-        build_argv_agy("/x/agy", " -c", model="gemini-x", print_timeout_s=30)
+        build_argv_agy("/x/agy", " -c", model="gemini-x", workspace=Path("/"), print_timeout_s=30)
     with pytest.raises(LaunchRefused, match="empty prompt"):
         build_argv_codex("/x/codex", "  ", cwd=Path("/"), model="m")
     # The existing builders are unaffected by the agy token additions.
@@ -914,9 +979,16 @@ def test_plan_call_per_cli(tmp_path: Path) -> None:
             make_call(tmp_path, make_policy(tmp_path, "codex", provider="openai", model=None))
         )
     agy = make_policy(tmp_path, "agy", provider="google", model="gemini-3.1-pro-high")
-    argv = plan_call(make_call(tmp_path, agy)).argv
+    plan = plan_call(make_call(tmp_path, agy))
+    argv = plan.argv
     assert argv[1:3] == ["-p", PROMPT] and "--mode" in argv and "--sandbox" in argv
     assert "--json-schema" not in argv
+    # --add-dir is exactly the cwd that spawn receives
+    assert argv.count("--add-dir") == 1
+    assert (
+        argv[argv.index("--add-dir") + 1] == str(plan.cwd) == str((tmp_path / "snapshot").resolve())
+    )
+    assert_agy_workspace(argv, plan.cwd)
     with_schema = plan_call(make_call(tmp_path, agy, schema={"b": 1, "a": 2})).argv
     assert with_schema[-2:] == ["--json-schema", '{"a": 2, "b": 1}']  # inline, sorted keys
     # the policy's lineage guard makes model=None unconstructible; the launcher
@@ -1114,6 +1186,51 @@ def test_run_worker_agy_success_threads_conversation_and_duration(
     env = factory.instances[0].popen_kwargs["env"]
     assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1" and env["HOME"] == str(tmp_path / "home")
     assert "--sandbox" in res.argv and "-c" not in res.argv
+    # the workspace handed to agy is the very cwd the process was spawned in
+    assert res.argv[res.argv.index("--add-dir") + 1] == factory.instances[0].popen_kwargs["cwd"]
+    assert res.argv.count("--add-dir") == 1 and res.cwd == str((tmp_path / "snapshot").resolve())
+
+
+def test_plan_call_agy_refuses_a_tampered_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the builder ever emitted a second or a different --add-dir, plan_call
+    refuses before anything can spawn (and run_worker records REFUSED)."""
+    import eris.launch as launch
+
+    real_build = launch.build_argv_agy
+
+    def extra_dir(*a: Any, **kw: Any) -> list[str]:
+        return real_build(*a, **kw) + ["--add-dir", str(tmp_path)]
+
+    monkeypatch.setattr(launch, "build_argv_agy", extra_dir)
+    with pytest.raises(LaunchRefused, match="exactly one --add-dir"):
+        plan_call(make_call(tmp_path, _agy_policy(tmp_path)))
+    res = run_worker(make_call(tmp_path, _agy_policy(tmp_path)), popen=FakeProcessFactory())
+    assert res.status is WorkerStatus.REFUSED and "exactly one --add-dir" in str(res.error)
+
+    def elsewhere(*a: Any, **kw: Any) -> list[str]:
+        kw["workspace"] = tmp_path / "elsewhere"
+        return real_build(*a, **kw)
+
+    monkeypatch.setattr(launch, "build_argv_agy", elsewhere)
+    with pytest.raises(LaunchRefused, match="must equal the spawn cwd"):
+        plan_call(make_call(tmp_path, _agy_policy(tmp_path)))
+
+
+def test_parse_agy_add_dir_battery_fixtures() -> None:
+    """A14: no workspace -> even README.md inside the cwd is denied. A15: with
+    --add-dir the read succeeds AND the workspace rules are injected (MANGO
+    KIWI). A16: with --add-dir, an absolute path outside is denied."""
+    env = parse_agy(fixture("agy", "1.1.18", "read_denied_inside_no_workspace.json"))
+    assert env.is_error and "read_file" in str(env.error) and "/snap/README.md" in str(env.error)
+    assert env.usage is not None and env.usage.input_tokens == 6670
+    env = parse_agy(fixture("agy", "1.1.18", "read_ok_with_add_dir.json"))
+    assert not env.is_error and env.text == "MANGO KIWI\nhello\n"  # injection is in the record
+    assert env.conversation_id == "1c8f8ae9-9ead-44af-bf4f-54bc4ec62f90"
+    env = parse_agy(fixture("agy", "1.1.18", "read_denied_outside_with_add_dir.json"))
+    assert env.is_error and "/OUTSIDE/CANARY.txt" in str(env.error) and env.text is None
+    assert "CANARY-" not in json.dumps(env.raw)  # nothing leaked
 
 
 def test_run_worker_agy_status_error_is_failed_even_with_exit_code_zero(
