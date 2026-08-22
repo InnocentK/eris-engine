@@ -108,6 +108,46 @@ def test_doctor_never_prints_secret_values(tmp_path: Path) -> None:
     assert not (tmp_path / "runs" / ".doctor.lock").exists()
 
 
+def test_agy_state_dir_size_is_reported_and_warns_when_large(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy writes ~1 MB of transcript/SQLite state per run under
+    ~/.gemini/antigravity-cli/. The doctor reports the size (never the
+    content) and WARNs past the threshold; Eris never deletes vendor state."""
+    import eris.doctor as doctor
+
+    write_env(tmp_path)
+    agy = {
+        "transport": "cli",
+        "cli": "agy",
+        "provider": "google",
+        "model": "gemini-3.1-pro-high",
+        "executable_sha256": UNPINNED,
+        "timeout_s": 10,
+        "max_stdout_bytes": 1000,
+    }
+    policy = write_policy(tmp_path, None, pinned=False, vendors_allowed=["xai", "openai", "google"])
+    data = yaml.safe_load(policy.read_text())
+    data["workers"]["agy"] = agy
+    policy.write_text(yaml.safe_dump(data))
+    report = run_doctor(policy_path=policy, env_file=tmp_path / ".env", home=tmp_path)
+    line = by_name(report.render(), "worker.agy.state")
+    assert line.startswith("OK") and "absent" in line
+    brain = tmp_path / ".gemini" / "antigravity-cli" / "brain" / "conv-1"
+    brain.mkdir(parents=True)
+    (brain / "plan.md").write_bytes(b"x" * 2048)
+    (tmp_path / ".gemini" / "antigravity-cli" / "brain" / "link").symlink_to(tmp_path / "runs")
+    report = run_doctor(policy_path=policy, env_file=tmp_path / ".env", home=tmp_path)
+    line = by_name(report.render(), "worker.agy.state")
+    assert line.startswith("OK") and "brain 0.0 MiB" in line and "conversations" not in line
+    assert "plan.md" not in line  # sizes only, never names of the worker's files
+    monkeypatch.setattr(doctor, "AGY_STATE_WARN_BYTES", 1024)
+    report = run_doctor(policy_path=policy, env_file=tmp_path / ".env", home=tmp_path)
+    line = by_name(report.render(), "worker.agy.state")
+    assert line.startswith("WARN") and "clean up manually" in line and report.ok
+    assert "worker.grok.state" not in report.render()  # only agy has a state check
+
+
 def test_missing_worker_is_warn_not_fail(tmp_path: Path) -> None:
     write_env(tmp_path)
     report = run_doctor(

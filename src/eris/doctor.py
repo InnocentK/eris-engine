@@ -22,6 +22,24 @@ from eris.schemas import Transport
 Status = Literal["OK", "WARN", "FAIL"]
 Runner = Callable[[list[str], dict[str, str]], str | None]
 
+# Antigravity writes a transcript + SQLite state under this directory on EVERY
+# run (~1 MB/run observed 2026-08-22). Eris never deletes vendor state (lock
+# races, not ours); the doctor only reports its size so the user can clean up.
+AGY_STATE_DIR = ".gemini/antigravity-cli"
+AGY_STATE_SUBDIRS = ("brain", "conversations")
+AGY_STATE_WARN_BYTES = 256 * 1024 * 1024
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
 
 @dataclass(frozen=True)
 class Check:
@@ -100,6 +118,27 @@ def _env_names(env_file: Path) -> tuple[dict[str, str], Status, str]:
     return values, ("WARN" if perm else "OK"), f"{len(values)} non-empty names{perm}"
 
 
+def _agy_state_check(report: DoctorReport, wid: str, home: Path) -> None:
+    """Size of agy's brain/conversations state (names and byte counts only)."""
+    root = home / AGY_STATE_DIR
+    present = [sub for sub in AGY_STATE_SUBDIRS if (root / sub).is_dir()]
+    if not present:
+        report.add("OK", f"worker.{wid}.state", f"~/{AGY_STATE_DIR}/{{brain,conversations}} absent")
+        return
+    sizes = {sub: _dir_size(root / sub) for sub in present}
+    total = sum(sizes.values())
+    detail = ", ".join(f"{sub} {size / 1_048_576:.1f} MiB" for sub, size in sizes.items())
+    if total >= AGY_STATE_WARN_BYTES:
+        report.add(
+            "WARN",
+            f"worker.{wid}.state",
+            f"~/{AGY_STATE_DIR}: {detail} (>= {AGY_STATE_WARN_BYTES >> 20} MiB; every run adds "
+            "~1 MB; Eris never deletes vendor state - clean up manually)",
+        )
+    else:
+        report.add("OK", f"worker.{wid}.state", f"~/{AGY_STATE_DIR}: {detail}")
+
+
 def run_doctor(
     *,
     policy_path: Path,
@@ -158,6 +197,8 @@ def run_doctor(
     redactor = Redactor([*env_values.values(), *(creds.values if creds else [])])
 
     for wid, w in pol.workers.items():
+        if w.cli == "agy":
+            _agy_state_check(report, wid, home)
         if w.transport is Transport.API:
             present = w.api_key_env in names
             report.add(
