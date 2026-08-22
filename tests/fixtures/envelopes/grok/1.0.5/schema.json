@@ -1,0 +1,32 @@
+{
+  "text": "{\"answer\":\"ok\",\"n\":7}",
+  "stopReason": "end_turn",
+  "sessionId": "01a02b23-5512-7341-b497-564e96875d54",
+  "requestId": "83753963-2b14-44da-9df5-79c5f2f5281b",
+  "thought": "The user wants me to answer with answer=ok and n=7. There's also a response format specified:\n",
+  "usage": {
+    "input_tokens": 13462,
+    "cache_read_input_tokens": 128,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 1316,
+    "reasoning_tokens": 1306,
+    "total_tokens": 14906
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.034884,
+  "total_cost_usd_ticks": 348840000,
+  "modelUsage": {
+    "grok-4.6": {
+      "inputTokens": 13462,
+      "outputTokens": 1316,
+      "cacheReadInputTokens": 128,
+      "cacheCreationInputTokens": 0,
+      "modelCalls": 1,
+      "costUSD": 0.034884
+    }
+  },
+  "structuredOutput": {
+    "answer": "ok",
+    "n": 7
+  }
+}

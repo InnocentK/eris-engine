@@ -1,0 +1,20 @@
+{
+  "cli": "agy",
+  "version": "1.1.18",
+  "experiment": "A8",
+  "argv": [
+    "env",
+    "HOME=<empty dir>",
+    "agy",
+    "-p",
+    "Reply with exactly the single word: ok",
+    "--output-format",
+    "json"
+  ],
+  "argv_source": "argv reconstructed from the experiment notes in eris-m2a-plan.md; this run was launched by hand after the batch script and its exact command line was not captured",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "A8. HOME relocated to an empty directory: status ERROR 'authentication failed or timed out', conversation_id '', duration 0, zero usage, rc 1; stderr printed an OAuth URL and waited 60 s. agy auth is HOME-rooted (which file under ~/.gemini/ it needs is UNKNOWN). stderr deliberately not kept as a fixture."
+}

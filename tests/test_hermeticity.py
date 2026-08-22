@@ -23,6 +23,12 @@ def test_which_hides_worker_binaries(name: str) -> None:
     assert shutil.which(f"/opt/homebrew/bin/{name}") is None
 
 
+def test_agy_is_a_guarded_worker_binary() -> None:
+    """Antigravity's `agy` joined the guard in M2a; `gemini` stays (harmless)."""
+    assert "agy" in WORKER_BINARIES and "gemini" in WORKER_BINARIES
+    assert shutil.which("agy") is None
+
+
 def test_which_passes_through_non_worker_lookups() -> None:
     # git is not a worker; the guard must not lie about it.
     assert shutil.which("git") is not None

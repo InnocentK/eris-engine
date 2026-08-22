@@ -2,8 +2,8 @@
 
 Three autouse guards apply to EVERY test:
 
-1. ``shutil.which`` returns ``None`` for worker binaries (claude, codex, gemini,
-   grok, hermes, opencode, ollama) so a declared worker is never found.
+1. ``shutil.which`` returns ``None`` for worker binaries (claude, codex, agy,
+   gemini, grok, hermes, opencode, ollama) so a declared worker is never found.
 2. Every subprocess entry point raises :class:`HermeticityViolation`:
    ``subprocess.Popen`` (which also covers ``run``/``call``/``check_*``,
    ``os.popen`` and asyncio's unix transport), the ``subprocess`` module
@@ -23,6 +23,7 @@ drive ``eris.launch.spawn`` without a real process.
 from __future__ import annotations
 
 import asyncio
+import getpass
 import io
 import os
 import shutil
@@ -32,13 +33,23 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 WORKER_BINARIES: frozenset[str] = frozenset(
-    {"claude", "codex", "gemini", "grok", "hermes", "opencode", "ollama"}
+    {"claude", "codex", "agy", "gemini", "grok", "hermes", "opencode", "ollama"}
 )
+
+# Fixture redaction list: literal -> placeholder. Captured envelopes are
+# rewritten with this before they are committed, and a suite-wide test proves
+# that none of the literals (derived from the running environment, so the test
+# is portable) appears anywhere under tests/fixtures.
+FIXTURE_REDACTIONS: dict[str, str] = {
+    str(Path.home()): "/Users/USER",
+    getpass.getuser(): "USER",
+}
 
 _ORIG_WHICH = shutil.which
 _ORIG_POPEN_INIT = subprocess.Popen.__init__
