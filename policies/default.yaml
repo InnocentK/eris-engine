@@ -9,19 +9,24 @@
 #   (pytest is refused); flip only for repos you own after reading SECURITY.md.
 # - Model ids marked ASSUMPTION were not verified against a live account.
 
-policy_version: "2026-08-21.1"
+policy_version: "2026-08-22.1"
 trusted: false
 runs_dir: runs
 path_env: /usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
 vendors_allowed: [anthropic, openai, xai, google]
 api_hosts_allowed: [api.openai.com, api.x.ai, localhost, 127.0.0.1]
-# All four files verified to EXIST on this machine on 2026-08-22. A declared
+# All five files verified to EXIST on this machine on 2026-08-22. A declared
 # file that is missing is a doctor WARN; one that exists but cannot be parsed
 # refuses the run (its secrets could not be added to the redactor).
+# ~/.gemini/antigravity-cli/settings.json (126 B, mode 600) held only
+# enableTelemetry/trustedWorkspaces when inspected; where agy keeps its OAuth
+# token is UNKNOWN (A8: auth is HOME-rooted). Declared so that anything
+# secret-shaped that appears there is redacted.
 credential_files:
   - ~/.codex/auth.json
   - ~/.claude/.credentials.json
   - ~/.gemini/oauth_creds.json
+  - ~/.gemini/antigravity-cli/settings.json
   - ~/.grok/auth.json
 
 workers:
@@ -55,14 +60,20 @@ workers:
     executable_sha256: UNPINNED
     timeout_s: 600
     max_stdout_bytes: 10000000
-  gemini:
+  agy:                            # Antigravity CLI 1.1.18 (Google lineage; `gemini` CLI is gone)
     transport: cli
-    cli: gemini
+    cli: agy
     provider: google
-    model: gemini-2.5-pro         # ASSUMPTION; CLI unusable here on 2026-08-21
+    model: gemini-3.1-pro-high    # listed by `agy models` 2026-08-22; NOT observed executing
+                                  # (the envelope carries no model id). Must start with
+                                  # "gemini-" (lineage guard in eris.policy).
     executable_sha256: UNPINNED
-    timeout_s: 600
+    timeout_s: 600                # --print-timeout is derived: max(30, timeout_s - 30) s
     max_stdout_bytes: 10000000
+    env:
+      AGY_CLI_DISABLE_AUTO_UPDATE: "1"  # name from the binary's strings; effect ASSUMPTION.
+                                        # agy spawns a background auto-updater that would
+                                        # change the binary under its pin (doctor: re-pin).
   openai-api:
     transport: api
     provider: openai
