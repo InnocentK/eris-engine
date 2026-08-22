@@ -15,8 +15,9 @@ proposed answer or action is defensible.**
 
 Eris is NOT a coding harness, IDE/TUI, chatbot, personal assistant, memory
 system, model gateway, tracing product, deployment platform, or autonomous
-agent. Claude Code, Codex, Gemini CLI, Grok, OpenCode, Hermes, direct APIs, and
-Ollama models are replaceable **workers**; Eris owns the protocol and the record.
+agent. Claude Code, Codex, Antigravity (`agy`, the Google lineage), Grok,
+OpenCode, Hermes, direct APIs, and Ollama models are replaceable **workers**;
+Eris owns the protocol and the record.
 
 ## Guardrails (binding on every agent)
 
@@ -87,7 +88,14 @@ never push without being asked) → stop and report.
 - **Subprocess env is built from `{}`**, never filtered from `os.environ`.
   `--bare` is forbidden for claude (breaks OAuth here). Codex gets
   `-c project_doc_max_bytes=0` (repo `AGENTS.md` is otherwise injected even with
-  `--ignore-rules` — verified 2026-08-21).
+  `--ignore-rules` — verified 2026-08-21). `agy` gets `--mode plan --sandbox
+  --disable-slash-commands --print-timeout <N>s` and must declare a `gemini-*`
+  model (lineage guard; agy also serves other vendors' models).
+- **Workers read outside the snapshot.** E1 (2026-08-22): claude, codex and
+  grok all read the parent and sibling directories of the snapshot; only agy
+  refused (in-process permission check). Until the containment decision in
+  `docs/SECURITY.md` is made, Phase 0 may run plumbing and clean-control
+  tasks only — no defect-detection or ABSTAIN scoring.
 - **A missing worker is a recorded absence, never a substitution.** No
   fallback inside a panel — it collapses lineage diversity.
 - **Secrets only in `.env`**; never in YAML, never in the ledger, never printed

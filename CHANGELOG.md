@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.0 - Milestone 2a: Antigravity `agy` worker, E-experiment results (2026-08-22)
+
+Added
+* `agy` (Antigravity CLI 1.1.18) replaces the uninstalled `gemini` CLI as the
+  Google lineage. `build_argv_agy`: `-p <prompt> --model <m> --mode plan
+  --sandbox --output-format json --disable-slash-commands --print-timeout
+  <max(30, timeout_s-30)>s [--json-schema <inline>]`; `parse_agy` (status
+  ERROR → FAILED with the worker's message, usage retained, `structured_output`
+  preferred, no model id / cost). Six captured agy envelopes are fixtures.
+* `eris.policy`: `CliName` is `claude|codex|agy|grok`; lineage guard - an agy
+  worker must declare a `gemini-*` model. `policies/default.yaml`: agy entry
+  (google, `gemini-3.1-pro-high`, `AGY_CLI_DISABLE_AUTO_UPDATE=1`),
+  `~/.gemini/antigravity-cli/settings.json` among the credential files.
+* `FORBIDDEN_ARGV_TOKENS` += `accept-edits`, `--continue`, `--conversation`,
+  `--add-dir`, `--prompt-interactive`, `--input-format`, `--new-project`,
+  `--project`, `--agent`, `--log-file`; an exact-element test proves the agy
+  builder never emits `-c`. NEVER env += `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_GEMINI_BASE_URL`, `AGY_ADC_AUTH`,
+  prefix `ANTIGRAVITY_`.
+* `parse_grok` reads `structuredOutput` (E9 capture); claude E9/E8b captures
+  added as fixtures.
+* `SCHEMA_VERSION` 0.1.1 → **0.1.2**: `Invocation.conversation_id` and
+  `Invocation.worker_reported_duration_ms` (optional). New goldens under
+  `tests/fixtures/records/0.1.2/` + manifest entry; 0.1.0/0.1.1 untouched and
+  their manifest blocks are now pinned by hash in the test.
+* `eris doctor`: `worker.<id>.state` reports the size of agy's
+  brain/conversations directories (WARN ≥ 256 MiB); never deletes them.
+* Suite-wide fixture guards (`tests/test_fixtures.py`): no redaction literal
+  (home dir / username, derived from the environment) under `tests/fixtures`;
+  every capture has a `.meta.json` with its argv. `tests/test_no_gemini.py`:
+  no gemini builder/parser/literal in `src/eris`.
+* Docs: EVAL-PLAN results for E1/E1b/E2/E7/E8/E8b/E9 and A1–A11; SECURITY
+  E1 consequence + containment options (USER DECISION, option 1 recommended)
+  and the agy section; INVARIANTS rows for every new test.
+
+Removed
+* `build_argv_gemini`, `parse_gemini`, `first_balanced_json` (its only
+  caller), the `gemini` worker and `PER_CLI_ENV["gemini"]`.
+
+Known caveats (documented, not resolved)
+* agy prints `warning: --mode plan has no effect while slash command
+  expansion is disabled.` under the required argv; the observed denials come
+  from its non-interactive permission check. Re-verify on version change.
+* `AGY_CLI_DISABLE_AUTO_UPDATE` name from binary strings; effect ASSUMPTION.
+* Which model agy executed is unobservable (`model_executed=None`).
+
 ## 0.1.1 - schema versioning discipline (2026-08-22)
 
 * `SCHEMA_VERSION` 0.1.0 -> 0.1.1. The `Invocation` record gained four optional
