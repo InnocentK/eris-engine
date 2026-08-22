@@ -13,6 +13,7 @@ from eris.schemas import (
     Adjudication,
     Claim,
     Event,
+    Invocation,
     Origin,
     Record,
     Task,
@@ -185,6 +186,53 @@ def test_committed_goldens_are_immutable() -> None:
 def test_current_schema_version_has_a_manifest_entry() -> None:
     assert SCHEMA_VERSION in _manifest()
     assert sorted(_manifest()[SCHEMA_VERSION]) == sorted(f"{n}.json" for n in example_records())
+
+
+# sha256 of the canonical JSON of each HISTORICAL manifest block, taken before
+# 0.1.2 was added. These pin the manifest entries themselves so that editing a
+# committed golden together with its manifest line is still caught.
+HISTORICAL_MANIFEST_BLOCKS = {
+    "0.1.0": "46df57acc986804a99037db9fb21e8070e4c7944a31cf21e88d90752fb3b5c0c",
+    "0.1.1": "715e86bccfd674c7743c4e722bdd3f5081060002608a312cc0314b8a154c464e",
+}
+
+
+def test_historical_goldens_are_byte_identical_to_their_pinned_manifest() -> None:
+    """0.1.0 and 0.1.1 were committed before the 0.1.2 bump and must never
+    change: their manifest blocks hash to the values pinned here, and every
+    file on disk still hashes to its manifest line."""
+    import hashlib
+
+    manifest = _manifest()
+    for version, expected in HISTORICAL_MANIFEST_BLOCKS.items():
+        block = json.dumps(manifest[version], sort_keys=True, separators=(",", ":")).encode()
+        assert hashlib.sha256(block).hexdigest() == expected, f"manifest block {version} edited"
+        for name, digest in manifest[version].items():
+            on_disk = hashlib.sha256((RECORDS_ROOT / version / name).read_bytes()).hexdigest()
+            assert on_disk == digest, f"{version}/{name} edited"
+    assert SCHEMA_VERSION not in HISTORICAL_MANIFEST_BLOCKS  # the current version is pinned above
+
+
+def test_invocation_0_1_2_fields() -> None:
+    """0.1.2 added ``conversation_id`` and ``worker_reported_duration_ms``
+    (both optional, default None). The 0.1.2 golden exercises them; the 0.1.1
+    golden has no such keys (the serialization changed, hence the bump)."""
+    inv = example_records()["invocation"]
+    data = json.loads(canonical_bytes(inv))
+    assert data["conversation_id"] == "ed889929-a04c-457f-91d1-194be848aa04"
+    assert data["worker_reported_duration_ms"] == 2646 and data["duration_ms"] == 300250
+    old = json.loads((RECORDS_ROOT / "0.1.1" / "invocation.json").read_bytes())
+    assert "conversation_id" not in old and "worker_reported_duration_ms" not in old
+    bare = Invocation.model_validate(
+        {
+            k: v
+            for k, v in data.items()
+            if k not in ("conversation_id", "worker_reported_duration_ms")
+        }
+    )
+    assert bare.conversation_id is None and bare.worker_reported_duration_ms is None
+    with pytest.raises(ValidationError):
+        Invocation.model_validate({**data, "worker_reported_duration_ms": -1})
 
 
 def test_old_schema_versions_are_rejected_on_parse() -> None:
