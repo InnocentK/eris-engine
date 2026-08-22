@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased - advisor review fixes (2026-08-22)
+
+Fixed (each with a test that would have caught it; see docs/INVARIANTS.md)
+* `verify.run_allowlisted` takes raw argv and re-validates immediately
+  before spawn; a forged `Decision` can no longer execute.
+* Timeout kill path always sweeps the process group with SIGKILL after the
+  leader exits (members that ignore SIGTERM are now killed).
+* Codex `-o` output is read into memory and deleted; nothing unredacted
+  stays on disk; the per-call scratch dir is removed in `finally`.
+* `eval/run.py` validates run ids (`^[A-Za-z0-9_-]{1,64}$`) before building
+  any path and checks containment under the runs dir.
+* Executable preflight resolves and hashes the realpath and executes it.
+* Hard deny lists reconciled against captured `--help` of the pinned tools
+  (`tests/fixtures/help/`); `--plugins` (not a mypy flag) removed; ruff
+  `--line-length` and pytest `-rN` removed from the policy allowlist
+  (`-r` is now a value flag).
+* Writer: a complete but unparsable last line is INVALID, not a torn tail;
+  directories are fsynced at creation.
+* Snapshot builder records future commits, trees AND blobs; the verifier
+  checks every object id.
+* Doctor never probes an unpinned/mismatched binary; probe output is
+  redacted.
+* `model_executed` is None unless `modelUsage` names exactly one model;
+  forbidden-token scan exempts the prompt element.
+* `credential_files` corrected to the four files that exist on this machine;
+  a missing file is a warning, an unparsable one fails closed.
+* Idempotency key includes the snapshot base commit (`snapshot_sha`).
+
 ## 0.1.0 - 2026-08-22 - Phase 0, Milestone 1 (harness, no engine)
 
 Added

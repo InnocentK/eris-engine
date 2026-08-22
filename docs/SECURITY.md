@@ -27,7 +27,17 @@ Adversarial repositories are OUT of scope until containers (Phase 3).
 * Pinned executable path + sha256 checked immediately before spawn; a changed
   binary is refused. Pins are machine-specific (`policies/pins.yaml`).
 * `stdin=DEVNULL`, `shell=False`, `start_new_session=True`, stdout and stderr
-  byte caps drained concurrently, SIGTERM then SIGKILL to the process group.
+  byte caps drained concurrently. On timeout: SIGTERM to the process group,
+  wait for the leader, then ALWAYS a SIGKILL sweep of the whole group (a
+  member that ignores SIGTERM or outlives the leader is still killed).
+* The pinned path is resolved to its realpath; the realpath is hashed and is
+  what is executed (argv[0]), so a retargeted symlink cannot swap the binary
+  between check and exec.
+* Codex's `-o` last-message file is read into memory and deleted inside
+  `run_worker` (the per-call scratch directory is removed in `finally`); the
+  bytes reach disk only through `RunWriter.put_blob`.
+* `model_executed` is taken from the envelope only when it names exactly one
+  model; otherwise it is `None` (never guessed).
 * A worker's prompt may not start with `-`.
 
 ### Secrets (`redact.py`, `writer.py`, `policy.py`, `doctor.py`)
@@ -54,6 +64,8 @@ Known limits of the redactor (documented, tested):
 * Throughput is roughly 3 MB/s (50 MB in ~16 s on this machine).
 
 ### Mechanical verification (`verify.py`)
+`run_allowlisted` accepts only RAW argv and re-runs `check_command` itself
+immediately before spawning; there is no way to pass it a pre-made decision.
 Allowlist, not denylist: unknown flags are refused. Executable realpath +
 sha256 pinned; subcommand lists; literal flags; `flag value` / `flag=value`
 regexes; positional paths must realpath-resolve inside the snapshot and never
@@ -63,7 +75,9 @@ hard deny list (git `-c`/`-C`/`--exec-path`/`--git-dir`/`--work-tree`/
 `--rootdir`/`--import-mode`/`--basetemp`/`--pdb*`/`--junit-xml`/`--cov*`;
 ruff `--config`/`--fix*`/`--add-noqa`; mypy `--config-file`/`--plugins`/
 `--install-types`/`-c`/`-p`/`-m`/report flags) applies even if a policy
-allowlists them. `pytest` executes repository code (conftest.py) and is
+allowlists them. The deny lists were reconciled against the captured
+`--help` of the pinned versions (`tests/fixtures/help/`, 2026-08-22) and a
+test asserts every entry is a real flag of that version. `pytest` executes repository code (conftest.py) and is
 refused unless the policy is `trusted: true`.
 
 ### Snapshots (`snapshot.py`)

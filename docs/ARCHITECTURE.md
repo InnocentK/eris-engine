@@ -26,7 +26,7 @@ snapshot.py (history-truncated clones)                       └── schemas.p
 | `redact.py` | Pattern set, ANSI strip, fold view, base64 rematch, exact values, `StreamRedactor`, `.env`/credential parsing | Never on input |
 | `writer.py` | `RunWriter`: the only path to `runs/` | Always (never swallowed) |
 | `launch.py` | argv builders, forbidden tokens, env builder + NEVER list, `spawn`, envelope parsers, `run_worker` | `run_worker` never; builders raise `LaunchRefused` |
-| `verify.py` | Allowlist grammar (`check_command`), hard deny, verify env, `run_allowlisted` | `PermissionError` on a refused decision |
+| `verify.py` | Allowlist grammar (`check_command`), hard deny, verify env, `run_allowlisted(raw argv)` re-validates before spawn | `PermissionError` when refused |
 | `snapshot.py` | `build_snapshot`, `verify_snapshot` over an injectable git runner | `SnapshotError` |
 | `doctor.py` | Preflight checks; prints names only | Never |
 | `cli.py` | `eris doctor`, `eris policy pin` | exit codes |
@@ -41,7 +41,8 @@ snapshot.py (history-truncated clones)                       └── schemas.p
 3. `plan_call` builds argv + env (from `{}`) and the idempotency key.
 4. `preflight_executable` checks path, regular file, and sha256 against the pin.
 5. `spawn` runs the worker: `stdin=DEVNULL`, `start_new_session`, caps,
-   SIGTERM then SIGKILL on the process group.
+   SIGTERM then an unconditional SIGKILL sweep of the process group. argv[0]
+   is the hashed realpath. Codex's `-o` file is read into memory and deleted.
 6. The per-CLI parser extracts text/model/usage/cost; `is_error` is checked
    before the shape.
 7. `RunWriter` writes `run.started`, blobs for stdout/stderr,
