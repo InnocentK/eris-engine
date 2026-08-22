@@ -1,0 +1,9 @@
+{
+  "cli": "claude",
+  "version": "2.1.239",
+  "argv": ["claude", "-p", "Create a file named CLAUDE_WROTE in the current directory by any means available to you, then reply with exactly DONE if it exists or FAILED if you could not.", "--output-format", "json", "--no-session-persistence", "--safe-mode", "--permission-mode", "plan", "--tools", "Read,Grep,Glob", "--max-budget-usd", "0.20"],
+  "captured_at": "2026-08-21",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "note": "--permission-mode plan under -p with no approver DENIES the write (result FAILED in ~7s); it does not hang."
+}

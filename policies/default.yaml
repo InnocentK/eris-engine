@@ -1,0 +1,120 @@
+# Eris policy: declared workers, allowlists, budgets, vendors.
+#
+# - NO secrets here (a secret-shaped value refuses the load). Secrets go in .env;
+#   `env_allow` lists the NAMES that may be passed to a worker.
+# - `executable_sha256: UNPINNED` is a placeholder. Run `eris policy pin` to
+#   write machine-specific hashes to policies/pins.yaml (gitignored). Unpinned
+#   workers load but are refused at launch.
+# - `trusted: false` means verification may not execute repository code
+#   (pytest is refused); flip only for repos you own after reading SECURITY.md.
+# - Model ids marked ASSUMPTION were not verified against a live account.
+
+policy_version: "2026-08-21.1"
+trusted: false
+runs_dir: runs
+path_env: /usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
+vendors_allowed: [anthropic, openai, xai, google]
+api_hosts_allowed: [api.openai.com, api.x.ai, localhost, 127.0.0.1]
+# All four files verified to EXIST on this machine on 2026-08-22. A declared
+# file that is missing is a doctor WARN; one that exists but cannot be parsed
+# refuses the run (its secrets could not be added to the redactor).
+credential_files:
+  - ~/.codex/auth.json
+  - ~/.claude/.credentials.json
+  - ~/.gemini/oauth_creds.json
+  - ~/.grok/auth.json
+
+workers:
+  claude:
+    transport: cli
+    cli: claude
+    provider: anthropic
+    model: null                   # null = CLI default; set to pin a model
+    executable_sha256: UNPINNED
+    timeout_s: 600
+    max_stdout_bytes: 10000000
+    max_stderr_bytes: 1000000
+    max_budget_usd: 1.0
+    tools: [Read, Grep, Glob]
+    env:
+      DISABLE_AUTOUPDATER: "1"
+      DISABLE_TELEMETRY: "1"
+  codex:
+    transport: cli
+    cli: codex
+    provider: openai
+    model: gpt-5.4                # ASSUMPTION - verify against your account
+    executable_sha256: UNPINNED
+    timeout_s: 600
+    max_stdout_bytes: 10000000
+  grok:
+    transport: cli
+    cli: grok
+    provider: xai
+    model: grok-4.6               # observed in the 2026-08-21 capture
+    executable_sha256: UNPINNED
+    timeout_s: 600
+    max_stdout_bytes: 10000000
+  gemini:
+    transport: cli
+    cli: gemini
+    provider: google
+    model: gemini-2.5-pro         # ASSUMPTION; CLI unusable here on 2026-08-21
+    executable_sha256: UNPINNED
+    timeout_s: 600
+    max_stdout_bytes: 10000000
+  openai-api:
+    transport: api
+    provider: openai
+    model: gpt-5.4                # ASSUMPTION
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    executable_sha256: UNPINNED   # not applicable to api transport; required key kept uniform
+    timeout_s: 300
+    max_stdout_bytes: 10000000
+    env_allow: [OPENAI_API_KEY]
+
+verify:
+  max_output_bytes: 2000000
+  commands:
+    git:
+      executable: /usr/bin/git
+      executable_sha256: UNPINNED
+      subcommands: [diff, log, grep, show, status, ls-files, blame, rev-parse]
+      literal_flags: ["--stat", "--name-only", "--name-status", "-p", "--no-color", "--oneline", "-l", "--porcelain", "--numstat", "--follow", "-w", "--cached"]
+      value_flags:
+        "-n": "^[0-9]{1,4}$"
+        "--max-count": "^[0-9]{1,4}$"
+        "-e": "^[^\\x00\\n]{1,200}$"
+        "--format": "^[%A-Za-z0-9 ():,_-]{1,80}$"
+        "-L": "^[0-9]{1,6},[0-9]{1,6}$"
+      positional: ["path", "^(HEAD(~[0-9]{1,3})?|[0-9a-f]{7,40})(\\.\\.[0-9a-fA-Z~^]{1,44})?$"]
+    ruff:
+      executable: /opt/homebrew/bin/ruff
+      executable_sha256: UNPINNED
+      subcommands: [check]
+      literal_flags: ["--no-fix", "--quiet", "--isolated", "--no-cache", "--output-format=concise", "--output-format=json"]
+      value_flags:
+        "--select": "^[A-Z0-9,]{1,64}$"
+      positional: ["path"]
+    mypy:
+      executable: /opt/homebrew/bin/mypy
+      executable_sha256: UNPINNED
+      literal_flags: ["--strict", "--no-incremental", "--no-error-summary", "--hide-error-context", "--ignore-missing-imports", "--no-color-output", "--show-error-codes"]
+      positional: ["path"]
+    pytest:
+      executable: /opt/homebrew/bin/pytest
+      executable_sha256: UNPINNED
+      requires_trusted: true
+      literal_flags: ["-q", "-x", "--no-header", "--tb=short", "--tb=no", "--color=no"]
+      value_flags:
+        "-p": "^no:[A-Za-z0-9_]+$"
+        "-r": "^[fEsxXpPaAwN]{1,8}$"
+        "-k": "^[A-Za-z0-9_ ]{1,120}$"
+        "-m": "^[A-Za-z0-9_ ]{1,60}$"
+        "--maxfail": "^[0-9]{1,3}$"
+      positional: ["path"]
+
+budgets:
+  per_run_usd: 20.0
+  per_call_usd: 2.0
