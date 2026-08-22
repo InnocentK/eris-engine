@@ -79,6 +79,11 @@ the allow list is honoured). No other test may spawn `git`.
 | `model_executed` is None unless `modelUsage` names exactly one model; all names in `models_used` | `test_launch.py::test_parse_claude_safemode_two_models_means_unknown_model` |
 | The pinned path is resolved to its realpath, the realpath is hashed and is what goes in argv[0]; symlink to another file or retargeted symlink is refused | `test_launch.py::test_preflight_hashes_and_executes_the_realpath` |
 | Codex `-o` output is read into memory and deleted; no raw output file or schema remains on disk after `run_worker` (also on spawn failure) | `test_launch.py::test_run_worker_codex_output_file_never_stays_on_disk`, `::test_run_worker_codex_scratch_removed_even_on_spawn_failure` |
+| The per-call scratch dir is created fresh (`exist_ok=False`; pre-existing entry or symlink refused; symlinked parent refused) and, in the harness, only after `RunWriter` holds the lock | `test_launch.py::test_run_worker_refuses_preexisting_symlink_scratch`, `test_run_hermetic.py::test_invoke_creates_scratch_after_the_lock_and_refuses_planted_symlink` |
+| The `-o` file is `lstat`-checked and opened `O_NOFOLLOW`; a non-regular file is refused and never read | `test_launch.py::test_run_worker_refuses_symlinked_output_file` |
+| Scratch cleanup failure is never swallowed: `WorkerResult.cleanup_error`, `Invocation.cleanup_error`, a `run.error` event, manifest `extra.cleanup_error`, exit code 4 | `test_launch.py::test_run_worker_codex_cleanup_failure_is_surfaced`, `test_run_hermetic.py::test_invoke_surfaces_cleanup_failure_as_run_error` |
+| An over-cap `-o` file is capped and flagged (`output_file_truncated`, `output_file_size`) on the result and the Invocation | `test_launch.py::test_run_worker_codex_output_file_truncation_flag` |
+| `snapshot_sha` is only ever read from the snapshot's `.git` (no `--snapshot-sha` flag exists) | `test_run_hermetic.py::test_invoke_key_includes_snapshot_sha_from_git_head` |
 | Idempotency key includes the snapshot base commit | `test_launch.py::test_idempotency_key_excludes_arm_includes_repeat`, `test_run_hermetic.py::test_invoke_key_includes_snapshot_sha_from_git_head` |
 | Env built from `{}`; NEVER list; only Eris's `GIT_*` hardening allowed | `test_launch.py::test_env_is_built_from_empty_dict`, `::test_never_list_names_are_refused`, `::test_git_hardening_values_are_the_only_git_vars_allowed` |
 | `stdin=DEVNULL`, `start_new_session`, `shell=False`, cwd = snapshot realpath | `test_launch.py::test_spawn_passes_hardened_popen_kwargs` |
@@ -99,7 +104,7 @@ the allow list is honoured). No other test may spawn `git`.
 | No shell: metacharacters stay one argument | `test_verify_allowlist.py::test_no_shell_so_metacharacters_stay_one_argument` |
 | Verify env from `{}` with git hardening | `test_verify_allowlist.py::test_verify_env_is_built_from_empty_and_git_hardened` |
 | `run_allowlisted` takes RAW argv and re-applies `check_command` immediately before spawn; a forged or stale `Decision` cannot reach `spawn` | `test_verify_allowlist.py::test_run_allowlisted_revalidates_raw_argv_before_spawn`, `::test_forged_decision_cannot_reach_spawn`, `::test_run_allowlisted_refuses_forbidden_launch_tokens` |
-| Every `HARD_DENY` entry is a real flag of the pinned tool version (captured `--help` in `tests/fixtures/help/`: git 2.50.1, pytest 9.1.1, ruff 0.16.4, mypy 2.3.1, captured 2026-08-22); every policy-allowlisted flag exists too | `test_verify_allowlist.py::test_every_hard_deny_entry_is_a_real_flag_of_the_pinned_tool`, `::test_mandatory_hard_deny_entries_present`, `::test_default_policy_allowlists_only_real_flags` |
+| Every `HARD_DENY` entry is a real flag of the pinned tool version (captured `--help` in `tests/fixtures/help/`: git 2.50.1 global + `-h`/man of log, grep, show, diff, status, ls-files, blame, rev-parse; pytest 9.1.1; ruff 0.16.4; mypy 2.3.1; captured 2026-08-22). Every policy-allowlisted flag appears in that help; for git, in the help of at least one declared subcommand | `test_verify_allowlist.py::test_every_hard_deny_entry_is_a_real_flag_of_the_pinned_tool`, `::test_mandatory_hard_deny_entries_present`, `::test_default_policy_allowlists_only_real_flags`, `::test_git_subcommand_help_fixtures_are_full_captures` |
 
 ## Snapshots (`src/eris/snapshot.py`)
 | Rule | Test |
@@ -115,6 +120,7 @@ the allow list is honoured). No other test may spawn `git`.
 | Doctor never prints secret values | `test_doctor.py::test_doctor_never_prints_secret_values`, `::test_cli_doctor` |
 | Missing worker is WARN; changed binary is FAIL | `test_doctor.py::test_missing_worker_is_warn_not_fail`, `::test_changed_binary_is_fail` |
 | `--probe` never executes an unpinned or hash-mismatched binary; probe output is passed through the redactor before printing | `test_doctor.py::test_probe_output_is_redacted_and_mismatched_binary_is_never_probed` |
+| After a credential-file parse failure NO worker is probed (the redactor would lack those values) | `test_doctor.py::test_probe_skipped_entirely_on_credential_parse_failure` |
 | A declared credential file that is missing is WARN; one that exists but cannot be parsed is FAIL (doctor) / refuses the run (harness) | `test_doctor.py::test_unparsable_credential_file_is_fail_missing_is_warn`, `test_redact.py::test_load_credential_values_from_json_files`, `test_run_hermetic.py::test_invoke_refuses_unparsable_credential_file` |
 | Run ids match `^[A-Za-z0-9_-]{1,64}$` and are validated BEFORE any path is built; the run dir must sit directly under the runs dir | `test_run_hermetic.py::test_invoke_refuses_unsafe_run_ids_before_touching_disk`, `::test_run_id_helpers` |
 | flock probe | `test_doctor.py::test_doctor_never_prints_secret_values`, `::test_flock_probe_failure_is_fail` |

@@ -16,7 +16,9 @@ Adversarial repositories are OUT of scope until containers (Phase 3).
   (UNVERIFIED: the CLI was unusable here).
 * `--bare`, `bypassPermissions`, `workspace-write`, `danger-full-access`,
   `yolo`, `--dangerously-skip-permissions`, `--full-auto`, `acceptEdits`,
-  `--skip-trust`, `--allow-all` are refused anywhere in argv, case-insensitive.
+  `--skip-trust`, `--allow-all` are refused, case-insensitive, in every argv
+  element EXCEPT the prompt (a reviewer may legitimately quote them); the
+  prompt itself may not start with `-`.
 * Env built from `{}`. NEVER list: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
   `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`, `PYTEST_ADDOPTS`,
   `PYTEST_PLUGINS`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `NODE_OPTIONS`,
@@ -33,9 +35,13 @@ Adversarial repositories are OUT of scope until containers (Phase 3).
 * The pinned path is resolved to its realpath; the realpath is hashed and is
   what is executed (argv[0]), so a retargeted symlink cannot swap the binary
   between check and exec.
-* Codex's `-o` last-message file is read into memory and deleted inside
-  `run_worker` (the per-call scratch directory is removed in `finally`); the
-  bytes reach disk only through `RunWriter.put_blob`.
+* Codex's `-o` last-message file is read into memory (without following
+  symlinks; a non-regular file is refused unread) and deleted inside
+  `run_worker`; the per-call scratch directory is created fresh (existing
+  entry or symlink refused) under the run's tmp after the writer holds the
+  lock, and removed in `finally`. A cleanup failure is reported as
+  `cleanup_error` and becomes a `run.error` event (exit code 4), never
+  silent. Oversize files are capped and flagged `output_file_truncated`.
 * `model_executed` is taken from the envelope only when it names exactly one
   model; otherwise it is `None` (never guessed).
 * A worker's prompt may not start with `-`.
@@ -73,7 +79,7 @@ into `.git/`; response files, `-`, control characters refused. A per-tool
 hard deny list (git `-c`/`-C`/`--exec-path`/`--git-dir`/`--work-tree`/
 `--ext-diff`/`--textconv`/`-O`/`--output`; pytest `-c`/`-p <plugin>`/`-o`/
 `--rootdir`/`--import-mode`/`--basetemp`/`--pdb*`/`--junit-xml`/`--cov*`;
-ruff `--config`/`--fix*`/`--add-noqa`; mypy `--config-file`/`--plugins`/
+ruff `--config`/`--fix*`/`--add-noqa`; mypy `--config-file`/`--shadow-file`/
 `--install-types`/`-c`/`-p`/`-m`/report flags) applies even if a policy
 allowlists them. The deny lists were reconciled against the captured
 `--help` of the pinned versions (`tests/fixtures/help/`, 2026-08-22) and a
@@ -83,12 +89,14 @@ refused unless the policy is `trusted: true`.
 ### Snapshots (`snapshot.py`)
 History-truncated clones: `--no-local --depth N --single-branch`, origin
 removed, `FETCH_HEAD`/`ORIG_HEAD`/hooks removed, no alternates. The verifier
-proves every future commit fails `git cat-file -e`.
+proves every future OBJECT (commit, tree and blob, from `git rev-list
+--objects --all --not <pre_fix>` in the source mirror) fails `git cat-file -e`.
 
 ### Ledger (`writer.py`)
 One writer per run (`flock`), temp+fsync+rename for blobs and manifest,
-append+fsync for events, hash chain, torn-tail truncation only on explicit
-resume, malformed middle line = INVALID. Failures raise.
+append+fsync for events, hash chain. Only a partial (non-newline-terminated)
+final line is truncated, and only on explicit resume; any complete invalid
+line, including the last, is INVALID. Failures raise.
 
 ## Residual risks (UNKNOWN / not enforced)
 * Whether a worker can READ outside the snapshot (answer keys, the Athena

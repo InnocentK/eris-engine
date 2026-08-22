@@ -2,6 +2,24 @@
 
 ## Unreleased - advisor review fixes (2026-08-22)
 
+Round 2 (remaining BLOCK conditions)
+* Codex scratch: per-call dir created with `exist_ok=False` (existing entry
+  or symlink refused, symlinked parent refused) under the run's scratch,
+  which the harness creates only after the writer holds the lock; `-o` is
+  `lstat`-checked and opened `O_NOFOLLOW`; `rmtree` failures are reported
+  (`cleanup_error` on the result and Invocation, `run.error` event, exit 4).
+* `output_file_truncated` / `output_file_size` on `WorkerResult` and
+  `Invocation` (golden `invocation.json` regenerated: four optional fields).
+* `--snapshot-sha` flag dropped; the base commit is read from `.git` only.
+* Doctor skips every probe after a credential-file parse failure.
+* Full `git <sub> -h` + man captures for all declared subcommands added to
+  `tests/fixtures/help/`; the policy test requires each git flag to appear
+  in at least one declared subcommand's help; `--no-pager` (a global
+  option) dropped from the policy.
+* Docs/docstrings aligned with the code (forbidden tokens exempt the
+  prompt; mypy `--plugins` gone; snapshot checks cover every object; only a
+  partial final line is a torn write).
+
 Fixed (each with a test that would have caught it; see docs/INVARIANTS.md)
 * `verify.run_allowlisted` takes raw argv and re-validates immediately
   before spawn; a forged `Decision` can no longer execute.
