@@ -21,7 +21,15 @@ from pathlib import Path
 from typing import IO, Any
 
 from eris.doctor import run_doctor
-from eris.launch import KillPg, LaunchRefused, PopenFactory, WorkerCall, plan_call, run_worker
+from eris.launch import (
+    KillPg,
+    LaunchRefused,
+    PopenFactory,
+    WorkerCall,
+    make_private_dir,
+    plan_call,
+    run_worker,
+)
 from eris.policy import LoadedPolicy, PolicyError, load_policy
 from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
 from eris.schemas import CostRecord, Invocation, Stage, Transport, WorkerStatus, now_ts
@@ -99,7 +107,7 @@ def _build_call(
         tmpdir=str(scratch_dir / "tmp") if scratch_dir else "/tmp",
         path_env=loaded.policy.path_env,
         secrets={k: v for k, v in secrets.items() if k in worker.env_allow},
-        snapshot_sha=args.snapshot_sha or read_head_sha(snapshot),
+        snapshot_sha=read_head_sha(snapshot),  # filesystem-observed, never user-supplied
     )
 
 
@@ -156,12 +164,12 @@ def cmd_invoke(
     env_values = _read_env_values(Path(args.env_file))
     creds = load_credential_values(_credential_paths(loaded, home))  # raises if unparsable
     redactor = Redactor(list(env_values.values()) + creds.values)
-    scratch = run_dir / "scratch"
-    scratch.mkdir(parents=True, exist_ok=True)
-    (scratch / "tmp").mkdir(exist_ok=True)
+    scratch = run_dir / "scratch"  # path only; created AFTER the writer holds the lock
     call = _build_call(loaded, args, env_values, home, scratch)
     plan_key = plan_call(call).idempotency_key if call.policy.executable else None
     with RunWriter(run_dir, redactor, run_id=run_id) as writer:
+        make_private_dir(scratch)  # refuses a pre-existing entry or symlink
+        (scratch / "tmp").mkdir()
         started = now_ts()
         writer.append(
             "run.started",
@@ -214,8 +222,18 @@ def cmd_invoke(
             cost_usd=result.cost_usd,
             stdout_sha256=stdout_ref.sha256 if stdout_ref else None,
             stderr_sha256=stderr_ref.sha256 if stderr_ref else None,
+            output_file_sha256=output_ref.sha256 if output_ref else None,
+            output_file_truncated=result.output_file_truncated,
+            output_file_size=result.output_file_size,
+            cleanup_error=result.cleanup_error,
         )
         writer.append("invocation.finished", invocation)
+        if result.cleanup_error:
+            # A raw worker file MAY remain under the run's scratch dir: run-level error, never silent.
+            writer.append(
+                "run.error",
+                {"kind": "scratch_cleanup_failed", "error": result.cleanup_error},
+            )
         writer.append(
             "cost",
             CostRecord(
@@ -236,6 +254,8 @@ def cmd_invoke(
                     "text": result.text,
                     "structured": result.structured,
                     "output_file_sha256": output_ref.sha256 if output_ref else None,
+                    "output_file_truncated": result.output_file_truncated,
+                    "output_file_size": result.output_file_size,
                 },
             )
         else:
@@ -243,7 +263,13 @@ def cmd_invoke(
                 "worker.absent",
                 {"worker_id": args.worker, "status": result.status.value, "error": result.error},
             )
-        manifest = writer.finalize({"worker_id": args.worker, "status": result.status.value})
+        manifest = writer.finalize(
+            {
+                "worker_id": args.worker,
+                "status": result.status.value,
+                "cleanup_error": result.cleanup_error,
+            }
+        )
     summary = {
         "run_dir": str(run_dir),
         "manifest": str(manifest),
@@ -253,6 +279,7 @@ def cmd_invoke(
         "model_executed": result.model_executed,
         "cost_usd": result.cost_usd,
         "duration_ms": result.duration_ms,
+        "cleanup_error": result.cleanup_error,
         "redactions": {
             k: v
             for ref in (stdout_ref, stderr_ref, output_ref)
@@ -261,6 +288,8 @@ def cmd_invoke(
         },
     }
     print(json.dumps(summary, indent=2, sort_keys=True), file=out)
+    if result.cleanup_error:
+        return 4  # run-level error even when the worker itself succeeded
     return 0 if result.status is WorkerStatus.OK else 3
 
 
@@ -280,7 +309,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--prompt-file", required=True)
         p.add_argument("--snapshot", required=True)
         p.add_argument("--task-id", default="adhoc")
-        p.add_argument("--snapshot-sha", default=None, help="base commit (default: read .git/HEAD)")
         p.add_argument("--stage", default="propose", choices=[s.value for s in Stage])
         p.add_argument("--repeat-index", type=int, default=0)
 

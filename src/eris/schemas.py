@@ -231,6 +231,10 @@ class Invocation(Record):
     cost_usd: float | None = Field(default=None, ge=0)
     stdout_sha256: Sha256 | None
     stderr_sha256: Sha256 | None
+    output_file_sha256: Sha256 | None = None
+    output_file_truncated: bool = False
+    output_file_size: int | None = Field(default=None, ge=0)
+    cleanup_error: str | None = None
 
 
 class Claim(Record):

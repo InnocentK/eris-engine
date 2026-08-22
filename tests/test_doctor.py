@@ -264,6 +264,29 @@ def test_unparsable_credential_file_is_fail_missing_is_warn(tmp_path: Path) -> N
     assert line.startswith("FAIL") and "cannot be parsed" in line and not report.ok
 
 
+def test_probe_skipped_entirely_on_credential_parse_failure(tmp_path: Path) -> None:
+    exe = fake_exe(tmp_path)
+    env = write_env(tmp_path)
+    (tmp_path / "auth.json").write_text("{not json")
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], _env: dict[str, str]) -> str | None:
+        calls.append(argv)
+        return "grok 1.0.5"
+
+    report = run_doctor(
+        policy_path=write_policy(tmp_path, exe, pinned=True),
+        env_file=env,
+        probe=True,
+        runner=runner,
+        home=tmp_path,
+    )
+    assert calls == []  # a pinned, hash-verified worker was still NOT probed
+    assert by_name(report.render(), "credential-file").startswith("FAIL")
+    assert "skipped (credential parse failure)" in by_name(report.render(), "worker.grok.probe")
+    assert not report.ok
+
+
 def test_default_probe_runner_is_a_real_subprocess_call() -> None:
     with pytest.raises(HermeticityViolation):
         default_probe_runner(["/usr/bin/true", "--version"], {})

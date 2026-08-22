@@ -81,7 +81,7 @@ verify:
       executable: /usr/bin/git
       executable_sha256: UNPINNED
       subcommands: [diff, log, grep, show, status, ls-files, blame, rev-parse]
-      literal_flags: ["--stat", "--name-only", "--name-status", "-p", "--no-color", "--oneline", "-l", "--porcelain", "--no-pager", "--numstat", "--follow", "-w", "--cached"]
+      literal_flags: ["--stat", "--name-only", "--name-status", "-p", "--no-color", "--oneline", "-l", "--porcelain", "--numstat", "--follow", "-w", "--cached"]
       value_flags:
         "-n": "^[0-9]{1,4}$"
         "--max-count": "^[0-9]{1,4}$"

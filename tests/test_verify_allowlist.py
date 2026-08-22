@@ -334,8 +334,12 @@ def test_run_allowlisted_refuses_forbidden_launch_tokens(
 # --------------------------------------------------------------------------- deny lists vs help
 
 HELP_DIR = Path(__file__).parent / "fixtures" / "help"
+GIT_SUBCOMMAND_HELP = {
+    sub: f"git-{sub}-2.50.1.txt"
+    for sub in ("log", "grep", "show", "diff", "status", "ls-files", "blame", "rev-parse")
+}
 HELP_FILES = {
-    "git": ["git-2.50.1.txt", "git-diff-2.50.1.txt", "git-log-2.50.1.txt"],
+    "git": ["git-2.50.1.txt", *GIT_SUBCOMMAND_HELP.values()],
     "pytest": ["pytest-9.1.1.txt"],
     "ruff": ["ruff-check-0.16.4.txt"],
     "mypy": ["mypy-2.3.1.txt"],
@@ -408,17 +412,36 @@ def test_mandatory_hard_deny_entries_present() -> None:
 
 
 def test_default_policy_allowlists_only_real_flags() -> None:
-    """Literal and value flags in policies/default.yaml must exist in the captured help."""
+    """Every literal/value flag in policies/default.yaml must appear in the
+    captured help of the tool; for git, in the help (`-h` + man page) of at
+    least one DECLARED subcommand (the policy's git grammar is shared across
+    its subcommands)."""
     from eris.policy import load_policy
 
     repo_policy = Path(__file__).resolve().parents[1] / "policies" / "default.yaml"
     pol = load_policy(repo_policy, pins_path=repo_policy.with_name("no-such-pins.yaml")).policy
     for name, cmd in pol.verify.commands.items():
-        text = "\n".join((HELP_DIR / f).read_text() for f in HELP_FILES[name])
-        flags = [*cmd.literal_flags, *cmd.value_flags]
-        unknown = [f for f in flags if f != "--" and not _flag_in_help(f.split("=")[0], text)]
+        flags = [f for f in (*cmd.literal_flags, *cmd.value_flags) if f != "--"]
         if name == "git":
-            # git-log/grep/show/blame help was not captured in full; only global+diff flags checked
-            unknown = [f for f in unknown if f in HARD_DENY["git"]]
-        assert unknown == [], f"{name}: {unknown}"
+            assert set(cmd.subcommands) <= set(GIT_SUBCOMMAND_HELP), "capture every subcommand"
+            helps = {
+                sub: (HELP_DIR / GIT_SUBCOMMAND_HELP[sub]).read_text() for sub in cmd.subcommands
+            }
+            unknown = [
+                f
+                for f in flags
+                if not any(_flag_in_help(f.split("=")[0], text) for text in helps.values())
+            ]
+        else:
+            text = "\n".join((HELP_DIR / f).read_text() for f in HELP_FILES[name])
+            unknown = [f for f in flags if not _flag_in_help(f.split("=")[0], text)]
+        assert unknown == [], f"{name}: not substantiated by captured help: {unknown}"
         assert not any(f in HARD_DENY.get(name, ()) for f in flags), name
+
+
+def test_git_subcommand_help_fixtures_are_full_captures() -> None:
+    """Each git subcommand fixture is `git <sub> -h` plus its man page, not a stub."""
+    for sub, fname in GIT_SUBCOMMAND_HELP.items():
+        text = (HELP_DIR / fname).read_text()
+        assert len(text) > 10_000, f"{fname} looks truncated ({len(text)} bytes)"
+        assert f"git-{sub}" in text or f"git {sub}" in text

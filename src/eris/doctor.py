@@ -138,11 +138,13 @@ def run_doctor(
     report.add(st, "env-file", msg)
 
     credential_paths = [_expand(raw, home) for raw in pol.credential_files]
+    creds_failed = False
     try:
         creds = load_credential_values(credential_paths)
     except CredentialFileError as exc:
         report.add("FAIL", "credential-file", str(exc))
         creds = None
+        creds_failed = True  # the redactor would be missing those values: no probes at all
     else:
         for raw, path in zip(pol.credential_files, credential_paths, strict=True):
             present = path.exists()
@@ -198,6 +200,9 @@ def run_doctor(
         if missing:
             report.add("WARN", f"worker.{wid}.env", f"env_allow names absent from .env: {missing}")
         if probe and w.cli:
+            if creds_failed:
+                report.add("WARN", f"worker.{wid}.probe", "skipped (credential parse failure)")
+                continue
             if not hash_ok:
                 # Never execute an unpinned or mismatched binary, even for --version.
                 report.add("WARN", f"worker.{wid}.probe", "skipped: binary is not pinned/verified")

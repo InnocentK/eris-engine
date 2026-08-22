@@ -919,6 +919,110 @@ def test_run_worker_codex_output_file_never_stays_on_disk(
     assert not (scratch / Path(seen["out"]).parent.name).exists()
 
 
+def _codex_call(tmp_path: Path, scratch: Path, **kw: Any) -> WorkerCall:
+    codex = make_policy(tmp_path, "codex", provider="openai", model="gpt-5.4")
+    return make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=scratch, **kw)
+
+
+def _call_dir(call: WorkerCall) -> Path:
+    assert call.scratch_dir is not None
+    return Path(call.scratch_dir) / f"call-{idempotency_key(call)[:16]}"
+
+
+def test_run_worker_codex_cleanup_failure_is_surfaced(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_rmtree(path: Any, *a: Any, **k: Any) -> None:
+        raise OSError(f"EBUSY {path}")
+
+    monkeypatch.setattr("eris.launch.shutil.rmtree", broken_rmtree)
+    call = _codex_call(tmp_path, tmp_path / "s")
+    res = run_worker(
+        call, popen=fake_process(stdout=fixture("codex", "0.147.0", "exec_nodoc.jsonl"))
+    )
+    assert res.status is WorkerStatus.OK  # the worker itself succeeded ...
+    assert res.cleanup_error is not None and "EBUSY" in res.cleanup_error  # ... but never silently
+    assert _call_dir(call).exists()  # the leftover is real, and reported
+
+
+def test_run_worker_refuses_preexisting_symlink_scratch(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    scratch = tmp_path / "s"
+    call = _codex_call(tmp_path, scratch)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    scratch.mkdir()
+    _call_dir(call).symlink_to(elsewhere)  # planted link at the exact per-call path
+    factory = fake_process(stdout=b"{}")
+    res = run_worker(call, popen=factory)
+    assert res.status is WorkerStatus.REFUSED and "symlink" in str(res.error)
+    assert factory.instances == [] and list(elsewhere.iterdir()) == []
+    assert _call_dir(call).is_symlink()  # not ours: left untouched
+    # a pre-existing plain directory is refused too (exist_ok=False)
+    _call_dir(call).unlink()
+    _call_dir(call).mkdir()
+    res = run_worker(call, popen=factory)
+    assert res.status is WorkerStatus.REFUSED and "already exists" in str(res.error)
+    # and a symlinked scratch parent
+    link_parent = tmp_path / "link-parent"
+    link_parent.symlink_to(elsewhere)
+    res = run_worker(_codex_call(tmp_path, link_parent), popen=factory)
+    assert res.status is WorkerStatus.REFUSED and "symlink" in str(res.error)
+    assert factory.instances == []
+
+
+def test_run_worker_refuses_symlinked_output_file(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    scratch = tmp_path / "s"
+    call = _codex_call(tmp_path, scratch)
+    target = tmp_path / "victim.json"
+    target.write_text('{"stolen": "sk-proj-' + "Vv5" * 16 + '"}')
+    factory = fake_process(stdout=fixture("codex", "0.147.0", "exec_nodoc.jsonl"))
+
+    def popen(args: list[str], **kw: Any) -> FakeProcess:
+        out_path = Path(args[args.index("-o") + 1])
+        out_path.symlink_to(target)  # the worker replaced its output with a link
+        return factory(args, **kw)
+
+    res = run_worker(call, popen=popen)
+    assert res.status is WorkerStatus.REFUSED and "not a regular file" in str(res.error)
+    assert res.output_file is None and res.structured is None
+    assert target.exists()  # the link target is untouched and was never read
+    assert not _call_dir(call).exists()  # our scratch (with the link) is gone
+    assert res.cleanup_error is None
+
+
+def test_run_worker_codex_output_file_truncation_flag(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    codex = make_policy(
+        tmp_path, "codex", provider="openai", model="gpt-5.4", max_stdout_bytes=4096
+    )
+    call = make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=tmp_path / "s")
+    factory = fake_process(stdout=fixture("codex", "0.147.0", "exec_nodoc.jsonl"))
+    big = b"x" * 10_000
+
+    def popen(args: list[str], **kw: Any) -> FakeProcess:
+        Path(args[args.index("-o") + 1]).write_bytes(big)
+        return factory(args, **kw)
+
+    res = run_worker(call, popen=popen)
+    assert res.status is WorkerStatus.OK
+    assert res.output_file_truncated is True and res.output_file_size == 10_000
+    assert res.output_file == big[:4096]
+    # under the cap: not flagged
+    small = fake_process(stdout=fixture("codex", "0.147.0", "exec_nodoc.jsonl"))
+
+    def popen_small(args: list[str], **kw: Any) -> FakeProcess:
+        Path(args[args.index("-o") + 1]).write_bytes(b"{}")
+        return small(args, **kw)
+
+    res = run_worker(call, popen=popen_small)
+    assert res.output_file_truncated is False and res.output_file_size == 2
+
+
 def test_run_worker_codex_scratch_removed_even_on_spawn_failure(tmp_path: Path) -> None:
     codex = make_policy(tmp_path, "codex", provider="openai", model="gpt-5.4")
 

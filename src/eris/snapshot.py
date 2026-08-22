@@ -1,4 +1,5 @@
-"""History-truncated corpus snapshots: no future commit is reachable.
+"""History-truncated corpus snapshots: no future object (commit, tree or
+blob) is present.
 
 Build: ``git clone --mirror`` of the source into a temporary mirror, force a
 branch at the pre-fix sha, ``git clone --no-local --depth N --single-branch

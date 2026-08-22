@@ -261,17 +261,80 @@ def test_invoke_key_includes_snapshot_sha_from_git_head(
     key_head = json.loads(out_b.getvalue())
     assert key_head["snapshot_sha"] == sha
     assert key_head["idempotency_key"] != key_none["idempotency_key"]
-    out_c = io.StringIO()
-    main(
-        ["dry-run", *common_args(w), "--snapshot-sha", "e" * 40],
-        out=out_c,
+    # The base commit is mechanically observed from the snapshot; there is no
+    # flag to assert it (a user-supplied value would be recorded as observed).
+    with pytest.raises(SystemExit):
+        main(
+            ["dry-run", *common_args(w), "--snapshot-sha", "e" * 40],
+            out=io.StringIO(),
+            home=tmp_path,
+        )
+
+
+def test_invoke_creates_scratch_after_the_lock_and_refuses_planted_symlink(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = setup_world(tmp_path)
+    runs = tmp_path / "runs"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (runs / "r").mkdir(parents=True)
+    (runs / "r" / "scratch").symlink_to(elsewhere)
+    factory = fake_process(stdout=b"{}")
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(runs), "--run-id", "r"],
+        out=out,
         home=tmp_path,
-        popen=fake_process(),
+        popen=factory,
     )
-    assert json.loads(out_c.getvalue())["idempotency_key"] not in (
-        key_head["idempotency_key"],
-        key_none["idempotency_key"],
+    assert rc == 2 and "symlink" in json.loads(out.getvalue())["error"]
+    assert factory.instances == [] and list(elsewhere.iterdir()) == []
+    assert (runs / "r" / ".lock").exists()  # the writer had opened before scratch was touched
+    assert not (runs / "r" / "manifest.json").exists()
+
+
+def test_invoke_surfaces_cleanup_failure_as_run_error(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A WorkerResult carrying cleanup_error becomes a run.error event, is
+    recorded on the Invocation and the manifest, and yields exit code 4 even
+    though the worker itself succeeded. Never silent."""
+    import eval.run as harness
+
+    from eris.launch import run_worker as real_run_worker
+
+    w = setup_world(tmp_path)
+    grok = json.loads((FIX / "grok" / "1.0.5" / "plan.json").read_bytes())
+    grok["stopReason"] = "stop"
+
+    def flaky_cleanup(call: object, **kw: object) -> object:
+        res = real_run_worker(call, **kw)  # type: ignore[arg-type]
+        res.cleanup_error = "scratch cleanup failed for /x: EBUSY"
+        return res
+
+    monkeypatch.setattr(harness, "run_worker", flaky_cleanup)
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(tmp_path / "runs"), "--run-id", "r"],
+        out=out,
+        home=tmp_path,
+        popen=fake_process(stdout=json.dumps(grok).encode()),
+        killpg=lambda *_: None,
     )
+    summary = json.loads(out.getvalue())
+    assert rc == 4 and summary["status"] == "ok" and "EBUSY" in summary["cleanup_error"]
+    run_dir = tmp_path / "runs" / "r"
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_bytes().splitlines()]
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["run.started", "invocation.finished", "run.error", "cost", "proposal.raw"]
+    assert events[1]["payload"]["cleanup_error"] == "scratch cleanup failed for /x: EBUSY"
+    assert events[2]["payload"] == {
+        "kind": "scratch_cleanup_failed",
+        "error": "scratch cleanup failed for /x: EBUSY",
+    }
+    manifest = json.loads((run_dir / "manifest.json").read_bytes())
+    assert "EBUSY" in manifest["extra"]["cleanup_error"]
 
 
 def test_invoke_refuses_unparsable_credential_file(

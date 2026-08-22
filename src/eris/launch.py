@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -945,6 +946,9 @@ class WorkerResult:
     parse_mode: str
     models_used: list[str] = field(default_factory=list)
     output_file: bytes | None = None  # codex `-o` last message: read into memory, file deleted
+    output_file_truncated: bool = False  # True when the `-o` file exceeded max_stdout_bytes
+    output_file_size: int | None = None  # original size of the `-o` file
+    cleanup_error: str | None = None  # scratch removal failed: a raw file MAY remain on disk
 
 
 def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -> WorkerResult:
@@ -975,6 +979,51 @@ def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -
     )
 
 
+def make_private_dir(path: Path) -> None:
+    """Create ``path`` for this call only. Refuse a pre-existing entry or a
+    symlink (a planted link could redirect the unredacted `-o` file)."""
+    if path.is_symlink() or path.exists():
+        raise LaunchRefused(f"scratch path {path} already exists (or is a symlink); refusing")
+    parent = path.parent
+    if parent.is_symlink():
+        raise LaunchRefused(f"scratch parent {parent} is a symlink; refusing")
+    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(exist_ok=False)
+    except FileExistsError:
+        raise LaunchRefused(f"scratch path {path} appeared concurrently; refusing") from None
+
+
+def read_output_file(path: Path, cap: int) -> tuple[bytes | None, int | None, bool]:
+    """Read a worker-written output file WITHOUT following symlinks.
+
+    Returns (bytes capped at ``cap``, original size, truncated). A missing
+    file yields (None, None, False). Anything that is not a regular file is
+    refused (LaunchRefused) and never read.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None, None, False
+    if not stat.S_ISREG(st.st_mode):
+        raise LaunchRefused(f"worker output {path} is not a regular file; refusing to read it")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if sum(len(c) for c in chunks) < cap:
+                chunks.append(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)[:cap]
+    return data, size, size > cap
+
+
 def run_worker(
     call: WorkerCall,
     *,
@@ -1001,9 +1050,17 @@ def run_worker(
     w = call.policy
     call_dir = plan.schema_path.parent if plan.schema_path is not None else None
     output_file: bytes | None = None
+    output_size: int | None = None
+    output_truncated = False
+    output_refusal: str | None = None
+    cleanup_error: str | None = None
     try:
-        if plan.schema_path is not None and call.schema is not None:
-            plan.schema_path.parent.mkdir(parents=True, exist_ok=True)
+        if call_dir is not None and plan.schema_path is not None and call.schema is not None:
+            try:
+                make_private_dir(call_dir)
+            except LaunchRefused as exc:
+                call_dir = None  # nothing of ours to clean up
+                return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
             plan.schema_path.write_text(json.dumps(call.schema, sort_keys=True), encoding="utf-8")
         try:
             spawned = spawn(
@@ -1022,13 +1079,22 @@ def run_worker(
             return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
         except OSError as exc:
             return _absent(call, WorkerStatus.FAILED, f"spawn failed: {exc}", plan.idempotency_key)
-        if plan.output_path is not None and plan.output_path.is_file():
-            output_file = plan.output_path.read_bytes()[: w.max_stdout_bytes]
+        if plan.output_path is not None:
+            try:
+                output_file, output_size, output_truncated = read_output_file(
+                    plan.output_path, w.max_stdout_bytes
+                )
+            except LaunchRefused as exc:
+                output_refusal = str(exc)
     finally:
         # Never leave the unredacted `-o` file (or the schema) on disk; the
-        # caller passes output_file through RunWriter.put_blob.
+        # caller passes output_file through RunWriter.put_blob. A cleanup
+        # failure is NOT swallowed: it is reported on the result.
         if call_dir is not None:
-            shutil.rmtree(call_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(call_dir)
+            except OSError as exc:
+                cleanup_error = f"scratch cleanup failed for {call_dir}: {exc}"
     assert w.cli is not None
     envelope = PARSERS[w.cli](spawned.stdout)
     if envelope.structured is None and output_file:
@@ -1037,6 +1103,9 @@ def run_worker(
     if spawned.timed_out:
         status = WorkerStatus.TIMEOUT
         error = f"timed out after {w.timeout_s}s (killed with signal {spawned.killed_with})"
+    elif output_refusal is not None:
+        status = WorkerStatus.REFUSED
+        error = output_refusal
     elif envelope.is_error:
         status = WorkerStatus.FAILED
         error = envelope.error or "worker reported an error"
@@ -1072,4 +1141,7 @@ def run_worker(
         parse_mode=envelope.parse_mode,
         models_used=envelope.models_used,
         output_file=output_file,
+        output_file_truncated=output_truncated,
+        output_file_size=output_size,
+        cleanup_error=cleanup_error,
     )

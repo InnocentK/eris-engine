@@ -15,9 +15,10 @@ Guarantees (each has a test in tests/test_writer.py; see docs/INVARIANTS.md):
   append -> flush -> fsync (events).
 * ``seq`` is contiguous from 0 and ``prev_sha256`` chains line bytes.
 * Only one writer per run directory (``flock(LOCK_EX | LOCK_NB)``).
-* Opening for resume verifies the chain; a torn final line (no trailing
-  newline, or unparsable) is truncated ONLY on resume; a malformed line in
-  the middle makes the ledger INVALID and the writer refuses.
+* Opening for resume verifies the chain. ONLY a partial final line (no
+  trailing newline: an interrupted write) is truncated, and only on resume.
+  A complete line that does not validate, anywhere including last, makes
+  the ledger INVALID and the writer refuses.
 * Failures raise. Nothing is swallowed; no partial blob is left behind.
 """
 
