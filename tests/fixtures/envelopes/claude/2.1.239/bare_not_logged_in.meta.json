@@ -1,0 +1,9 @@
+{
+  "cli": "claude",
+  "version": "2.1.239",
+  "argv": ["claude", "-p", "Reply with exactly the single word: ok", "--output-format", "json", "--bare", "--max-budget-usd", "0.10"],
+  "captured_at": "2026-08-21",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "note": "--bare breaks OAuth here: is_error=true, result='Not logged in'. --bare is FORBIDDEN in Eris argv."
+}

@@ -1,0 +1,28 @@
+{
+  "text": "I'll create `GROK_WROTE` and fetch `https://example.com` with curl, then report each result in the requested format.",
+  "stopReason": "cancelled",
+  "sessionId": "01a02744-5fa2-7543-92c1-cfe035589436",
+  "requestId": "15b5e11d-29c9-49f2-a05e-1cd563adb057",
+  "thought": "The user wants me to do two things:\n",
+  "usage": {
+    "input_tokens": 13638,
+    "cache_read_input_tokens": 256,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 643,
+    "reasoning_tokens": 485,
+    "total_tokens": 14537
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.031262,
+  "total_cost_usd_ticks": 312620000,
+  "modelUsage": {
+    "grok-4.6": {
+      "inputTokens": 13638,
+      "outputTokens": 643,
+      "cacheReadInputTokens": 256,
+      "cacheCreationInputTokens": 0,
+      "modelCalls": 1,
+      "costUSD": 0.031262
+    }
+  }
+}

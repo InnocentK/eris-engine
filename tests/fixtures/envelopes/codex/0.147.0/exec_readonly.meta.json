@@ -1,0 +1,9 @@
+{
+  "cli": "codex",
+  "version": "0.147.0",
+  "argv": ["codex", "exec", "-s", "read-only", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--json", "-C", "<scratch repo>", "<write+fetch prompt>"],
+  "captured_at": "2026-08-21",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "note": "JSONL. Write and network blocked by the OS sandbox (touch: Operation not permitted). Repo AGENTS.md (MANGO) was still injected despite --ignore-rules; stderr said 'Reading additional input from stdin...'. No model id in any event."
+}

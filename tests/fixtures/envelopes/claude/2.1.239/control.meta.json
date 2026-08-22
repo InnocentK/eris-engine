@@ -1,0 +1,9 @@
+{
+  "cli": "claude",
+  "version": "2.1.239",
+  "argv": ["claude", "-p", "Reply with exactly the single word: ok", "--output-format", "json", "--no-session-persistence", "--max-budget-usd", "0.10"],
+  "captured_at": "2026-08-21",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "note": "Control run WITHOUT --safe-mode: the scratch repo's CLAUDE.md (PINEAPPLE) was injected and its SessionStart hook ran."
+}

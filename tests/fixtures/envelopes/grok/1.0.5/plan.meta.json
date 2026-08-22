@@ -1,0 +1,9 @@
+{
+  "cli": "grok",
+  "version": "1.0.5",
+  "argv": ["grok", "-p", "<write+fetch prompt>", "--permission-mode", "plan", "--output-format", "json"],
+  "captured_at": "2026-08-21",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "note": "Plan mode blocked the write; stopReason 'cancelled'. Reports modelUsage (grok-4.6), usage, total_cost_usd."
+}

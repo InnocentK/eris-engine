@@ -164,10 +164,10 @@ class FakeProcess:
         returncode: int = 0,
         hang: bool = False,
         pid: int = 424242,
-        **popen_kwargs: Any,
+        popen_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.args = args
-        self.popen_kwargs = popen_kwargs
+        self.popen_kwargs = popen_kwargs or {}
         self.stdout = io.BytesIO(stdout)
         self.stderr = io.BytesIO(stderr)
         self.pid = pid
@@ -212,7 +212,7 @@ class FakeProcessFactory:
         self.instances: list[FakeProcess] = []
 
     def __call__(self, args: Any, **popen_kwargs: Any) -> FakeProcess:
-        proc = FakeProcess(args, **self.defaults, **popen_kwargs)
+        proc = FakeProcess(args, popen_kwargs=popen_kwargs, **self.defaults)
         self.instances.append(proc)
         return proc
 

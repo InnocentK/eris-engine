@@ -1,0 +1,9 @@
+{
+  "cli": "codex",
+  "version": "0.147.0",
+  "argv": ["codex", "exec", "-s", "read-only", "--ignore-user-config", "--ignore-rules", "--ephemeral", "-c", "project_doc_max_bytes=0", "--json", "-C", "<scratch repo>", "Reply with exactly the single word: ok"],
+  "captured_at": "2026-08-21",
+  "captured_by": "synthesizer",
+  "redacted": true,
+  "note": "With -c project_doc_max_bytes=0 the AGENTS.md injection (MANGO) is suppressed."
+}
