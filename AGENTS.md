@@ -89,8 +89,10 @@ never push without being asked) → stop and report.
   `--bare` is forbidden for claude (breaks OAuth here). Codex gets
   `-c project_doc_max_bytes=0` (repo `AGENTS.md` is otherwise injected even with
   `--ignore-rules` — verified 2026-08-21). `agy` gets `--mode plan --sandbox
-  --disable-slash-commands --print-timeout <N>s` and must declare a `gemini-*`
-  model (lineage guard; agy also serves other vendors' models).
+  --add-dir <snapshot> --output-format json --disable-slash-commands
+  --print-timeout <N>s` (canonical order; `--add-dir` is required — without it
+  agy cannot read its own cwd) and must declare a `gemini-*` model (lineage
+  guard; agy also serves other vendors' models).
 - **Workers read outside the snapshot.** E1 (2026-08-22): claude, codex and
   grok all read the parent and sibling directories of the snapshot; only agy
   refused (in-process permission check). Until the containment decision in

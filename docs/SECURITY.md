@@ -98,10 +98,11 @@ engineering recommendation is option 1.
 ### Antigravity `agy` 1.1.18 (Google lineage, M2a)
 What each part of the required argv enforces, and what it does not:
 * `--mode plan` is agy's IN-PROCESS policy (no repo write, shell denied —
-  A2/A5). It is not an OS boundary. **Caveat (A6/A10/A10b/A11 stderr):**
-  `warning: --mode plan has no effect while slash command expansion is
-  disabled.` With `--disable-slash-commands` present, the denials actually
-  observed (write A6, shell A5/A6, read outside cwd A10b) come from agy's
+  A2/A5). It is not an OS boundary. **Caveat (A6/A10/A10b/A11/A14–A16
+  stderr):** `warning: --mode plan has no effect while slash command
+  expansion is disabled.` With `--disable-slash-commands` present, the
+  denials actually observed (write A6, shell A5/A6, read outside the declared
+  workspace A16) come from agy's
   non-interactive permission check, which refuses every tool call it cannot
   prompt for. The set is kept as specified because it denied everything it
   was asked to deny on 1.1.18; it must be re-verified on any version change
@@ -128,14 +129,27 @@ What each part of the required argv enforces, and what it does not:
   `CLAUDE.md`/`.agents/` from the agy worktree copy, recorded in the
   manifest) — **Milestone 2b**. Until then agy proposals/critiques are
   exposed to repo-authored instructions, the same class as grok.
-* `--print-timeout max(30, timeout_s-30)s`: agy's own timer fires first and
-  emits a parseable `status ERROR` envelope (A7); Eris's `timeout_s` and the
-  process-group SIGKILL sweep remain the backstop.
-* Lineage guard (`eris.policy`): an `agy` worker must declare a `gemini-*`
-  model because `agy models` also serves Claude and GPT-OSS ids. The
-  envelope carries no model id, so which model actually executed is UNKNOWN
-  (`model_executed=None`); the agy log for A9 said the requested id was "not
-  in local config, defaulting".
+* Canonical argv order (the code is the reference; docs and sidecars follow
+  it): `-p <prompt> --model <m> --mode plan --sandbox --add-dir <snapshot
+  realpath> --output-format json --disable-slash-commands --print-timeout
+  <N>s [--json-schema <inline>]`.
+* `--print-timeout <N>s` with `N = timeout_s - 30` above 60 s, else
+  `max(1, timeout_s // 2)` — ALWAYS strictly less than Eris's `timeout_s`,
+  so agy's own timer fires first and emits a parseable `status ERROR`
+  envelope (A7); Eris's `timeout_s` and the process-group SIGKILL sweep
+  remain the backstop. A policy `timeout_s` below 2 s is refused for agy
+  (no positive whole second is strictly smaller than 1). `timeout_s` itself
+  is a strict int in `[1, 86400]` (no `"60"`/`60.0`/`true` coercion).
+* Lineage guard (`eris.policy`): an `agy` worker must declare a model
+  matching `^gemini-\S+$` because `agy models` also serves Claude and
+  GPT-OSS ids. The guard is SYNTACTIC only: the envelope carries no model
+  id, so which model actually executed is UNKNOWN (`model_executed=None`),
+  and agy may silently default — the agy log for A9 said the requested id
+  was "not in local config, defaulting".
+* Parser containment: a parser exception (e.g. a malformed
+  `duration_seconds`) never escapes `run_worker`; the result is FAILED with
+  `<cli>: parser failure: …`, and `worker_reported_duration_ms` accepts only
+  finite values in `[0, 1e7]` s.
 * Residual, not enforced: every run writes a transcript and SQLite state under
   `~/.gemini/antigravity-cli/{brain,conversations}/` (≈1 MB/run; plan mode
   writes its implementation plan there too). Eris never deletes vendor state
@@ -152,7 +166,7 @@ What each part of the required argv enforces, and what it does not:
   `enableTelemetry`/`trustedWorkspaces`.
 * Hooks: no `.agents/hooks.json` SessionStart hook fired in A9/A11, but those
   runs had no declared workspace; whether hooks fire with `--add-dir` is
-  UNKNOWN (EVAL-PLAN E16).
+  UNKNOWN (EVAL-PLAN E11).
 
 ### Secrets (`redact.py`, `writer.py`, `policy.py`, `doctor.py`)
 * Secrets live only in `.env`. A secret-shaped value in any policy or pins

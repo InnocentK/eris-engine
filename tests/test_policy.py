@@ -104,15 +104,65 @@ def test_agy_loads_with_a_gemini_model(tmp_path: Path) -> None:
     assert loaded.policy.workers["agy"].model == "gemini-3.1-pro-high"
 
 
-@pytest.mark.parametrize("model", [None, "claude-fable-5", "gpt-oss-120b", "Gemini-3", "gemini"])
+@pytest.mark.parametrize(
+    "model",
+    [
+        None,
+        "",
+        "claude-fable-5",
+        "gpt-oss-120b",
+        "Gemini-3",
+        "gemini",
+        "gemini-",  # at least one char after the dash
+        "gemini- ",
+        " gemini-x",  # nothing before the prefix
+        "GEMINI-x",  # exact lowercase prefix
+        "xgemini-y",
+        "gemini-3 pro",  # no whitespace inside an id
+    ],
+)
 def test_agy_lineage_guard_refuses_non_gemini_models(tmp_path: Path, model: str | None) -> None:
     """agy also serves Claude and GPT-OSS ids: an agy worker without a
-    gemini-* model is refused at policy load with a clear message."""
+    gemini-* model is refused at policy load with a clear message. The guard
+    is SYNTACTIC: it cannot prove which model executed."""
     with pytest.raises(PolicyError, match="lineage guard: cli `agy` requires `model`"):
         load_policy(write(tmp_path, _agy(model)))
     # other CLIs are not subject to the guard
     loaded = load_policy(write(tmp_path, minimal_policy(), "other.yaml"))
     assert loaded.policy.workers["claude"].model is None
+
+
+@pytest.mark.parametrize("model", ["gemini-3.1-pro-high", "gemini-x", "gemini-2.5-flash_preview"])
+def test_agy_lineage_guard_accepts_gemini_ids(tmp_path: Path, model: str) -> None:
+    assert load_policy(write(tmp_path, _agy(model))).policy.workers["agy"].model == model
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout_s", "60"),
+        ("timeout_s", 60.0),
+        ("timeout_s", True),
+        ("timeout_s", 0),
+        ("timeout_s", 86_401),
+        ("max_stdout_bytes", "1000"),
+        ("max_stdout_bytes", 1000.0),
+        ("max_stdout_bytes", True),
+        ("max_stderr_bytes", "1"),
+        ("max_stderr_bytes", 1.0),
+    ],
+)
+def test_worker_int_limits_are_strict(tmp_path: Path, field: str, value: object) -> None:
+    """timeout_s / max_*_bytes feed timers and caps: no string, float or bool
+    coercion, and timeout_s is bounded to [1, 86400]."""
+    data = minimal_policy()
+    workers = data["workers"]
+    assert isinstance(workers, dict)
+    workers["claude"][field] = value
+    with pytest.raises(PolicyError, match=field):
+        load_policy(write(tmp_path, data))
+    workers["claude"][field] = 86_400 if field == "timeout_s" else 7
+    assert load_policy(write(tmp_path, data, "ok.yaml")).policy.workers["claude"]
 
 
 def test_minimal_policy_loads_with_defaults(tmp_path: Path) -> None:

@@ -23,7 +23,6 @@ drive ``eris.launch.spawn`` without a real process.
 from __future__ import annotations
 
 import asyncio
-import getpass
 import io
 import os
 import shutil
@@ -33,7 +32,6 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterator
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -42,14 +40,14 @@ WORKER_BINARIES: frozenset[str] = frozenset(
     {"claude", "codex", "agy", "gemini", "grok", "hermes", "opencode", "ollama"}
 )
 
-# Fixture redaction list: literal -> placeholder. Captured envelopes are
-# rewritten with this before they are committed, and a suite-wide test proves
-# that none of the literals (derived from the running environment, so the test
-# is portable) appears anywhere under tests/fixtures.
-FIXTURE_REDACTIONS: dict[str, str] = {
-    str(Path.home()): "/Users/USER",
-    getpass.getuser(): "USER",
-}
+# Fixture redaction placeholders. Captured envelopes are rewritten before they
+# are committed: the capturing user's home directory becomes /Users/USER and
+# the experiment directory (whose name embedded the username) becomes
+# /private/tmp/OUTSIDE. tests/test_fixtures.py scans every fixture for any
+# OTHER /Users/<name>, /home/<name> or /private/tmp/claude-501/-Users-<...>
+# path (portable: no username literal anywhere in the repository).
+FIXTURE_HOME_PLACEHOLDER = "/Users/USER"
+FIXTURE_OUTSIDE_PLACEHOLDER = "/private/tmp/OUTSIDE"
 
 _ORIG_WHICH = shutil.which
 _ORIG_POPEN_INIT = subprocess.Popen.__init__

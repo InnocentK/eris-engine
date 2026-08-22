@@ -17,10 +17,10 @@
     "--print-timeout",
     "570s"
   ],
-  "argv_source": "argv reconstructed from the experiment notes in eris-m2a-plan.md; this run was launched by hand after the batch script and its exact command line was not captured",
+  "argv_source": "reconstructed by the synthesizer from the experiment script; not mechanically captured",
   "captured_at": "2026-08-22",
   "captured_by": "synthesizer",
   "redacted": true,
   "redaction": "the outside directory (under this session's scratchpad, whose name embeds the username) -> /private/tmp/OUTSIDE",
-  "note": "A10b. Full required argv; the read_file tool call on an ABSOLUTE path outside cwd was denied: status ERROR, rc 1, no canary in the output, usage retained. This is the one worker whose read reach was confined in E1 (in-process permission check, not OS-level). stderr carried 'warning: --mode plan has no effect while slash command expansion is disabled.' - the denial is agy's non-interactive permission check, not plan mode."
+  "note": "A10b. The required argv OF THE TIME, WITHOUT --add-dir (the workspace flag became required in M2a step 7 after A14-A16); the read_file tool call on an ABSOLUTE path outside cwd was denied: status ERROR, rc 1, no canary in the output, usage retained. This denial is VACUOUS as an E1 result: A14 showed that without --add-dir agy denies reads even inside its own cwd. The valid E1 pass is A16 (read_denied_outside_with_add_dir). stderr carried 'warning: --mode plan has no effect while slash command expansion is disabled.' - the denial is agy's non-interactive permission check, not plan mode."
 }

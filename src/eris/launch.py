@@ -11,10 +11,11 @@ tests/fixtures/envelopes/*/*.meta.json and docs/EVAL-PLAN.md):
   --json [--output-schema F] [-o F] <prompt>``.
 * agy (Antigravity 1.1.18, the Google lineage): ``-p <prompt> --model <m>
   --mode plan --sandbox --add-dir <snapshot realpath> --output-format json
-  --disable-slash-commands --print-timeout <N>s [--json-schema S]`` with
-  ``N = max(30, timeout_s - 30)`` so agy's own timer fires first and still
-  emits a parseable envelope; the Eris timeout + process-group kill is the
-  backstop. ``--add-dir`` is REQUIRED and appears exactly once, equal to the
+  --disable-slash-commands --print-timeout <N>s [--json-schema S]`` (this
+  order is canonical) with ``N = timeout_s - 30`` above 60 s, else
+  ``max(1, timeout_s // 2)`` - always strictly less than ``timeout_s`` so
+  agy's own timer fires first and still emits a parseable envelope; the Eris
+  timeout + process-group kill is the backstop (``timeout_s < 2`` refused). ``--add-dir`` is REQUIRED and appears exactly once, equal to the
   spawn cwd: without a declared workspace agy cannot read the repository at
   all (A14), with it reads are confined to that workspace (A16). ``--sandbox``
   must be DROPPED if Eris ever wraps agy in its own sandbox-exec (nested
@@ -35,6 +36,7 @@ never a substitution. ``run_worker`` does not raise.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -189,15 +191,27 @@ def build_argv_codex(
     return argv
 
 
-AGY_PRINT_TIMEOUT_MIN_S = 30
 AGY_PRINT_TIMEOUT_MARGIN_S = 30
+AGY_MIN_TIMEOUT_S = 2
 
 
 def agy_print_timeout_s(timeout_s: int) -> int:
-    """agy's own ``--print-timeout`` in seconds: ``max(30, timeout_s - 30)``.
-    It fires BEFORE Eris's timeout so agy can still emit a parseable ERROR
-    envelope (A7); the Eris timeout + group kill remains the backstop."""
-    return max(AGY_PRINT_TIMEOUT_MIN_S, int(timeout_s) - AGY_PRINT_TIMEOUT_MARGIN_S)
+    """agy's own ``--print-timeout`` in whole seconds, ALWAYS strictly less
+    than Eris's ``timeout_s`` so agy's timer fires first and still emits a
+    parseable ERROR envelope (A7); the Eris timeout + group kill remains the
+    backstop: ``timeout_s - 30`` above 60 s, else ``max(1, timeout_s // 2)``.
+    With integer seconds a 1 s policy timeout has no strictly smaller positive
+    value, so ``timeout_s < 2`` is refused rather than letting the two timers
+    coincide."""
+    timeout_s = int(timeout_s)
+    if timeout_s < AGY_MIN_TIMEOUT_S:
+        raise LaunchRefused(
+            f"agy needs timeout_s >= {AGY_MIN_TIMEOUT_S} so its --print-timeout can fire "
+            f"before Eris's timeout (got {timeout_s})"
+        )
+    if timeout_s > 60:
+        return timeout_s - AGY_PRINT_TIMEOUT_MARGIN_S
+    return max(1, timeout_s // 2)
 
 
 def build_argv_agy(
@@ -577,6 +591,25 @@ def _float_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+WORKER_DURATION_MAX_S = 10_000_000.0  # ~115 days; anything beyond is not a duration
+
+
+def _duration_ms_or_none(value: Any) -> int | None:
+    """A worker-reported duration in seconds -> whole milliseconds. Only a
+    finite number in ``[0, 1e7]`` is accepted; ``Infinity``/``NaN``/``1e309``,
+    huge ints (``float()`` overflow), negatives, bools and strings record
+    ``None`` - never an exception (``run_worker`` never raises)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(seconds) or not 0.0 <= seconds <= WORKER_DURATION_MAX_S:
+        return None
+    return int(round(seconds * 1000))
+
+
 def _pick_model(model_usage: Any) -> tuple[str | None, list[str]]:
     """``model_executed`` is known only when ``modelUsage`` names EXACTLY one
     model; with several (e.g. a helper model plus the primary) it is None -
@@ -812,8 +845,7 @@ def parse_agy(stdout: bytes) -> Envelope:
     )
     conv = data.get("conversation_id")
     conversation_id = conv if isinstance(conv, str) and conv else None
-    seconds = _float_or_none(data.get("duration_seconds"))
-    reported_ms = int(round(seconds * 1000)) if seconds is not None and seconds >= 0 else None
+    reported_ms = _duration_ms_or_none(data.get("duration_seconds"))
     error: str | None
     if status == "SUCCESS":
         error = None
@@ -1211,7 +1243,19 @@ def _execute(
             # the two (ELOOP) or any other open/read failure is a refusal.
             output_refusal = f"worker output {plan.output_path} could not be read safely: {exc}"
     assert w.cli is not None
-    envelope = PARSERS[w.cli](spawned.stdout)
+    try:
+        envelope = PARSERS[w.cli](spawned.stdout)
+    except Exception as exc:  # noqa: BLE001 - a parser bug must never escape run_worker
+        envelope = Envelope(
+            None,
+            None,
+            None,
+            None,
+            True,
+            f"{w.cli}: parser failure: {exc!s:.120}",
+            "none",
+            raw=spawned.stdout[:2000],
+        )
     if envelope.structured is None and output_file:
         envelope.structured = _structured_from_text(output_file.decode("utf-8", errors="replace"))
     error: str | None

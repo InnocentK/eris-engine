@@ -219,13 +219,33 @@ def test_agy_argv_never_contains_continue_or_edit_flags(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("timeout_s", "expected"), [(600, 570), (61, 31), (60, 30), (31, 30), (5, 30), (1, 30)]
+    ("timeout_s", "expected"),
+    [(86_400, 86_370), (600, 570), (61, 31), (60, 30), (31, 15), (30, 15), (5, 2), (3, 1), (2, 1)],
 )
 def test_agy_print_timeout_derivation(timeout_s: int, expected: int) -> None:
-    """max(30, timeout_s - 30): agy's own timer fires first and still emits an
-    envelope (A7); Eris's timeout + group kill is the backstop."""
+    """timeout_s - 30 above 60 s, else max(1, timeout_s // 2): agy's own timer
+    ALWAYS fires before Eris's and still emits an envelope (A7)."""
     assert agy_print_timeout_s(timeout_s) == expected
-    assert agy_print_timeout_s(timeout_s) <= max(30, timeout_s)
+    assert 1 <= agy_print_timeout_s(timeout_s) < timeout_s
+
+
+@pytest.mark.parametrize("timeout_s", [1, 2, 30, 31, 60, 61, 86_400])
+def test_agy_print_timeout_is_strictly_before_eris_timeout(timeout_s: int) -> None:
+    """Boundary values. With whole seconds there is no positive value strictly
+    below 1, so a 1 s policy timeout is refused instead of letting the two
+    timers coincide."""
+    if timeout_s < 2:
+        with pytest.raises(LaunchRefused, match="timeout_s >= 2"):
+            agy_print_timeout_s(timeout_s)
+        return
+    assert agy_print_timeout_s(timeout_s) < timeout_s
+
+
+def test_run_worker_agy_refuses_one_second_timeout(tmp_path: Path) -> None:
+    res = run_worker(
+        make_call(tmp_path, _agy_policy(tmp_path, timeout_s=1)), popen=FakeProcessFactory()
+    )
+    assert res.status is WorkerStatus.REFUSED and "timeout_s >= 2" in str(res.error)
 
 
 def test_grok_argv_exactly_as_specified() -> None:
@@ -1001,8 +1021,9 @@ def test_plan_call_per_cli(tmp_path: Path) -> None:
 
 
 def test_plan_call_agy_print_timeout_tracks_policy_timeout(tmp_path: Path) -> None:
-    """--print-timeout = max(30, timeout_s - 30) seconds, rendered as '<N>s'."""
-    for timeout_s, expected in ((600, "570s"), (5, "30s"), (60, "30s"), (100, "70s")):
+    """--print-timeout = timeout_s - 30 above 60 s else max(1, timeout_s // 2),
+    rendered as '<N>s'."""
+    for timeout_s, expected in ((600, "570s"), (5, "2s"), (60, "30s"), (100, "70s"), (2, "1s")):
         agy = make_policy(
             tmp_path, "agy", provider="google", model="gemini-3.1-pro-high", timeout_s=timeout_s
         )
@@ -1283,11 +1304,80 @@ def test_run_worker_agy_eris_timeout_has_no_usage(
         factory.instances[0].send_signal(sig)
 
     res = run_worker(
-        make_call(tmp_path, _agy_policy(tmp_path, timeout_s=1)), popen=factory, killpg=killpg
+        make_call(tmp_path, _agy_policy(tmp_path, timeout_s=2)), popen=factory, killpg=killpg
     )
     assert res.status is WorkerStatus.TIMEOUT and res.timed_out
     assert res.usage is None and res.conversation_id is None
-    assert res.worker_reported_duration_ms is None and "timed out after 1s" in str(res.error)
+    assert res.worker_reported_duration_ms is None and "timed out after 2s" in str(res.error)
+    assert res.argv[res.argv.index("--print-timeout") + 1] == "1s"  # agy's timer was set first
+
+
+@pytest.mark.parametrize(
+    "raw_seconds",
+    [
+        "Infinity",
+        "-Infinity",
+        "NaN",
+        "1e309",
+        "-1",
+        "-0.5",
+        '"3"',
+        "true",
+        "null",
+        "[3]",
+        "10000001",
+        "1" + "0" * 400,
+    ],
+)
+def test_parse_agy_duration_is_contained(raw_seconds: str) -> None:
+    """Only a finite number in [0, 1e7] s becomes worker_reported_duration_ms;
+    Infinity/NaN/1e309/huge ints/negatives/strings record None and never raise
+    (int(round(inf)) would have raised OverflowError)."""
+    stdout = (
+        '{"status":"SUCCESS","response":"ok","duration_seconds":' + raw_seconds + "}"
+    ).encode()
+    env = parse_agy(stdout)
+    assert env.worker_reported_duration_ms is None and not env.is_error and env.text == "ok"
+    assert (
+        parse_agy(
+            b'{"status":"SUCCESS","response":"ok","duration_seconds":10000000}'
+        ).worker_reported_duration_ms
+        == 10_000_000_000
+    )
+    assert (
+        parse_agy(
+            b'{"status":"SUCCESS","response":"ok","duration_seconds":0.0004}'
+        ).worker_reported_duration_ms
+        == 0
+    )
+
+
+def test_run_worker_never_raises_on_a_parser_bug(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parser exception is contained in _execute: FAILED with a 'parser
+    failure' message, parse_mode none, raw stdout retained (capped)."""
+    import eris.launch as launch
+
+    def broken(_stdout: bytes) -> Any:
+        raise RuntimeError("boom " + "x" * 500)
+
+    monkeypatch.setitem(launch.PARSERS, "agy", broken)
+    res = run_worker(
+        make_call(tmp_path, _agy_policy(tmp_path)),
+        popen=fake_process(stdout=fixture("agy", "1.1.18", "plain.json"), returncode=0),
+        killpg=lambda *_: None,
+    )
+    assert res.status is WorkerStatus.FAILED and res.parse_mode == "none"
+    assert res.error is not None and res.error.startswith("agy: parser failure: boom ")
+    assert len(res.error) <= len("agy: parser failure: ") + 120
+    assert res.text is None and res.usage is None and res.stdout.startswith(b"{")
+    # the same containment holds for every CLI's parser
+    monkeypatch.setitem(launch.PARSERS, "grok", broken)
+    res = run_worker(
+        make_call(tmp_path, make_policy(tmp_path)), popen=fake_process(stdout=grok_ok())
+    )
+    assert res.status is WorkerStatus.FAILED and "grok: parser failure" in str(res.error)
 
 
 def test_run_worker_codex_output_file_never_stays_on_disk(

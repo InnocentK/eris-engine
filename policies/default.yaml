@@ -68,7 +68,7 @@ workers:
                                   # (the envelope carries no model id). Must start with
                                   # "gemini-" (lineage guard in eris.policy).
     executable_sha256: UNPINNED
-    timeout_s: 600                # --print-timeout is derived: max(30, timeout_s - 30) s
+    timeout_s: 600                # --print-timeout is derived: timeout_s - 30 (above 60 s)
     max_stdout_bytes: 10000000
     env:
       AGY_CLI_DISABLE_AUTO_UPDATE: "1"  # name from the binary's strings; effect ASSUMPTION.

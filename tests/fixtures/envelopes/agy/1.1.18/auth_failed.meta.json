@@ -11,7 +11,7 @@
     "--output-format",
     "json"
   ],
-  "argv_source": "argv reconstructed from the experiment notes in eris-m2a-plan.md; this run was launched by hand after the batch script and its exact command line was not captured",
+  "argv_source": "reconstructed by the synthesizer from the experiment script; not mechanically captured",
   "captured_at": "2026-08-22",
   "captured_by": "synthesizer",
   "redacted": false,

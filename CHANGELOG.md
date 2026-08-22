@@ -6,10 +6,20 @@ Added
 * `agy` (Antigravity CLI 1.1.18) replaces the uninstalled `gemini` CLI as the
   Google lineage. `build_argv_agy`: `-p <prompt> --model <m> --mode plan
   --sandbox --add-dir <snapshot realpath> --output-format json
-  --disable-slash-commands --print-timeout <max(30, timeout_s-30)>s
-  [--json-schema <inline>]`; `parse_agy` (status ERROR → FAILED with the
-  worker's message, usage retained, `structured_output` preferred, no model
-  id / cost). Nine captured agy envelopes are fixtures.
+  --disable-slash-commands --print-timeout <N>s [--json-schema <inline>]`
+  (canonical order) with `N = timeout_s - 30` above 60 s else
+  `max(1, timeout_s // 2)`, always strictly below `timeout_s` (`timeout_s`
+  < 2 refused for agy); `parse_agy` (status ERROR → FAILED with the worker's
+  message, usage retained, `structured_output` preferred, no model id / cost;
+  `duration_seconds` accepted only when finite in `[0, 1e7]`). Nine captured
+  agy envelopes are fixtures (A7/A8/A10b/A14/A15/A16 sidecars carry
+  reconstructed, labelled argv).
+* Advisor fixes (Codex, MERGE-AFTER-FIXES): parser exceptions are contained
+  in `_execute` (`run_worker` never raises); `timeout_s`/`max_*_bytes` are
+  strict ints (`timeout_s` in `[1, 86400]`); the 0.1.2 manifest block is
+  pinned by hash like 0.1.0/0.1.1 (committed = immutable); the lineage guard
+  is `^gemini-\S+$` and documented as syntactic; the fixture username guard
+  is a portable path-pattern scan.
 * `--add-dir` is REQUIRED for agy (A14: without a declared workspace agy
   cannot read even its own cwd; A16: with it, reads outside are denied — the
   valid E1 pass). Exactly one, equal to the spawn cwd, re-checked element by
