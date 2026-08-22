@@ -1023,6 +1023,79 @@ def test_run_worker_codex_output_file_truncation_flag(
     assert res.output_file_truncated is False and res.output_file_size == 2
 
 
+def test_run_worker_cleanup_error_reaches_failed_and_refused_results(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every return path after the scratch dir exists carries cleanup_error."""
+
+    def broken_rmtree(path: Any, *a: Any, **k: Any) -> None:
+        raise OSError(f"EBUSY {path}")
+
+    monkeypatch.setattr("eris.launch.shutil.rmtree", broken_rmtree)
+
+    def boom(*_a: Any, **_k: Any) -> FakeProcess:
+        raise PermissionError("denied")
+
+    # spawn fails with OSError -> FAILED, cleanup_error present
+    res = run_worker(_codex_call(tmp_path, tmp_path / "s1"), popen=boom)
+    assert res.status is WorkerStatus.FAILED and "spawn failed" in str(res.error)
+    assert res.cleanup_error is not None and "EBUSY" in res.cleanup_error
+    # spawn refuses (cwd vanished after planning) -> REFUSED, cleanup_error present
+    call = _codex_call(tmp_path, tmp_path / "s2")
+    Path(call.cwd).rmdir()
+    res = run_worker(call, popen=fake_process(stdout=b"{}"))
+    assert res.status is WorkerStatus.REFUSED and "not a directory" in str(res.error)
+    assert res.cleanup_error is not None and "EBUSY" in res.cleanup_error
+    # `-o` refused (symlink) -> REFUSED, cleanup_error present
+    target = tmp_path / "victim"
+    target.write_text("x")
+    factory = fake_process(stdout=fixture("codex", "0.147.0", "exec_nodoc.jsonl"))
+
+    def popen_link(args: list[str], **kw: Any) -> FakeProcess:
+        Path(args[args.index("-o") + 1]).symlink_to(target)
+        return factory(args, **kw)
+
+    res = run_worker(_codex_call(tmp_path, tmp_path / "s3"), popen=popen_link)
+    assert res.status is WorkerStatus.REFUSED and res.cleanup_error is not None
+    # a pre-scratch refusal has nothing of ours to clean: no cleanup_error
+    scratch = tmp_path / "s4"
+    call = _codex_call(tmp_path, scratch)
+    scratch.mkdir()
+    _call_dir(call).mkdir()
+    res = run_worker(call, popen=fake_process(stdout=b"{}"))
+    assert res.status is WorkerStatus.REFUSED and res.cleanup_error is None
+
+
+def test_run_worker_output_open_race_is_refused_not_raised(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """lstat passes but the O_NOFOLLOW open fails (file swapped for a symlink
+    in between): run_worker returns REFUSED, never raises, still cleans up."""
+    import errno
+
+    real_open = os.open
+
+    def racy_open(path: Any, flags: int, *a: Any, **k: Any) -> int:
+        if str(path).endswith("last_message.json"):
+            assert flags & os.O_NOFOLLOW
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links", str(path))
+        return real_open(path, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", racy_open)
+    factory = fake_process(stdout=fixture("codex", "0.147.0", "exec_nodoc.jsonl"))
+
+    def popen(args: list[str], **kw: Any) -> FakeProcess:
+        Path(args[args.index("-o") + 1]).write_bytes(b'{"ok": 1}')  # a regular file for lstat
+        return factory(args, **kw)
+
+    call = _codex_call(tmp_path, tmp_path / "s")
+    res = run_worker(call, popen=popen)
+    assert res.status is WorkerStatus.REFUSED
+    assert "could not be read safely" in str(res.error) and "symbolic links" in str(res.error)
+    assert res.output_file is None and res.structured is None
+    assert not _call_dir(call).exists() and res.cleanup_error is None
+
+
 def test_run_worker_codex_scratch_removed_even_on_spawn_failure(tmp_path: Path) -> None:
     codex = make_policy(tmp_path, "codex", provider="openai", model="gpt-5.4")
 

@@ -337,6 +337,50 @@ def test_invoke_surfaces_cleanup_failure_as_run_error(
     assert "EBUSY" in manifest["extra"]["cleanup_error"]
 
 
+def test_invoke_persists_output_file_truncation_on_invocation(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persisted Invocation record (read back from events.jsonl) carries
+    output_file_truncated / output_file_size, and the capped bytes are a blob."""
+    import eval.run as harness
+
+    from eris.launch import run_worker as real_run_worker
+    from eris.schemas import Invocation
+
+    w = setup_world(tmp_path)
+    grok = json.loads((FIX / "grok" / "1.0.5" / "plan.json").read_bytes())
+    grok["stopReason"] = "stop"
+    capped = b"y" * 4096
+
+    def truncating_worker(call: object, **kw: object) -> object:
+        res = real_run_worker(call, **kw)  # type: ignore[arg-type]
+        res.output_file = capped
+        res.output_file_truncated = True
+        res.output_file_size = 10_000
+        return res
+
+    monkeypatch.setattr(harness, "run_worker", truncating_worker)
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(tmp_path / "runs"), "--run-id", "r"],
+        out=out,
+        home=tmp_path,
+        popen=fake_process(stdout=json.dumps(grok).encode()),
+        killpg=lambda *_: None,
+    )
+    assert rc == 0
+    run_dir = tmp_path / "runs" / "r"
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_bytes().splitlines()]
+    inv_payload = next(e["payload"] for e in events if e["kind"] == "invocation.finished")
+    inv = Invocation.model_validate(inv_payload)  # the persisted record round-trips
+    assert inv.output_file_truncated is True and inv.output_file_size == 10_000
+    assert inv.output_file_sha256 is not None
+    assert (run_dir / "blobs" / "sha256" / inv.output_file_sha256).read_bytes() == capped
+    raw = next(e["payload"] for e in events if e["kind"] == "proposal.raw")
+    assert raw["output_file_truncated"] is True and raw["output_file_size"] == 10_000
+    assert raw["output_file_sha256"] == inv.output_file_sha256
+
+
 def test_invoke_refuses_unparsable_credential_file(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:

@@ -1047,45 +1047,17 @@ def run_worker(
         return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
     plan.argv[0] = str(real)  # execute exactly the file that was hashed
     plan.executable = str(real)
-    w = call.policy
     call_dir = plan.schema_path.parent if plan.schema_path is not None else None
-    output_file: bytes | None = None
-    output_size: int | None = None
-    output_truncated = False
-    output_refusal: str | None = None
-    cleanup_error: str | None = None
-    try:
-        if call_dir is not None and plan.schema_path is not None and call.schema is not None:
-            try:
-                make_private_dir(call_dir)
-            except LaunchRefused as exc:
-                call_dir = None  # nothing of ours to clean up
-                return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
-            plan.schema_path.write_text(json.dumps(call.schema, sort_keys=True), encoding="utf-8")
+    if call_dir is not None and call.schema is not None:
         try:
-            spawned = spawn(
-                plan.argv,
-                env=plan.env,
-                cwd=plan.cwd,
-                timeout_s=w.timeout_s,
-                max_stdout_bytes=w.max_stdout_bytes,
-                max_stderr_bytes=w.max_stderr_bytes,
-                popen=popen,
-                killpg=killpg,
-                clock=clock,
-                exempt=(plan.prompt_index,),
-            )
+            make_private_dir(call_dir)
         except LaunchRefused as exc:
             return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
-        except OSError as exc:
-            return _absent(call, WorkerStatus.FAILED, f"spawn failed: {exc}", plan.idempotency_key)
-        if plan.output_path is not None:
-            try:
-                output_file, output_size, output_truncated = read_output_file(
-                    plan.output_path, w.max_stdout_bytes
-                )
-            except LaunchRefused as exc:
-                output_refusal = str(exc)
+    # From here on a scratch directory of ours exists: EVERY return path below
+    # goes through the cleanup in `finally` and carries its outcome.
+    cleanup_error: str | None = None
+    try:
+        result = _execute(call, plan, digest, popen=popen, killpg=killpg, clock=clock)
     finally:
         # Never leave the unredacted `-o` file (or the schema) on disk; the
         # caller passes output_file through RunWriter.put_blob. A cleanup
@@ -1095,6 +1067,62 @@ def run_worker(
                 shutil.rmtree(call_dir)
             except OSError as exc:
                 cleanup_error = f"scratch cleanup failed for {call_dir}: {exc}"
+    if cleanup_error is not None:
+        result.cleanup_error = cleanup_error
+    return result
+
+
+def _execute(
+    call: WorkerCall,
+    plan: Plan,
+    digest: str,
+    *,
+    popen: PopenFactory,
+    killpg: KillPg,
+    clock: Callable[[], float],
+) -> WorkerResult:
+    """spawn -> read `-o` -> parse -> WorkerResult. Never raises on worker
+    misbehaviour; the caller attaches cleanup_error afterwards."""
+    w = call.policy
+    if plan.schema_path is not None and call.schema is not None:
+        try:
+            plan.schema_path.write_text(json.dumps(call.schema, sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            return _absent(
+                call, WorkerStatus.FAILED, f"cannot write schema: {exc}", plan.idempotency_key
+            )
+    try:
+        spawned = spawn(
+            plan.argv,
+            env=plan.env,
+            cwd=plan.cwd,
+            timeout_s=w.timeout_s,
+            max_stdout_bytes=w.max_stdout_bytes,
+            max_stderr_bytes=w.max_stderr_bytes,
+            popen=popen,
+            killpg=killpg,
+            clock=clock,
+            exempt=(plan.prompt_index,),
+        )
+    except LaunchRefused as exc:
+        return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
+    except OSError as exc:
+        return _absent(call, WorkerStatus.FAILED, f"spawn failed: {exc}", plan.idempotency_key)
+    output_file: bytes | None = None
+    output_size: int | None = None
+    output_truncated = False
+    output_refusal: str | None = None
+    if plan.output_path is not None:
+        try:
+            output_file, output_size, output_truncated = read_output_file(
+                plan.output_path, w.max_stdout_bytes
+            )
+        except LaunchRefused as exc:
+            output_refusal = str(exc)
+        except OSError as exc:
+            # lstat is advisory; O_NOFOLLOW is the real guard. A swap between
+            # the two (ELOOP) or any other open/read failure is a refusal.
+            output_refusal = f"worker output {plan.output_path} could not be read safely: {exc}"
     assert w.cli is not None
     envelope = PARSERS[w.cli](spawned.stdout)
     if envelope.structured is None and output_file:
@@ -1143,5 +1171,4 @@ def run_worker(
         output_file=output_file,
         output_file_truncated=output_truncated,
         output_file_size=output_size,
-        cleanup_error=cleanup_error,
     )
