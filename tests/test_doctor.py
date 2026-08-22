@@ -193,6 +193,7 @@ def test_probe_uses_injected_runner_with_hardened_env(tmp_path: Path) -> None:
     assert seen[0][0] == [str(exe), "--version"]
     assert seen[0][1]["HOME"] == str(tmp_path) and "OPENAI_API_KEY" not in seen[0][1]
     assert "--version: grok 1.0.5" in by_name(report.render(), "worker.grok.probe")
+    assert len(seen) == 1  # only the pinned, hash-verified worker was probed
     report = run_doctor(
         policy_path=write_policy(tmp_path, exe, pinned=True),
         env_file=write_env(tmp_path),
@@ -201,6 +202,66 @@ def test_probe_uses_injected_runner_with_hardened_env(tmp_path: Path) -> None:
         home=tmp_path,
     )
     assert by_name(report.render(), "worker.grok.probe").startswith("WARN")
+
+
+def test_probe_output_is_redacted_and_mismatched_binary_is_never_probed(tmp_path: Path) -> None:
+    exe = fake_exe(tmp_path)
+    env = write_env(tmp_path)
+    leak = "xai-" + "Pq2" * 12
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], _env: dict[str, str]) -> str | None:
+        calls.append(argv)
+        return f"grok 1.0.5 (key {leak}; planted {PLANTED}; cred {CRED_TOKEN})"
+
+    report = run_doctor(
+        policy_path=write_policy(tmp_path, exe, pinned=True),
+        env_file=env,
+        probe=True,
+        runner=runner,
+        home=tmp_path,
+    )
+    text = report.render()
+    line = by_name(text, "worker.grok.probe")
+    assert line.startswith("OK") and "grok 1.0.5" in line
+    for secret in (leak, PLANTED, CRED_TOKEN):
+        assert secret not in text and secret[-10:] not in text
+    assert "[REDACTED:" in line
+
+    # tampered binary: hash mismatch -> FAIL and the probe must NOT execute it
+    calls.clear()
+    policy = write_policy(tmp_path, exe, pinned=True)
+    exe.write_bytes(b"#!/bin/sh\necho tampered\n")
+    report = run_doctor(policy_path=policy, env_file=env, probe=True, runner=runner, home=tmp_path)
+    assert calls == []
+    assert by_name(report.render(), "worker.grok").startswith("FAIL")
+    assert "skipped" in by_name(report.render(), "worker.grok.probe")
+    # unpinned binary: not probed either
+    report = run_doctor(
+        policy_path=write_policy(tmp_path, exe, pinned=False),
+        env_file=env,
+        probe=True,
+        runner=runner,
+        home=tmp_path,
+    )
+    assert calls == [] and "skipped" in by_name(report.render(), "worker.grok.probe")
+
+
+def test_unparsable_credential_file_is_fail_missing_is_warn(tmp_path: Path) -> None:
+    exe = fake_exe(tmp_path)
+    env = write_env(tmp_path)
+    report = run_doctor(
+        policy_path=write_policy(tmp_path, exe, pinned=True), env_file=env, home=tmp_path
+    )
+    lines = [line for line in report.render().splitlines() if "credential-file" in line]
+    assert any(line.startswith("OK") and "auth.json: present" in line for line in lines)
+    assert any(line.startswith("WARN") and "absent" in line for line in lines)
+    (tmp_path / "auth.json").write_text("{not json")
+    report = run_doctor(
+        policy_path=write_policy(tmp_path, exe, pinned=True), env_file=env, home=tmp_path
+    )
+    line = by_name(report.render(), "credential-file")
+    assert line.startswith("FAIL") and "cannot be parsed" in line and not report.ok
 
 
 def test_default_probe_runner_is_a_real_subprocess_call() -> None:

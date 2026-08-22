@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -63,8 +64,12 @@ FORBIDDEN_ARGV_TOKENS: tuple[str, ...] = (
 )
 
 
-def assert_argv_safe(argv: Iterable[str]) -> None:
+def assert_argv_safe(argv: Iterable[str], *, exempt: Iterable[int] = ()) -> None:
+    """Refuse forbidden tokens anywhere in argv EXCEPT the elements listed in
+    ``exempt`` (the prompt, which may legitimately quote ``--bare`` etc.).
+    NUL is refused everywhere."""
     argv = list(argv)
+    skip = set(exempt)
     if not argv:
         raise LaunchRefused("empty argv")
     for i, arg in enumerate(argv):
@@ -72,10 +77,16 @@ def assert_argv_safe(argv: Iterable[str]) -> None:
             raise LaunchRefused(f"argv[{i}] is not a str")
         if "\x00" in arg:
             raise LaunchRefused(f"argv[{i}] contains NUL")
+        if i in skip:
+            continue
         low = arg.lower()
         for token in FORBIDDEN_ARGV_TOKENS:
             if token in low:
                 raise LaunchRefused(f"forbidden token {token!r} in argv[{i}]")
+
+
+# Index of the prompt in claude/gemini/grok argv (`<exe> -p <prompt> ...`).
+CLI_PROMPT_INDEX = 2
 
 
 def _prompt_ok(prompt: str) -> str:
@@ -114,7 +125,7 @@ def build_argv_claude(
         argv += ["--json-schema", schema_json]
     if max_budget_usd is not None:
         argv += ["--max-budget-usd", f"{max_budget_usd:g}"]
-    assert_argv_safe(argv)
+    assert_argv_safe(argv, exempt=(CLI_PROMPT_INDEX,))
     return argv
 
 
@@ -149,7 +160,7 @@ def build_argv_codex(
     if output_path is not None:
         argv += ["-o", str(output_path)]
     argv.append(_prompt_ok(prompt))
-    assert_argv_safe(argv)
+    assert_argv_safe(argv, exempt=(len(argv) - 1,))
     return argv
 
 
@@ -165,7 +176,7 @@ def build_argv_gemini(executable: str, prompt: str, *, model: str) -> list[str]:
         "-o",
         "json",
     ]
-    assert_argv_safe(argv)
+    assert_argv_safe(argv, exempt=(CLI_PROMPT_INDEX,))
     return argv
 
 
@@ -186,7 +197,7 @@ def build_argv_grok(
     ]
     if schema_json is not None:
         argv += ["--json-schema", schema_json]
-    assert_argv_safe(argv)
+    assert_argv_safe(argv, exempt=(CLI_PROMPT_INDEX,))
     return argv
 
 
@@ -349,17 +360,30 @@ class _Drain(threading.Thread):
 
 
 def _kill_group(proc: PopenLike, killpg: KillPg, grace_s: float) -> int:
-    for sig, wait_s in ((signal.SIGTERM, grace_s), (signal.SIGKILL, max(grace_s, 1.0))):
-        try:
-            killpg(proc.pid, sig)
-        except ProcessLookupError:
-            return int(sig)
-        try:
-            proc.wait(timeout=wait_s)
-            return int(sig)
-        except subprocess.TimeoutExpired:
-            continue
-    raise LaunchRefused(f"process group {proc.pid} survived SIGKILL")
+    """SIGTERM the group, wait for the leader, then ALWAYS sweep the group
+    with SIGKILL: members may ignore SIGTERM or outlive the leader. Returns
+    the signal that ended the leader."""
+    try:
+        killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    leader_gone = False
+    try:
+        proc.wait(timeout=grace_s)
+        leader_gone = True
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if leader_gone:
+        return int(signal.SIGTERM)
+    try:
+        proc.wait(timeout=max(grace_s, 1.0))
+    except subprocess.TimeoutExpired:
+        raise LaunchRefused(f"process group {proc.pid} survived SIGKILL") from None
+    return int(signal.SIGKILL)
 
 
 def spawn(
@@ -374,8 +398,9 @@ def spawn(
     killpg: KillPg = os.killpg,
     grace_s: float = 2.0,
     clock: Callable[[], float] = time.monotonic,
+    exempt: Iterable[int] = (),
 ) -> SpawnResult:
-    assert_argv_safe(argv)
+    assert_argv_safe(argv, exempt=exempt)
     assert_env_safe(env)
     cwd = Path(cwd).resolve()
     if not cwd.is_dir():
@@ -451,21 +476,13 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def _pick_model(model_usage: Any) -> tuple[str | None, list[str]]:
-    """Primary model = highest costUSD (then outputTokens) in ``modelUsage``."""
+    """``model_executed`` is known only when ``modelUsage`` names EXACTLY one
+    model; with several (e.g. a helper model plus the primary) it is None -
+    recorded as unknown, never guessed. All names go to ``models_used``."""
     if not isinstance(model_usage, dict) or not model_usage:
         return None, []
     names = [str(k) for k in model_usage]
-
-    def score(name: str) -> tuple[float, int]:
-        entry = model_usage.get(name)
-        if not isinstance(entry, dict):
-            return (0.0, 0)
-        return (
-            _float_or_none(entry.get("costUSD")) or 0.0,
-            _int_or_none(entry.get("outputTokens")) or 0,
-        )
-
-    return max(names, key=score), names
+    return (names[0] if len(names) == 1 else None), names
 
 
 def _structured_from_text(text: str | None) -> Any:
@@ -774,11 +791,15 @@ class WorkerCall:
     tmpdir: str = "/tmp"
     path_env: str = "/usr/bin:/bin"
     secrets: Mapping[str, str] = field(default_factory=dict)
+    snapshot_sha: str | None = None
 
 
 def idempotency_key(call: WorkerCall) -> str:
-    """Excludes the experimental arm (so arms share proposals); includes repeat_index."""
+    """Excludes the experimental arm (so arms share proposals); includes
+    repeat_index and the snapshot's base commit (a re-snapshotted task never
+    collides with the old one)."""
     material = {
+        "snapshot_sha": call.snapshot_sha,
         "worker_id": call.worker_id,
         "provider": call.policy.provider,
         "model": call.policy.model,
@@ -799,6 +820,7 @@ class Plan:
     cwd: Path
     idempotency_key: str
     executable: str
+    prompt_index: int
     schema_path: Path | None = None
     output_path: Path | None = None
 
@@ -816,6 +838,7 @@ def plan_call(call: WorkerCall) -> Plan:
     schema_json = json.dumps(call.schema, sort_keys=True) if call.schema else None
     schema_path: Path | None = None
     output_path: Path | None = None
+    prompt_index = CLI_PROMPT_INDEX
     if w.cli == "claude":
         argv = build_argv_claude(
             w.executable,
@@ -831,8 +854,9 @@ def plan_call(call: WorkerCall) -> Plan:
         if call.schema is not None:
             if call.scratch_dir is None:
                 raise LaunchRefused("codex --output-schema needs scratch_dir")
-            schema_path = Path(call.scratch_dir) / "schema.json"
-            output_path = Path(call.scratch_dir) / "last_message.json"
+            call_dir = Path(call.scratch_dir) / f"call-{idempotency_key(call)[:16]}"
+            schema_path = call_dir / "schema.json"
+            output_path = call_dir / "last_message.json"
         argv = build_argv_codex(
             w.executable,
             call.prompt,
@@ -841,6 +865,7 @@ def plan_call(call: WorkerCall) -> Plan:
             schema_path=schema_path,
             output_path=output_path,
         )
+        prompt_index = len(argv) - 1
     elif w.cli == "gemini":
         if not w.model:
             raise LaunchRefused("gemini requires a model in policy")
@@ -861,26 +886,36 @@ def plan_call(call: WorkerCall) -> Plan:
         policy_env=w.env,
         secrets=secrets,
     )
-    return Plan(argv, env, cwd, idempotency_key(call), w.executable, schema_path, output_path)
+    return Plan(
+        argv, env, cwd, idempotency_key(call), w.executable, prompt_index, schema_path, output_path
+    )
 
 
 def preflight_executable(
     policy: WorkerPolicy, *, hasher: Callable[[Path], str] = sha256_file
-) -> str:
-    """Refuse unless the pinned path exists, is a regular file and hashes to the pin."""
+) -> tuple[str, Path]:
+    """Resolve the pinned path to its realpath, require a regular file, hash
+    the REALPATH and compare with the pin. Returns (sha256, realpath); the
+    realpath goes into argv[0] so the hashed file is the executed one."""
     if policy.executable is None:
         raise LaunchRefused("no executable path (unpinned)")
     path = Path(policy.executable)
-    if not path.is_file():
+    try:
+        real = path.resolve(strict=True)
+    except FileNotFoundError:
+        raise FileNotFoundError(str(path)) from None
+    except (OSError, RuntimeError) as exc:
+        raise LaunchRefused(f"{path} cannot be resolved: {exc}") from exc
+    if not real.is_file():
         raise FileNotFoundError(str(path))
     if not policy.pinned:
         raise LaunchRefused(f"{path} is UNPINNED; run `eris policy pin`")
-    actual = hasher(path)
+    actual = hasher(real)
     if actual != policy.executable_sha256:
         raise LaunchRefused(
-            f"{path} sha256 {actual[:12]}... != pinned {policy.executable_sha256[:12]}..."
+            f"{real} sha256 {actual[:12]}... != pinned {policy.executable_sha256[:12]}..."
         )
-    return actual
+    return actual, real
 
 
 @dataclass
@@ -909,6 +944,7 @@ class WorkerResult:
     timed_out: bool
     parse_mode: str
     models_used: list[str] = field(default_factory=list)
+    output_file: bytes | None = None  # codex `-o` last message: read into memory, file deleted
 
 
 def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -> WorkerResult:
@@ -953,35 +989,50 @@ def run_worker(
     except LaunchRefused as exc:
         return _absent(call, WorkerStatus.REFUSED, str(exc))
     try:
-        digest = preflight_executable(call.policy, hasher=hasher)
+        digest, real = preflight_executable(call.policy, hasher=hasher)
     except FileNotFoundError as exc:
         return _absent(
             call, WorkerStatus.MISSING, f"executable not found: {exc}", plan.idempotency_key
         )
     except LaunchRefused as exc:
         return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
-    if plan.schema_path is not None and call.schema is not None:
-        plan.schema_path.parent.mkdir(parents=True, exist_ok=True)
-        plan.schema_path.write_text(json.dumps(call.schema, sort_keys=True), encoding="utf-8")
+    plan.argv[0] = str(real)  # execute exactly the file that was hashed
+    plan.executable = str(real)
     w = call.policy
+    call_dir = plan.schema_path.parent if plan.schema_path is not None else None
+    output_file: bytes | None = None
     try:
-        spawned = spawn(
-            plan.argv,
-            env=plan.env,
-            cwd=plan.cwd,
-            timeout_s=w.timeout_s,
-            max_stdout_bytes=w.max_stdout_bytes,
-            max_stderr_bytes=w.max_stderr_bytes,
-            popen=popen,
-            killpg=killpg,
-            clock=clock,
-        )
-    except LaunchRefused as exc:
-        return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
-    except OSError as exc:
-        return _absent(call, WorkerStatus.FAILED, f"spawn failed: {exc}", plan.idempotency_key)
+        if plan.schema_path is not None and call.schema is not None:
+            plan.schema_path.parent.mkdir(parents=True, exist_ok=True)
+            plan.schema_path.write_text(json.dumps(call.schema, sort_keys=True), encoding="utf-8")
+        try:
+            spawned = spawn(
+                plan.argv,
+                env=plan.env,
+                cwd=plan.cwd,
+                timeout_s=w.timeout_s,
+                max_stdout_bytes=w.max_stdout_bytes,
+                max_stderr_bytes=w.max_stderr_bytes,
+                popen=popen,
+                killpg=killpg,
+                clock=clock,
+                exempt=(plan.prompt_index,),
+            )
+        except LaunchRefused as exc:
+            return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
+        except OSError as exc:
+            return _absent(call, WorkerStatus.FAILED, f"spawn failed: {exc}", plan.idempotency_key)
+        if plan.output_path is not None and plan.output_path.is_file():
+            output_file = plan.output_path.read_bytes()[: w.max_stdout_bytes]
+    finally:
+        # Never leave the unredacted `-o` file (or the schema) on disk; the
+        # caller passes output_file through RunWriter.put_blob.
+        if call_dir is not None:
+            shutil.rmtree(call_dir, ignore_errors=True)
     assert w.cli is not None
     envelope = PARSERS[w.cli](spawned.stdout)
+    if envelope.structured is None and output_file:
+        envelope.structured = _structured_from_text(output_file.decode("utf-8", errors="replace"))
     error: str | None
     if spawned.timed_out:
         status = WorkerStatus.TIMEOUT
@@ -1020,4 +1071,5 @@ def run_worker(
         timed_out=spawned.timed_out,
         parse_mode=envelope.parse_mode,
         models_used=envelope.models_used,
+        output_file=output_file,
     )

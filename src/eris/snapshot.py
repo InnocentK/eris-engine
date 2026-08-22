@@ -75,7 +75,39 @@ class SnapshotInfo:
     head_sha: str
     depth: int
     commit_count: int
-    forbidden_shas: tuple[str, ...]
+    forbidden_shas: tuple[str, ...]  # future commits, trees AND blobs
+
+
+def read_head_sha(repo: Path) -> str | None:
+    """HEAD commit of a checkout using the filesystem only (no git process).
+    Handles a detached HEAD, a loose ref file and packed-refs; None otherwise."""
+    gitdir = Path(repo) / ".git"
+    try:
+        head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if _SHA_RE.fullmatch(head):
+        return head
+    if not head.startswith("ref: "):
+        return None
+    ref = head[5:].strip()
+    if ".." in ref or ref.startswith("/"):
+        return None
+    loose = gitdir / ref
+    try:
+        value = loose.read_text(encoding="utf-8").strip()
+        if _SHA_RE.fullmatch(value):
+            return value
+    except OSError:
+        pass
+    try:
+        for line in (gitdir / "packed-refs").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == ref and _SHA_RE.fullmatch(parts[0]):
+                return parts[0]
+    except OSError:
+        pass
+    return None
 
 
 @dataclass
@@ -124,8 +156,12 @@ def build_snapshot(
         )
         _run(git, ["branch", "-f", SNAPSHOT_BRANCH, pre_fix_sha], mirror, "branch at pre-fix sha")
         full = _run(git, ["rev-parse", f"{pre_fix_sha}^{{commit}}"], mirror, "resolve sha").text
-        future = _run(git, ["rev-list", "--all", "--not", full], mirror, "list future commits").text
-        forbidden = tuple(s for s in future.splitlines() if s)
+        # Every object (commit, tree, blob) reachable from any ref but NOT from
+        # the pre-fix commit is a future object and must be absent from the snapshot.
+        future = _run(
+            git, ["rev-list", "--objects", "--all", "--not", full], mirror, "list future objects"
+        ).text
+        forbidden = tuple(line.split()[0] for line in future.splitlines() if line.strip())
         _run(
             git,
             [
@@ -210,7 +246,8 @@ def verify_snapshot(
     count_res = git(["rev-list", "--count", "HEAD"], dest)
     count = int(count_res.text) if count_res.ok and count_res.text.isdigit() else None
     for sha in forbidden_shas:
-        res = git(["cat-file", "-e", f"{sha}^{{commit}}"], dest)
+        # Any object type: commits, trees and blobs of the future must all be absent.
+        res = git(["cat-file", "-e", sha], dest)
         if res.ok:
-            problems.append(f"future commit {sha} is reachable")
+            problems.append(f"future object {sha} is present in the snapshot")
     return SnapshotVerdict(not problems, problems, head_value, count)

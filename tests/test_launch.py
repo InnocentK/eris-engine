@@ -138,13 +138,25 @@ def test_gemini_and_grok_argv_exactly_as_specified() -> None:
 
 
 @pytest.mark.parametrize("token", FORBIDDEN_ARGV_TOKENS)
-def test_forbidden_tokens_are_refused(token: str) -> None:
+def test_forbidden_tokens_are_refused_outside_the_prompt(token: str) -> None:
     with pytest.raises(LaunchRefused, match="forbidden token"):
         assert_argv_safe(["/x/claude", "-p", "hi", token])
     with pytest.raises(LaunchRefused):
         assert_argv_safe(["/x/claude", token.upper()])
     with pytest.raises(LaunchRefused):
-        build_argv_claude("/x/claude", f"prompt mentioning {token}")
+        build_argv_claude(f"/x/{token}/claude", "hi")
+    with pytest.raises(LaunchRefused):
+        build_argv_grok("/x/grok", "hi", model=f"m-{token}")
+    # The prompt element is exempt: reviewers legitimately quote these flags.
+    argv = build_argv_claude("/x/claude", f"Is using {token} here defensible?")
+    assert argv[2] == f"Is using {token} here defensible?"
+    codex = build_argv_codex("/x/codex", f"Explain {token}", cwd=Path("/"), model="m")
+    assert codex[-1] == f"Explain {token}"
+    assert build_argv_grok("/x/grok", f"review {token}", model="m")[2] == f"review {token}"
+    # spawn honours the same exemption, and only for the declared index
+    with pytest.raises(LaunchRefused):
+        assert_argv_safe(["/x/claude", "-p", token], exempt=(1,))
+    assert_argv_safe(["/x/claude", "-p", token], exempt=(2,))
 
 
 def test_argv_hygiene() -> None:
@@ -313,7 +325,8 @@ def test_timeout_kills_process_group_sigterm_then_reaps(
         killpg=killpg,
         grace_s=0.2,
     )
-    assert res.timed_out and calls == [(4242, signal.SIGTERM)]
+    # SIGTERM ended the leader, but the group is ALWAYS swept with SIGKILL afterwards
+    assert res.timed_out and calls == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
     assert res.killed_with == signal.SIGTERM and res.exit_code == -signal.SIGTERM
 
 
@@ -346,8 +359,12 @@ def test_timeout_process_already_gone(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
     factory = fake_process(hang=True)
+    calls: list[int] = []
 
-    def killpg(_pgid: int, _sig: int) -> None:
+    def killpg(_pgid: int, sig: int) -> None:
+        # The group vanished concurrently: the leader exits, killpg reports no such group.
+        calls.append(sig)
+        factory.instances[0].send_signal(sig)
         raise ProcessLookupError
 
     res = spawn(
@@ -362,6 +379,7 @@ def test_timeout_process_already_gone(
         grace_s=0.1,
     )
     assert res.timed_out and res.killed_with == signal.SIGTERM
+    assert calls == [signal.SIGTERM, signal.SIGKILL]  # ProcessLookupError is tolerated for both
 
 
 def test_timeout_unkillable_raises(
@@ -414,6 +432,44 @@ def test_real_process_group_kill_reaches_grandchildren(tmp_path: Path) -> None:
         pytest.fail(f"grandchild {grandchild} survived the process-group kill")
 
 
+GRANDPARENT_TERM_IGNORING_CHILD = """
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c",
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
+print(child.pid, flush=True)
+time.sleep(120)
+"""
+
+
+def _wait_gone(pid: int, seconds: float = 10.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+@pytest.mark.real_subprocess
+def test_real_group_kill_sweeps_members_that_ignore_sigterm(tmp_path: Path) -> None:
+    """Leader dies on SIGTERM; the grandchild ignores SIGTERM. Only an
+    unconditional SIGKILL sweep of the group reaches it."""
+    res = spawn(
+        [sys.executable, "-c", GRANDPARENT_TERM_IGNORING_CHILD],
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=1.5,
+        max_stdout_bytes=1000,
+        max_stderr_bytes=1000,
+        grace_s=1.0,
+    )
+    assert res.timed_out and res.killed_with == signal.SIGTERM  # leader honoured TERM
+    grandchild = int(res.stdout.decode().strip())
+    assert _wait_gone(grandchild), f"grandchild {grandchild} survived: SIGKILL sweep missing"
+
+
 @pytest.mark.real_subprocess
 def test_real_caps_and_stdin_devnull(tmp_path: Path) -> None:
     script = "import sys; print(sys.stdin.read() == ''); sys.stdout.write('x' * 50000)"
@@ -447,12 +503,16 @@ def test_parse_claude_control_fixture() -> None:
     assert env.usage.reasoning_tokens == 0 and env.parse_mode == "json"
 
 
-def test_parse_claude_safemode_picks_primary_model() -> None:
+def test_parse_claude_safemode_two_models_means_unknown_model() -> None:
+    """modelUsage lists a helper model AND the primary: which one 'executed'
+    is not observable from the envelope, so it is None (never guessed)."""
     env = parse_claude(fixture("claude", "2.1.239", "safemode.json"))
     assert env.text == "ok"
-    assert env.model_executed == "claude-fable-5"
+    assert env.model_executed is None
     assert set(env.models_used) == {"claude-haiku-4-5-20251001", "claude-fable-5"}
     assert env.cost_usd == 0.080129
+    single = parse_claude(fixture("claude", "2.1.239", "control.json"))
+    assert single.model_executed == "claude-opus-5" and single.models_used == ["claude-opus-5"]
 
 
 def test_parse_claude_is_error_checked_before_shape() -> None:
@@ -625,6 +685,13 @@ def test_idempotency_key_excludes_arm_includes_repeat(tmp_path: Path) -> None:
         make_call(tmp_path, policy, stage=Stage.CRITIQUE)
     )
     assert "arm" not in WorkerCall.__dataclass_fields__
+    # a re-snapshotted task (different base commit) never collides
+    assert idempotency_key(call) != idempotency_key(
+        make_call(tmp_path, policy, snapshot_sha="a" * 40)
+    )
+    assert idempotency_key(make_call(tmp_path, policy, snapshot_sha="a" * 40)) != idempotency_key(
+        make_call(tmp_path, policy, snapshot_sha="b" * 40)
+    )
 
 
 def test_plan_call_builds_argv_env_cwd_without_spawning(tmp_path: Path) -> None:
@@ -648,7 +715,9 @@ def test_plan_call_per_cli(tmp_path: Path) -> None:
     plan = plan_call(
         make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=tmp_path / "s")
     )
-    assert plan.schema_path == tmp_path / "s" / "schema.json" and "--output-schema" in plan.argv
+    assert plan.schema_path is not None and plan.schema_path.name == "schema.json"
+    assert plan.schema_path.parent.parent == tmp_path / "s"  # per-call scratch subdir
+    assert plan.schema_path.parent.name.startswith("call-") and "--output-schema" in plan.argv
     with pytest.raises(LaunchRefused, match="scratch_dir"):
         plan_call(make_call(tmp_path, codex, schema={"type": "object"}))
     with pytest.raises(LaunchRefused, match="requires a model"):
@@ -680,7 +749,8 @@ def test_plan_call_per_cli(tmp_path: Path) -> None:
 
 def test_preflight_executable(tmp_path: Path) -> None:
     policy = make_policy(tmp_path)
-    assert preflight_executable(policy) == policy.executable_sha256
+    digest, real = preflight_executable(policy)
+    assert digest == policy.executable_sha256 and real == Path(str(policy.executable)).resolve()
     with pytest.raises(LaunchRefused, match="UNPINNED"):
         preflight_executable(make_policy(tmp_path, executable_sha256=UNPINNED))
     with pytest.raises(LaunchRefused, match="sha256"):
@@ -689,6 +759,42 @@ def test_preflight_executable(tmp_path: Path) -> None:
         preflight_executable(make_policy(tmp_path, executable=str(tmp_path / "missing")))
     with pytest.raises(LaunchRefused, match="unpinned"):
         preflight_executable(make_policy(tmp_path, executable=None))
+
+
+def test_preflight_hashes_and_executes_the_realpath(tmp_path: Path) -> None:
+    pinned = make_policy(tmp_path)  # pin computed over bin/grok
+    other = tmp_path / "bin" / "other"
+    other.write_bytes(b"#!/bin/sh\necho other\n")
+    link = tmp_path / "bin" / "grok-link"
+    link.symlink_to(other)
+    # symlink whose target differs from the pinned file -> refused
+    with pytest.raises(LaunchRefused, match="sha256"):
+        preflight_executable(make_policy(tmp_path, executable=str(link)))
+    # symlink to the pinned file -> accepted, and argv[0] becomes the realpath
+    good = tmp_path / "bin" / "good-link"
+    good.symlink_to(Path(str(pinned.executable)))
+    via_link = make_policy(tmp_path, executable=str(good))
+    digest, real = preflight_executable(via_link)
+    assert digest == pinned.executable_sha256 and real == Path(str(pinned.executable)).resolve()
+    res = run_worker(
+        make_call(tmp_path, via_link),
+        popen=FakeProcessFactory(stdout=grok_ok()),
+        killpg=lambda *_: None,
+    )
+    assert res.status is WorkerStatus.OK
+    assert res.argv[0] == str(real) and res.argv[0] != str(good)
+    # symlink retargeted AFTER pinning -> refused (the hash is of the realpath)
+    good.unlink()
+    good.symlink_to(other)
+    with pytest.raises(LaunchRefused, match="sha256"):
+        preflight_executable(via_link)
+    assert run_worker(make_call(tmp_path, via_link), popen=FakeProcessFactory()).status is (
+        WorkerStatus.REFUSED
+    )
+    dangling = tmp_path / "bin" / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    with pytest.raises(FileNotFoundError):
+        preflight_executable(make_policy(tmp_path, executable=str(dangling)))
 
 
 def grok_ok(text: str = "hello") -> bytes:
@@ -779,15 +885,49 @@ def test_run_worker_failures(
     assert res.status is WorkerStatus.REFUSED and "survived" in str(res.error)
 
 
-def test_run_worker_writes_codex_schema_file(
+def test_run_worker_codex_output_file_never_stays_on_disk(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
     codex = make_policy(tmp_path, "codex", provider="openai", model="gpt-5.4")
     stdout = fixture("codex", "0.147.0", "exec_nodoc.jsonl")
+    factory = fake_process(stdout=stdout)
+    secret = "sk-proj-" + "Lz8" * 16
+    seen: dict[str, str] = {}
+
+    def popen(args: list[str], **kw: Any) -> FakeProcess:
+        # The real codex writes `-o` (unredacted) and reads `--output-schema`.
+        out_path = Path(args[args.index("-o") + 1])
+        schema_path = Path(args[args.index("--output-schema") + 1])
+        seen["schema"] = schema_path.read_text()
+        out_path.write_text(json.dumps({"verdict": "ok", "leak": secret}))
+        seen["out"] = str(out_path)
+        return factory(args, **kw)
+
+    scratch = tmp_path / "s"
     res = run_worker(
-        make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=tmp_path / "s"),
-        popen=fake_process(stdout=stdout),
+        make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=scratch), popen=popen
     )
     assert res.status is WorkerStatus.OK and res.text == "ok" and res.model_executed is None
-    assert json.loads((tmp_path / "s" / "schema.json").read_text()) == {"type": "object"}
+    assert json.loads(seen["schema"]) == {"type": "object"}
     assert "-c" in res.argv and "project_doc_max_bytes=0" in res.argv
+    # the -o content came back IN MEMORY and is the structured output ...
+    assert res.output_file is not None and secret.encode() in res.output_file
+    assert res.structured == {"verdict": "ok", "leak": secret}
+    # ... and NO raw output file or schema remains anywhere under scratch
+    assert not Path(seen["out"]).exists()
+    assert [p for p in scratch.rglob("*") if p.is_file()] == []
+    assert not (scratch / Path(seen["out"]).parent.name).exists()
+
+
+def test_run_worker_codex_scratch_removed_even_on_spawn_failure(tmp_path: Path) -> None:
+    codex = make_policy(tmp_path, "codex", provider="openai", model="gpt-5.4")
+
+    def boom(*_a: Any, **_k: Any) -> FakeProcess:
+        raise PermissionError("denied")
+
+    scratch = tmp_path / "s"
+    res = run_worker(
+        make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=scratch), popen=boom
+    )
+    assert res.status is WorkerStatus.FAILED
+    assert [p for p in scratch.rglob("*") if p.is_file()] == []

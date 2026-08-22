@@ -379,21 +379,40 @@ def _collect_strings(obj: Any, key_hint: bool, out: list[str]) -> None:
         out.append(obj)
 
 
-def load_credential_values(paths: Iterable[Path]) -> list[str]:
+class CredentialFileError(RuntimeError):
+    """A declared credential file exists but cannot be parsed (fail closed)."""
+
+
+@dataclass
+class CredentialValues:
+    values: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)  # declared but missing files
+
+
+def load_credential_values(paths: Iterable[Path]) -> CredentialValues:
     """Secret VALUES from JSON credential files (kept in memory only).
 
-    Any string >= 16 chars under a key that looks credential-like is
-    collected. Missing or unparsable files are skipped silently - this is a
-    best-effort extra layer on top of the pattern set.
+    Any string >= 16 chars under a credential-looking key is collected. A
+    declared file that is MISSING is a warning (for the doctor); a file that
+    EXISTS but cannot be read or parsed raises :class:`CredentialFileError`
+    because its secrets could not be added to the redactor.
     """
+    out = CredentialValues()
     values: list[str] = []
-    for path in paths:
-        try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+    for raw in paths:
+        path = Path(raw)
+        if not path.exists():
+            out.warnings.append(f"credential file {path} not found")
             continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CredentialFileError(
+                f"credential file {path} exists but cannot be parsed: {exc.__class__.__name__}"
+            ) from exc
         _collect_strings(data, False, values)
-    return sorted(set(values))
+    out.values = sorted(set(values))
+    return out
 
 
 def parse_dotenv(text: str) -> dict[str, str]:

@@ -43,30 +43,34 @@ from eris.launch import (
 from eris.policy import Policy, VerifyCommand, sha256_file
 
 # Defense in depth: refused for these tools regardless of the policy grammar.
+# Every entry was verified against the captured --help output of the pinned
+# tool versions in tests/fixtures/help/ (git 2.50.1, pytest 9.1.1, ruff 0.16.4,
+# mypy 2.3.1); tests/test_verify_allowlist.py asserts each entry appears there.
 HARD_DENY: dict[str, frozenset[str]] = {
     "git": frozenset(
         {
+            # global options (git-2.50.1.txt)
             "-c",
             "-C",
             "--exec-path",
             "--git-dir",
             "--work-tree",
             "--namespace",
+            "--config-env",
+            "--bare",
+            "--paginate",
+            # diff family (git-diff-2.50.1.txt): external programs / writes / outside-repo
             "--ext-diff",
             "--textconv",
-            "-O",
-            "--open-files-in-pager",
             "--output",
-            "--config-env",
-            "--super-prefix",
-            "--upload-pack",
-            "--receive-pack",
-            "--exec",
+            "-O",
+            "--no-index",
         }
     ),
     "pytest": frozenset(
         {
             "-c",
+            "--config-file",
             "--rootdir",
             "-o",
             "--override-ini",
@@ -75,56 +79,85 @@ HARD_DENY: dict[str, frozenset[str]] = {
             "--pdb",
             "--pdbcls",
             "--trace",
-            "--junit-xml",
             "--junitxml",
+            "--junit-xml",
+            "--junitprefix",
+            "--junit-prefix",
             "--cov",
             "--cov-report",
             "--cov-config",
+            "--cov-append",
             "--confcutdir",
             "--pyargs",
             "--lf",
+            "--last-failed",
             "--ff",
+            "--failed-first",
+            "--nf",
+            "--new-first",
+            "--sw",
+            "--stepwise",
             "-W",
+            "--pythonwarnings",
             "--doctest-modules",
+            "--doctest-glob",
+            "--log-file",
+            "--log-file-mode",
+            "--pastebin",
+            "--debug",
+            "--cache-clear",
+            "--assert",
         }
     ),
     "ruff": frozenset(
         {
             "--config",
             "--fix",
+            "--fix-only",
             "--unsafe-fixes",
             "--add-noqa",
-            "--fix-only",
-            "--show-settings",
+            "--add-ignore",
+            "--cache-dir",
+            "--preview",
             "--extension",
             "--stdin-filename",
             "-e",
             "--exit-zero",
+            "--exit-non-zero-on-fix",
+            "-o",
+            "--output-file",
+            "-w",
+            "--watch",
+            "--show-settings",
         }
     ),
     "mypy": frozenset(
         {
             "--config-file",
-            "--install-types",
-            "-c",
-            "--command",
-            "--custom-typeshed-dir",
             "--python-executable",
+            "--shadow-file",
+            "--custom-typeshed-dir",
+            "--custom-typing-module",
             "--cache-dir",
             "--sqlite-cache",
+            "--install-types",
+            "--non-interactive",
+            "-c",
+            "--command",
             "-p",
             "--package",
             "-m",
             "--module",
-            "--plugins",
             "--junit-xml",
-            "--html-report",
-            "--txt-report",
+            "--pdb",
             "--any-exprs-report",
-            "--linecount-report",
-            "--xml-report",
             "--cobertura-xml-report",
+            "--html-report",
+            "--linecount-report",
+            "--linecoverage-report",
             "--lineprecision-report",
+            "--txt-report",
+            "--xml-report",
             "--xslt-html-report",
             "--xslt-txt-report",
         }
@@ -295,7 +328,7 @@ def build_verify_env(*, path_env: str, scratch_home: Path) -> dict[str, str]:
 
 
 def run_allowlisted(
-    decision: Decision,
+    argv: Sequence[str],
     policy: Policy,
     snapshot_root: Path,
     scratch_home: Path,
@@ -303,13 +336,19 @@ def run_allowlisted(
     popen: PopenFactory = subprocess.Popen,
     killpg: KillPg = os.killpg,
     clock: Callable[[], float] = time.monotonic,
-) -> SpawnResult:
-    """Execute a Decision that ``check_command`` allowed. Refuses anything else."""
+    hasher: Callable[[Path], str] = sha256_file,
+) -> tuple[Decision, SpawnResult]:
+    """Validate RAW argv with :func:`check_command` immediately before spawning.
+
+    Callers cannot hand in a pre-made ``Decision``: the grammar is re-applied
+    here so a forged or stale decision can never reach ``spawn``.
+    """
+    decision = check_command(argv, policy, Path(snapshot_root), hasher=hasher)
     if not decision.allowed or not decision.argv:
         raise PermissionError(f"refusing to run: {decision.reason}")
     Path(scratch_home).mkdir(parents=True, exist_ok=True)
     env = build_verify_env(path_env=policy.path_env, scratch_home=Path(scratch_home))
-    return spawn(
+    result = spawn(
         list(decision.argv),
         env=env,
         cwd=Path(snapshot_root),
@@ -320,3 +359,4 @@ def run_allowlisted(
         killpg=killpg,
         clock=clock,
     )
+    return decision, result

@@ -6,8 +6,9 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 import yaml
-from eval.run import main
+from eval.run import default_run_id, main, run_dir_for, validate_run_id
 
 from eris.policy import UNPINNED
 from eris.validate import validate_events
@@ -210,6 +211,83 @@ def test_invoke_failed_worker_is_recorded(
     assert summary["status"] == "failed"
     manifest = json.loads((tmp_path / "runs" / "r" / "manifest.json").read_bytes())
     assert manifest["extra"]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "bad", ["../x", "/abs/x", "a/b", "", "x" * 65, "run id", "r\n", ".", "..", "~x", "x;y"]
+)
+def test_invoke_refuses_unsafe_run_ids_before_touching_disk(
+    tmp_path: Path, bad: str, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = setup_world(tmp_path)
+    runs = tmp_path / "runs"
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(runs), "--run-id", bad],
+        out=out,
+        home=tmp_path,
+        popen=fake_process(stdout=b"{}"),
+    )
+    assert rc == 2 and json.loads(out.getvalue())["status"] == "error"
+    assert not runs.exists()
+    assert not (tmp_path / "x").exists() and not Path("/abs/x").exists()
+    with pytest.raises(ValueError):
+        validate_run_id(bad)
+
+
+def test_run_id_helpers(tmp_path: Path) -> None:
+    assert validate_run_id("t_01-grok-r2") == "t_01-grok-r2"
+    assert run_dir_for(tmp_path, "ok_1") == (tmp_path / "ok_1").resolve()
+    with pytest.raises(ValueError):
+        run_dir_for(tmp_path, "../escape")
+    generated = default_run_id("task.with:odd/chars", "grok", 3)
+    assert validate_run_id(generated) == generated and len(generated) <= 64
+    assert generated.startswith("task_with_odd_chars-grok-r3-")
+
+
+def test_invoke_key_includes_snapshot_sha_from_git_head(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = setup_world(tmp_path)
+    sha = "f" * 40
+    out_a = io.StringIO()
+    main(["dry-run", *common_args(w)], out=out_a, home=tmp_path, popen=fake_process())
+    key_none = json.loads(out_a.getvalue())
+    assert key_none["snapshot_sha"] is None  # no .git in the scratch snapshot
+    (w["snapshot"] / ".git").mkdir()
+    (w["snapshot"] / ".git" / "HEAD").write_text(f"{sha}\n")
+    out_b = io.StringIO()
+    main(["dry-run", *common_args(w)], out=out_b, home=tmp_path, popen=fake_process())
+    key_head = json.loads(out_b.getvalue())
+    assert key_head["snapshot_sha"] == sha
+    assert key_head["idempotency_key"] != key_none["idempotency_key"]
+    out_c = io.StringIO()
+    main(
+        ["dry-run", *common_args(w), "--snapshot-sha", "e" * 40],
+        out=out_c,
+        home=tmp_path,
+        popen=fake_process(),
+    )
+    assert json.loads(out_c.getvalue())["idempotency_key"] not in (
+        key_head["idempotency_key"],
+        key_none["idempotency_key"],
+    )
+
+
+def test_invoke_refuses_unparsable_credential_file(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = setup_world(tmp_path)
+    (tmp_path / "auth.json").write_text("{broken")
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(tmp_path / "runs"), "--run-id", "r"],
+        out=out,
+        home=tmp_path,
+        popen=fake_process(stdout=b"{}"),
+    )
+    assert rc == 2 and "cannot be parsed" in json.loads(out.getvalue())["error"]
+    assert not (tmp_path / "runs" / "r" / "events.jsonl").exists()
 
 
 def test_preflight_prints_doctor(tmp_path: Path) -> None:

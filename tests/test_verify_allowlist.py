@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -274,29 +275,150 @@ def test_verify_env_is_built_from_empty_and_git_hardened(
         assert never not in env
 
 
-def test_run_allowlisted_refuses_denied_decisions(
+def test_run_allowlisted_revalidates_raw_argv_before_spawn(
     world: tuple[Policy, Path], tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
     policy, snap = world
     factory = fake_process(stdout=b"ok")
-    with pytest.raises(PermissionError):
-        run_allowlisted(Decision(False, "nope"), policy, snap, tmp_path / "scratch", popen=factory)
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        run_allowlisted(["bash", "-c", "true"], policy, snap, tmp_path / "scratch", popen=factory)
     assert factory.instances == []
-    d = check_command(["git", "diff", "--stat", "src"], policy, snap)
-    res = run_allowlisted(
-        d, policy, snap, tmp_path / "scratch", popen=factory, killpg=lambda *_: None
+    d, res = run_allowlisted(
+        ["git", "diff", "--stat", "src"],
+        policy,
+        snap,
+        tmp_path / "scratch",
+        popen=factory,
+        killpg=lambda *_: None,
     )
-    assert res.stdout == b"ok" and res.exit_code == 0
+    assert d.allowed and res.stdout == b"ok" and res.exit_code == 0
     kw = factory.instances[0].popen_kwargs
     assert kw["cwd"] == str(snap.resolve()) and kw["env"]["GIT_CONFIG_GLOBAL"] == "/dev/null"
     assert kw["env"]["HOME"] == str(tmp_path / "scratch")
     assert list(factory.instances[0].args) == list(d.argv)
+    assert d.argv[0] == str(Path(policy.verify.commands["git"].executable).resolve())
 
 
-def test_run_allowlisted_passes_through_launch_refusal(
+def test_forged_decision_cannot_reach_spawn(
+    world: tuple[Policy, Path], tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """A caller can no longer hand in a Decision: run_allowlisted takes RAW
+    argv and applies the grammar itself immediately before spawning."""
+    policy, snap = world
+    factory = fake_process(stdout=b"uid=0")
+    forged = Decision(True, "forged", "git", ("/bin/sh", "-c", "id"), 10)
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        run_allowlisted(list(forged.argv), policy, snap, tmp_path / "s", popen=factory)
+    with pytest.raises(TypeError):
+        run_allowlisted(forged, policy, snap, tmp_path / "s", popen=factory)  # type: ignore[arg-type]
+    # stale decision: the binary changed between an earlier check and now
+    Path(policy.verify.commands["git"].executable).write_bytes(b"#!/bin/sh\necho swapped\n")
+    with pytest.raises(PermissionError, match="hash mismatch"):
+        run_allowlisted(
+            ["git", "diff", "--stat", "src"], policy, snap, tmp_path / "s", popen=factory
+        )
+    assert factory.instances == []
+
+
+def test_run_allowlisted_refuses_forbidden_launch_tokens(
     world: tuple[Policy, Path], tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
     policy, snap = world
-    forged = Decision(True, "forged", "git", ("git", "--bare"), 10)
-    with pytest.raises(LaunchRefused):
-        run_allowlisted(forged, policy, snap, tmp_path / "s", popen=fake_process())
+    with pytest.raises(PermissionError, match="hard-denied"):
+        run_allowlisted(
+            ["git", "diff", "--bare"], policy, snap, tmp_path / "s", popen=fake_process()
+        )
+    assert LaunchRefused  # spawn's own guard stays behind the grammar as defense in depth
+
+
+# --------------------------------------------------------------------------- deny lists vs help
+
+HELP_DIR = Path(__file__).parent / "fixtures" / "help"
+HELP_FILES = {
+    "git": ["git-2.50.1.txt", "git-diff-2.50.1.txt", "git-log-2.50.1.txt"],
+    "pytest": ["pytest-9.1.1.txt"],
+    "ruff": ["ruff-check-0.16.4.txt"],
+    "mypy": ["mypy-2.3.1.txt"],
+}
+
+
+def _flag_in_help(flag: str, text: str) -> bool:
+    return re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text) is not None
+
+
+@pytest.mark.parametrize("command", sorted(HARD_DENY))
+def test_every_hard_deny_entry_is_a_real_flag_of_the_pinned_tool(command: str) -> None:
+    """A deny entry that is not in the captured --help is a sign the list
+    drifted from the tool (wrong name = no protection). Captured on
+    2026-08-22 from the versions named in the fixture file names."""
+    text = "\n".join((HELP_DIR / f).read_text() for f in HELP_FILES[command])
+    missing = sorted(flag for flag in HARD_DENY[command] if not _flag_in_help(flag, text))
+    assert missing == [], f"{command}: not in captured help: {missing}"
+
+
+def test_mandatory_hard_deny_entries_present() -> None:
+    assert {
+        "--log-file",
+        "--pastebin",
+        "--junit-xml",
+        "--doctest-modules",
+        "--import-mode",
+        "--trace",
+        "-W",
+        "-c",
+        "--rootdir",
+        "-o",
+        "--basetemp",
+        "--pdb",
+    } <= HARD_DENY["pytest"]
+    assert {
+        "--fix",
+        "--fix-only",
+        "--unsafe-fixes",
+        "--config",
+        "--cache-dir",
+        "--preview",
+        "--add-noqa",
+        "--stdin-filename",
+    } <= HARD_DENY["ruff"]
+    assert {
+        "--python-executable",
+        "--shadow-file",
+        "--custom-typeshed-dir",
+        "--config-file",
+        "--cache-dir",
+        "--install-types",
+        "-c",
+        "-p",
+        "-m",
+    } <= HARD_DENY["mypy"]
+    assert {
+        "-c",
+        "-C",
+        "--exec-path",
+        "--git-dir",
+        "--work-tree",
+        "--ext-diff",
+        "--textconv",
+        "--output",
+        "-O",
+        "--no-index",
+    } <= HARD_DENY["git"]
+    assert "--plugins" not in HARD_DENY["mypy"]  # not a mypy 2.3.1 flag: removed
+
+
+def test_default_policy_allowlists_only_real_flags() -> None:
+    """Literal and value flags in policies/default.yaml must exist in the captured help."""
+    from eris.policy import load_policy
+
+    repo_policy = Path(__file__).resolve().parents[1] / "policies" / "default.yaml"
+    pol = load_policy(repo_policy, pins_path=repo_policy.with_name("no-such-pins.yaml")).policy
+    for name, cmd in pol.verify.commands.items():
+        text = "\n".join((HELP_DIR / f).read_text() for f in HELP_FILES[name])
+        flags = [*cmd.literal_flags, *cmd.value_flags]
+        unknown = [f for f in flags if f != "--" and not _flag_in_help(f.split("=")[0], text)]
+        if name == "git":
+            # git-log/grep/show/blame help was not captured in full; only global+diff flags checked
+            unknown = [f for f in unknown if f in HARD_DENY["git"]]
+        assert unknown == [], f"{name}: {unknown}"
+        assert not any(f in HARD_DENY.get(name, ()) for f in flags), name

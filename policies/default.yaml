@@ -15,11 +15,14 @@ runs_dir: runs
 path_env: /usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
 vendors_allowed: [anthropic, openai, xai, google]
 api_hosts_allowed: [api.openai.com, api.x.ai, localhost, 127.0.0.1]
+# All four files verified to EXIST on this machine on 2026-08-22. A declared
+# file that is missing is a doctor WARN; one that exists but cannot be parsed
+# refuses the run (its secrets could not be added to the redactor).
 credential_files:
-  - ~/.codex/auth.json            # codex auth is file-based (verified on this machine)
-  - ~/.claude/.credentials.json   # present on Linux installs; macOS uses Keychain (UNKNOWN here)
-  - ~/.gemini/oauth_creds.json    # ASSUMPTION
-  - ~/.grok/credentials.json      # ASSUMPTION (GROK_HOME semantics unknown)
+  - ~/.codex/auth.json
+  - ~/.claude/.credentials.json
+  - ~/.gemini/oauth_creds.json
+  - ~/.grok/auth.json
 
 workers:
   claude:
@@ -93,7 +96,6 @@ verify:
       literal_flags: ["--no-fix", "--quiet", "--isolated", "--no-cache", "--output-format=concise", "--output-format=json"]
       value_flags:
         "--select": "^[A-Z0-9,]{1,64}$"
-        "--line-length": "^[0-9]{2,3}$"
       positional: ["path"]
     mypy:
       executable: /opt/homebrew/bin/mypy
@@ -104,9 +106,10 @@ verify:
       executable: /opt/homebrew/bin/pytest
       executable_sha256: UNPINNED
       requires_trusted: true
-      literal_flags: ["-q", "-x", "--no-header", "--tb=short", "--tb=no", "-rN", "--color=no"]
+      literal_flags: ["-q", "-x", "--no-header", "--tb=short", "--tb=no", "--color=no"]
       value_flags:
         "-p": "^no:[A-Za-z0-9_]+$"
+        "-r": "^[fEsxXpPaAwN]{1,8}$"
         "-k": "^[A-Za-z0-9_ ]{1,120}$"
         "-m": "^[A-Za-z0-9_ ]{1,60}$"
         "--maxfail": "^[0-9]{1,3}$"

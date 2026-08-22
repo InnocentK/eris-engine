@@ -180,7 +180,9 @@ class FakeProcess:
     def poll(self) -> int | None:
         if self.hang and not self._signalled.is_set():
             return None
-        self.returncode = -self.signals[-1] if self.signals else self._rc
+        # Like a real process: the FIRST delivered signal is what ended it;
+        # later signals (e.g. the SIGKILL sweep) are recorded but change nothing.
+        self.returncode = -self.signals[0] if self.signals else self._rc
         return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:

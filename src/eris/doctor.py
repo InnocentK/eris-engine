@@ -6,7 +6,6 @@ values. A missing worker is a WARN (recorded absence), never a substitution.
 from __future__ import annotations
 
 import fcntl
-import os
 import shutil
 import subprocess
 import sys
@@ -17,7 +16,7 @@ from typing import Literal
 
 from eris.launch import build_env
 from eris.policy import LoadedPolicy, PolicyError, load_policy, sha256_file
-from eris.redact import parse_dotenv
+from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
 from eris.schemas import Transport
 
 Status = Literal["OK", "WARN", "FAIL"]
@@ -71,6 +70,10 @@ def default_probe_runner(argv: list[str], env: dict[str, str]) -> str | None:
     return proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
 
 
+def _expand(raw: str, home: Path) -> Path:
+    return Path(raw.replace("~", str(home), 1)) if raw.startswith("~") else Path(raw)
+
+
 def _flock_probe(runs_dir: Path) -> tuple[Status, str]:
     try:
         runs_dir.mkdir(parents=True, exist_ok=True)
@@ -84,16 +87,17 @@ def _flock_probe(runs_dir: Path) -> tuple[Status, str]:
     return "OK", f"{runs_dir} writable; flock works"
 
 
-def _env_names(env_file: Path) -> tuple[set[str], Status, str]:
+def _env_names(env_file: Path) -> tuple[dict[str, str], Status, str]:
+    """Names and (in-memory only, for the redactor) values from .env."""
     if not env_file.exists():
-        return set(), "WARN", f"{env_file} not found (only needed for api workers / env_allow)"
+        return {}, "WARN", f"{env_file} not found (only needed for api workers / env_allow)"
     try:
         mode = env_file.stat().st_mode & 0o777
-        names = {k for k, v in parse_dotenv(env_file.read_text(encoding="utf-8")).items() if v}
+        values = {k: v for k, v in parse_dotenv(env_file.read_text(encoding="utf-8")).items() if v}
     except OSError as exc:
-        return set(), "FAIL", f"cannot read {env_file}: {exc.__class__.__name__}"
+        return {}, "FAIL", f"cannot read {env_file}: {exc.__class__.__name__}"
     perm = f"; mode {mode:o} is group/world readable - chmod 600" if mode & 0o077 else ""
-    return names, ("WARN" if perm else "OK"), f"{len(names)} non-empty names{perm}"
+    return values, ("WARN" if perm else "OK"), f"{len(values)} non-empty names{perm}"
 
 
 def run_doctor(
@@ -129,8 +133,27 @@ def run_doctor(
         + (f"{loaded.pins_sha256[:12]}" if loaded.pins_sha256 else "none")
         + f"; trusted={pol.trusted}",
     )
-    names, st, msg = _env_names(env_file)
+    env_values, st, msg = _env_names(env_file)
+    names = set(env_values)
     report.add(st, "env-file", msg)
+
+    credential_paths = [_expand(raw, home) for raw in pol.credential_files]
+    try:
+        creds = load_credential_values(credential_paths)
+    except CredentialFileError as exc:
+        report.add("FAIL", "credential-file", str(exc))
+        creds = None
+    else:
+        for raw, path in zip(pol.credential_files, credential_paths, strict=True):
+            present = path.exists()
+            report.add(
+                "OK" if present else "WARN",
+                "credential-file",
+                f"{raw}: {'present' if present else 'absent'}",
+            )
+    # Anything printed from a probe goes through the redactor (patterns +
+    # every known secret value); the values themselves never leave memory.
+    redactor = Redactor([*env_values.values(), *(creds.values if creds else [])])
 
     for wid, w in pol.workers.items():
         if w.transport is Transport.API:
@@ -157,6 +180,7 @@ def run_doctor(
         if not Path(exe).is_file():
             report.add("WARN", f"worker.{wid}", f"{exe} missing (recorded absence)")
             continue
+        hash_ok = False
         if not w.pinned:
             report.add(
                 "WARN", f"worker.{wid}", f"{exe} present but UNPINNED (run `eris policy pin`)"
@@ -168,11 +192,16 @@ def run_doctor(
                 f"{exe} sha256 differs from pin (binary changed; re-pin deliberately)",
             )
         else:
+            hash_ok = True
             report.add("OK", f"worker.{wid}", f"{exe} pinned {w.executable_sha256[:12]}")
         missing = [n for n in w.env_allow if n not in names]
         if missing:
             report.add("WARN", f"worker.{wid}.env", f"env_allow names absent from .env: {missing}")
-        if probe and w.pinned and w.cli:
+        if probe and w.cli:
+            if not hash_ok:
+                # Never execute an unpinned or mismatched binary, even for --version.
+                report.add("WARN", f"worker.{wid}.probe", "skipped: binary is not pinned/verified")
+                continue
             env = build_env(
                 w.cli, path_env=pol.path_env, home=str(home), tmpdir="/tmp", policy_env=w.env
             )
@@ -180,7 +209,10 @@ def run_doctor(
             if version is None:
                 report.add("WARN", f"worker.{wid}.probe", "--version failed")
             else:
-                report.add("OK", f"worker.{wid}.probe", f"--version: {version[:80]}")
+                safe = redactor.redact(version).text.splitlines()
+                report.add(
+                    "OK", f"worker.{wid}.probe", f"--version: {(safe[0] if safe else '')[:80]}"
+                )
 
     for name, cmd in pol.verify.commands.items():
         p = Path(cmd.executable)
@@ -190,18 +222,6 @@ def run_doctor(
             report.add("WARN", f"verify.{name}", f"{p} UNPINNED")
         else:
             report.add("OK", f"verify.{name}", f"{p} pinned")
-
-    for raw in pol.credential_files:
-        path = (
-            Path(os.path.expanduser(raw.replace("~", str(home), 1)))
-            if raw.startswith("~")
-            else Path(raw)
-        )
-        report.add(
-            "OK" if path.exists() else "WARN",
-            "credential-file",
-            f"{raw}: {'present' if path.exists() else 'absent'}",
-        )
 
     git = which("git")
     report.add("OK" if git else "FAIL", "git", git or "git not found on PATH")

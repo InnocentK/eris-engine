@@ -135,6 +135,10 @@ class RunWriter:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
         lock_fh = open(self.lock_path, "ab")
+        # Directory entries are durable only after their parent is fsynced.
+        self._fsync_dir(self.run_dir.parent)
+        self._fsync_dir(self.blobs_dir.parent)
+        self._fsync_dir(self.blobs_dir)
         try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -149,6 +153,7 @@ class RunWriter:
                     raise RunExists(f"{self.events_path} exists; pass resume=True to continue")
                 self._recover()
             self._events_fh = open(self.events_path, "ab")
+            self._fsync_dir(self.run_dir)  # .lock and events.jsonl entries
         except BaseException:
             self._release_lock()
             raise
@@ -178,12 +183,10 @@ class RunWriter:
         lines = raw.split(b"\n")
         tail = lines.pop()  # bytes after the last newline ("" when clean)
         keep = [line + b"\n" for line in lines]
-        torn = False
-        if tail:
-            torn = True  # no trailing newline: the final write was interrupted
-        elif keep and not self._parses(keep[-1]):
-            torn = True  # final line is complete but unparsable
-            keep.pop()
+        # ONLY a non-newline-terminated partial tail is recoverable (the
+        # final write was interrupted). A complete but invalid line anywhere,
+        # including last, is corruption, not a torn write -> LedgerInvalid.
+        torn = bool(tail)
         findings = validate_events(keep)
         if findings:
             raise LedgerInvalid(self._describe(findings))
@@ -204,14 +207,6 @@ class RunWriter:
                 self._blobs[blob_path.name] = BlobRef(
                     blob_path.name, blob_path.stat().st_size, {}, blob_path
                 )
-
-    @staticmethod
-    def _parses(line: bytes) -> bool:
-        try:
-            Event.model_validate(json.loads(line))
-        except (ValueError, TypeError):
-            return False
-        return True
 
     @staticmethod
     def _describe(findings: list[Finding]) -> str:

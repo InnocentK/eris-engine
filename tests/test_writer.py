@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -63,18 +64,24 @@ def test_seq_and_prev_sha_chain_validate(tmp_path: Path) -> None:
 def test_fsync_is_called_for_every_durable_write(tmp_path: Path) -> None:
     calls: list[int] = []
 
+    kinds: list[str] = []
+
     def fsync(fd: int) -> None:
         calls.append(fd)
+        kinds.append("dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
         os.fsync(fd)
 
     w = RunWriter(tmp_path / "r", Redactor(), fsync=fsync, clock=clock).open()
+    # creation-time directory fsyncs: runs parent, run dir (for blobs/), blobs/sha256,
+    # and the run dir again once .lock and events.jsonl exist
+    n_after_open = len(calls)
+    assert n_after_open == 4 and kinds == ["dir", "dir", "dir", "dir"]
     w.append("k", {"x": 1})
-    n_after_append = len(calls)
-    assert n_after_append == 1  # the events file
+    assert len(calls) == n_after_open + 1 and kinds[-1] == "file"  # the events file
     w.put_blob(b"hello")
-    assert len(calls) == n_after_append + 2  # blob file + blobs dir
+    assert len(calls) == n_after_open + 3 and kinds[-2:] == ["file", "dir"]  # blob + blobs dir
     w.finalize()
-    assert len(calls) == n_after_append + 4  # manifest file + run dir
+    assert len(calls) == n_after_open + 5 and kinds[-2:] == ["file", "dir"]  # manifest + run dir
 
 
 # --------------------------------------------------------------------------- blobs
@@ -96,11 +103,15 @@ def test_put_blob_is_redacted_before_hashing_and_atomic(tmp_path: Path) -> None:
 
 def test_write_failure_raises_and_leaves_no_partial_blob(tmp_path: Path) -> None:
     boom = OSError("disk full")
+    failing = False
 
-    def fsync(_fd: int) -> None:
-        raise boom
+    def fsync(fd: int) -> None:
+        if failing:
+            raise boom
+        os.fsync(fd)
 
     w = RunWriter(tmp_path / "r", Redactor(), fsync=fsync, clock=clock).open()
+    failing = True  # the disk "fills up" after the run directory exists
     with pytest.raises(OSError, match="disk full"):
         w.put_blob(b"payload")
     assert list(w.blobs_dir.iterdir()) == []
@@ -159,15 +170,18 @@ def test_torn_tail_truncated_only_on_resume(tmp_path: Path) -> None:
     assert json.loads(r.manifest_path.read_bytes())["torn_tail_truncated"] is True
 
 
-def test_complete_but_unparsable_last_line_is_a_torn_tail(tmp_path: Path) -> None:
+def test_complete_but_unparsable_last_line_is_invalid_not_torn(tmp_path: Path) -> None:
+    """Only a partial (non-newline-terminated) tail is a torn write. A complete
+    line that does not parse is corruption: refuse, never truncate it away."""
     w = make_writer(tmp_path).open()
     w.append("k", {"n": 0})
     w.close()
     with open(w.events_path, "ab") as fh:
         fh.write(b"{garbage\n")
-    r = make_writer(tmp_path, resume=True).open()
-    assert r.torn_tail_truncated and r.seq == 1
-    r.close()
+    before = w.events_path.read_bytes()
+    with pytest.raises(LedgerInvalid, match="MALFORMED_LINE"):
+        make_writer(tmp_path, resume=True).open()
+    assert w.events_path.read_bytes() == before
 
 
 def test_malformed_middle_line_is_invalid(tmp_path: Path) -> None:

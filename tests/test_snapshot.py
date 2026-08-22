@@ -13,11 +13,14 @@ from eris.snapshot import (
     build_snapshot,
     default_git_runner,
     git_env,
+    read_head_sha,
     verify_snapshot,
 )
 
 HEAD = "a" * 40
 FUTURE = "b" * 40
+FUTURE_BLOB = "c" * 40
+FUTURE_TREE = "d" * 40
 
 
 class FakeGit:
@@ -51,7 +54,9 @@ def clean_answers() -> dict[tuple[str, ...], GitResult]:
         ("for-each-ref",): ok(f"refs/heads/{SNAPSHOT_BRANCH}\n"),
         ("rev-parse", "HEAD"): ok(HEAD),
         ("rev-list", "--count", "HEAD"): ok("3"),
-        ("cat-file", "-e", f"{FUTURE}^{{commit}}"): fail(),
+        ("cat-file", "-e", FUTURE): fail(),
+        ("cat-file", "-e", FUTURE_BLOB): fail(),
+        ("cat-file", "-e", FUTURE_TREE): fail(),
     }
 
 
@@ -64,9 +69,22 @@ def make_dest(tmp_path: Path) -> Path:
 def test_verify_clean_snapshot(tmp_path: Path) -> None:
     dest = make_dest(tmp_path)
     git = FakeGit(clean_answers())
-    v = verify_snapshot(dest, head_sha=HEAD, forbidden_shas=[FUTURE], git=git)
+    v = verify_snapshot(
+        dest, head_sha=HEAD, forbidden_shas=[FUTURE, FUTURE_BLOB, FUTURE_TREE], git=git
+    )
     assert v.ok and v.problems == [] and v.head_sha == HEAD and v.commit_count == 3
-    assert (("cat-file", "-e", f"{FUTURE}^{{commit}}"), dest) in git.calls
+    for obj in (FUTURE, FUTURE_BLOB, FUTURE_TREE):
+        assert (("cat-file", "-e", obj), dest) in git.calls  # any object type, not ^{commit}
+
+
+def test_verify_rejects_injected_future_blob_and_tree(tmp_path: Path) -> None:
+    dest = make_dest(tmp_path)
+    git = FakeGit({**clean_answers(), ("cat-file", "-e", FUTURE_BLOB): ok("")})
+    v = verify_snapshot(dest, head_sha=HEAD, forbidden_shas=[FUTURE, FUTURE_BLOB], git=git)
+    assert not v.ok and v.problems == [f"future object {FUTURE_BLOB} is present in the snapshot"]
+    git = FakeGit({**clean_answers(), ("cat-file", "-e", FUTURE_TREE): ok("")})
+    v = verify_snapshot(dest, head_sha=HEAD, forbidden_shas=[FUTURE_TREE], git=git)
+    assert not v.ok and FUTURE_TREE in v.problems[0]
 
 
 def test_verify_no_git_dir(tmp_path: Path) -> None:
@@ -110,7 +128,7 @@ def test_verify_no_git_dir(tmp_path: Path) -> None:
             "unexpected refs",
         ),
         (lambda d: None, {("rev-parse", "HEAD"): ok("c" * 40)}, "HEAD"),
-        (lambda d: None, {("cat-file", "-e", f"{FUTURE}^{{commit}}"): ok("")}, "future commit"),
+        (lambda d: None, {("cat-file", "-e", FUTURE): ok("")}, "future object"),
         (
             lambda d: None,
             {("remote",): fail(), ("for-each-ref",): fail(), ("rev-parse", "HEAD"): fail()},
@@ -168,12 +186,14 @@ def test_build_snapshot_sequence_with_fake_git(tmp_path: Path) -> None:
         {
             **clean_answers(),
             ("rev-parse", f"{HEAD}^{{commit}}"): ok(HEAD),
-            ("rev-list", "--all", "--not", HEAD): ok(f"{FUTURE}\n"),
+            ("rev-list", "--objects", "--all", "--not", HEAD): ok(
+                f"{FUTURE}\n{FUTURE_TREE} \n{FUTURE_BLOB} path/to/secret_key.py\n"
+            ),
         }
     )
     info = build_snapshot(src, HEAD, dest, depth=7, git=git)
     assert info.head_sha == HEAD and info.depth == 7 and info.commit_count == 3
-    assert info.forbidden_shas == (FUTURE,)
+    assert info.forbidden_shas == (FUTURE, FUTURE_TREE, FUTURE_BLOB)  # commits, trees, blobs
     argv = [c[0] for c in git.calls]
     assert (
         "clone",
@@ -226,6 +246,25 @@ def test_build_snapshot_head_mismatch_is_an_error(tmp_path: Path) -> None:
         build_snapshot(src, HEAD, tmp_path / "snap", git=git)
 
 
+def test_read_head_sha_filesystem_only(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    gitdir = repo / ".git"
+    (gitdir / "refs" / "heads").mkdir(parents=True)
+    assert read_head_sha(tmp_path / "missing") is None
+    (gitdir / "HEAD").write_text(f"{HEAD}\n")  # detached
+    assert read_head_sha(repo) == HEAD
+    (gitdir / "HEAD").write_text("ref: refs/heads/eris-snapshot\n")
+    assert read_head_sha(repo) is None  # ref file missing, no packed-refs
+    (gitdir / "packed-refs").write_text(f"# pack-refs\n{FUTURE} refs/heads/eris-snapshot\n")
+    assert read_head_sha(repo) == FUTURE
+    (gitdir / "refs" / "heads" / "eris-snapshot").write_text(f"{HEAD}\n")
+    assert read_head_sha(repo) == HEAD  # loose ref wins
+    (gitdir / "HEAD").write_text("ref: ../../etc/passwd\n")
+    assert read_head_sha(repo) is None
+    (gitdir / "HEAD").write_text("garbage\n")
+    assert read_head_sha(repo) is None
+
+
 def test_git_env_is_hardened(tmp_path: Path) -> None:
     env = git_env(tmp_path)
     assert env["GIT_CONFIG_GLOBAL"] == "/dev/null" and env["GIT_TERMINAL_PROMPT"] == "0"
@@ -264,17 +303,20 @@ def test_snapshot_has_no_future(tmp_path: Path) -> None:
     run_git([*ident, "commit", "-q", "-m", "two (the fix)"], src)
     second = run_git(["rev-parse", "HEAD"], src)
     fix_blob = run_git(["rev-parse", "HEAD:secret_key.py"], src)
+    fix_tree = run_git(["rev-parse", "HEAD^{tree}"], src)
     run_git(["tag", "v-future"], src)
 
     dest = tmp_path / "snapshots" / "task"
     info = build_snapshot(src, first, dest, depth=10, git=default_git_runner)
-    assert info.head_sha == first and info.forbidden_shas == (second,)
+    assert info.head_sha == first
+    assert {second, fix_tree, fix_blob} <= set(info.forbidden_shas)
+    assert read_head_sha(dest) == first
     assert (dest / "f.py").read_text() == "v1\n"
     assert not (dest / "secret_key.py").exists()
 
     verdict = verify_snapshot(dest, head_sha=first, forbidden_shas=[second], git=default_git_runner)
     assert verdict.ok, verdict.problems
-    for obj in (second, fix_blob):
+    for obj in (second, fix_tree, fix_blob):
         res = subprocess.run(
             ["git", "cat-file", "-e", obj],
             cwd=dest,

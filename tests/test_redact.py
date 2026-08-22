@@ -12,6 +12,7 @@ from eris.redact import (
     MIN_B64_RUN,
     PATTERN_IDS,
     SECRET_PATTERNS,
+    CredentialFileError,
     Redactor,
     StreamRedactor,
     load_credential_values,
@@ -265,10 +266,16 @@ def test_load_credential_values_from_json_files(tmp_path: Path) -> None:
             }
         )
     )
+    creds = load_credential_values([auth, tmp_path / "missing.json"])
+    assert set(creds.values) == {"A" * 40, "R" * 40, OPENAI, "n" * 20}
+    assert "2026-08-21T00:00:00Z" not in creds.values
+    # a declared file that is MISSING is a warning, not fatal
+    assert creds.warnings == [f"credential file {tmp_path / 'missing.json'} not found"]
+    # a declared file that EXISTS but cannot be parsed fails closed
     (tmp_path / "bad.json").write_text("{not json")
-    values = load_credential_values([auth, tmp_path / "bad.json", tmp_path / "missing.json"])
-    assert set(values) == {"A" * 40, "R" * 40, OPENAI, "n" * 20}
-    assert "2026-08-21T00:00:00Z" not in values
+    with pytest.raises(CredentialFileError, match="cannot be parsed"):
+        load_credential_values([auth, tmp_path / "bad.json"])
+    assert load_credential_values([]).values == []
 
 
 def test_parse_dotenv() -> None:
