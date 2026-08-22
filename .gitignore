@@ -32,3 +32,6 @@ eval/snapshots/
 
 # claude-code machine-local settings
 .claude/settings.local.json
+
+# Machine-specific executable pins written by `eris policy pin`
+policies/pins.yaml

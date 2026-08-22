@@ -1,0 +1,26 @@
+# Hooks run the tools from .venv so the versions are exactly requirements.txt.
+# Install with `task hooks:install`.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: .venv/bin/ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format --check
+        entry: .venv/bin/ruff format --check --force-exclude
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy (strict, src)
+        entry: .venv/bin/mypy
+        language: system
+        pass_filenames: false
+        files: ^src/
+      - id: no-dotenv
+        name: refuse committing .env
+        entry: bash -c 'echo ".env must never be committed"; exit 1'
+        language: system
+        files: ^\.env$

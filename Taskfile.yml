@@ -1,0 +1,60 @@
+version: "3"
+
+vars:
+  PY: .venv/bin/python
+  PIP: .venv/bin/pip
+
+tasks:
+  setup:
+    desc: Create .venv and install exact pins + the package (editable)
+    cmds:
+      - test -d .venv || python3 -m venv .venv
+      - "{{.PIP}} install --quiet --upgrade pip"
+      - "{{.PIP}} install --quiet -r requirements.txt"
+      - "{{.PIP}} install --quiet --no-deps -e ."
+
+  lint:
+    desc: ruff check + ruff format --check
+    cmds:
+      - .venv/bin/ruff check src tests eval
+      - .venv/bin/ruff format --check src tests eval
+
+  fmt:
+    desc: ruff format + autofix imports
+    cmds:
+      - .venv/bin/ruff check --fix src tests eval
+      - .venv/bin/ruff format src tests eval
+
+  typecheck:
+    desc: mypy strict on src (eval is checked non-strict)
+    cmds:
+      - .venv/bin/mypy
+      - .venv/bin/mypy --ignore-missing-imports eval
+
+  test:
+    desc: pytest (fully hermetic; no worker CLIs, no network)
+    cmds:
+      - "{{.PY}} -m pytest"
+
+  coverage:
+    desc: pytest with the coverage floor (src + eval)
+    cmds:
+      - "{{.PY}} -m pytest --cov --cov-report=term-missing --cov-fail-under=80"
+
+  audit:
+    desc: pip-audit against the exact pins (BLOCKING)
+    cmds:
+      - .venv/bin/pip-audit -r requirements.txt --strict --progress-spinner off
+
+  ci:
+    desc: The required gate - lint, typecheck, coverage, audit
+    cmds:
+      - task: lint
+      - task: typecheck
+      - task: coverage
+      - task: audit
+
+  hooks:install:
+    desc: Install the pre-commit hooks into .git
+    cmds:
+      - .venv/bin/pre-commit install
