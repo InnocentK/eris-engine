@@ -78,7 +78,7 @@ verify:
       executable: /usr/bin/git
       executable_sha256: UNPINNED
       subcommands: [diff, log, grep, show, status, ls-files, blame, rev-parse]
-      literal_flags: ["--stat", "--name-only", "--name-status", "-p", "--no-color", "--oneline", "-n", "-l", "--porcelain", "--", "--no-pager", "--numstat", "--follow", "-w", "--cached"]
+      literal_flags: ["--stat", "--name-only", "--name-status", "-p", "--no-color", "--oneline", "-l", "--porcelain", "--no-pager", "--numstat", "--follow", "-w", "--cached"]
       value_flags:
         "-n": "^[0-9]{1,4}$"
         "--max-count": "^[0-9]{1,4}$"
@@ -104,8 +104,9 @@ verify:
       executable: /opt/homebrew/bin/pytest
       executable_sha256: UNPINNED
       requires_trusted: true
-      literal_flags: ["-q", "-x", "--no-header", "-p", "no:cacheprovider", "--tb=short", "--tb=no", "-rN", "--color=no"]
+      literal_flags: ["-q", "-x", "--no-header", "--tb=short", "--tb=no", "-rN", "--color=no"]
       value_flags:
+        "-p": "^no:[A-Za-z0-9_]+$"
         "-k": "^[A-Za-z0-9_ ]{1,120}$"
         "-m": "^[A-Za-z0-9_ ]{1,60}$"
         "--maxfail": "^[0-9]{1,3}$"
