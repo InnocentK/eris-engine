@@ -154,3 +154,47 @@ def test_record_base_requires_origin() -> None:
     with pytest.raises(ValidationError):
         Minimal(x=1)
     assert Minimal(x=1, origin=Origin.HUMAN_ENTERED).origin is Origin.HUMAN_ENTERED
+
+
+# --------------------------------------------------------------------------- versioning
+
+RECORDS_ROOT = Path(__file__).parent / "fixtures" / "records"
+
+
+def _manifest() -> dict[str, dict[str, str]]:
+    return json.loads((RECORDS_ROOT / "MANIFEST.json").read_text())  # type: ignore[no-any-return]
+
+
+def test_committed_goldens_are_immutable() -> None:
+    """Every golden of every committed SCHEMA_VERSION must hash exactly as
+    MANIFEST.json records. Changing a record's serialization requires a NEW
+    version directory + manifest entry, never editing an old golden."""
+    import hashlib
+
+    manifest = _manifest()
+    on_disk = {
+        d.name: {
+            f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(d.glob("*.json"))
+        }
+        for d in RECORDS_ROOT.iterdir()
+        if d.is_dir()
+    }
+    assert on_disk == manifest, "golden fixtures drifted from MANIFEST.json"
+
+
+def test_current_schema_version_has_a_manifest_entry() -> None:
+    assert SCHEMA_VERSION in _manifest()
+    assert sorted(_manifest()[SCHEMA_VERSION]) == sorted(f"{n}.json" for n in example_records())
+
+
+def test_old_schema_versions_are_rejected_on_parse() -> None:
+    """No migrations in 0.x: a record carrying any other schema_version fails."""
+    older = sorted(v for v in _manifest() if v != SCHEMA_VERSION)
+    assert older, "expected at least one historical schema version directory"
+    for version in older:
+        raw = (RECORDS_ROOT / version / "task.json").read_bytes()
+        assert json.loads(raw)["schema_version"] == version
+        with pytest.raises(ValidationError):
+            Task.model_validate_json(raw)
+    with pytest.raises(ValidationError):
+        Task.model_validate({**example_records()["task"].model_dump(), "schema_version": "9.9.9"})

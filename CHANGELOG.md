@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.1 - schema versioning discipline (2026-08-22)
+
+* `SCHEMA_VERSION` 0.1.0 -> 0.1.1. The `Invocation` record gained four optional
+  fields (`output_file_sha256`, `output_file_size`, `output_file_truncated`,
+  `cleanup_error`) during the M1 advisor rounds; the 0.1.0 golden had been
+  regenerated in place, which is exactly the habit this entry ends. The
+  original 0.1.0 goldens are restored (immutable history) and 0.1.1 goldens
+  are generated from `tests/examples.py`.
+* `tests/fixtures/records/MANIFEST.json` pins the sha256 of every golden of
+  every committed version; `test_committed_goldens_are_immutable` fails on
+  any edit to a committed version directory.
+* `Record.schema_version` is validated against the current `SCHEMA_VERSION`
+  at parse time: no migrations exist in 0.x, so an old record is refused
+  rather than silently reinterpreted (`test_old_schema_versions_are_rejected_on_parse`).
+* Package version 0.1.0 -> 0.1.1 (`src/eris/version.py`).
+
 ## Unreleased - advisor review fixes (2026-08-22)
 
 Round 2 (remaining BLOCK conditions)

@@ -23,9 +23,9 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.1.1"
 
 TS_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -166,6 +166,19 @@ class Record(BaseModel):
 
     schema_version: str = SCHEMA_VERSION
     origin: Origin
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_version_is_current(cls, value: str) -> str:
+        """No migrations in 0.x: a record from any other schema version is
+        refused at parse time rather than silently reinterpreted. Old
+        goldens stay committed (immutable, see MANIFEST.json) as history."""
+        if value != SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version {value!r} is not the current {SCHEMA_VERSION!r}; "
+                "no migration exists"
+            )
+        return value
 
 
 class Location(BaseModel):

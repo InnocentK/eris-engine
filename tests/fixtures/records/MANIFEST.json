@@ -1,0 +1,30 @@
+{
+  "0.1.0": {
+    "adjudication.json": "776fcf513544fabb41cbeffe8b6d8c0c1ff47f53bc963c6d7d43ba27867c58b5",
+    "approval.json": "182d74301d879671dfd4218ae666b6126ab2f48c41e0fc2e7ed86c931cbedf5a",
+    "challenge.json": "9bc9377dcca0e32461d879d5043e59ec7e35fb5eca0080531509bcc1f328f6d8",
+    "claim.json": "44ed31737c36233e53bb7b18a76b8112f4164b8fae070b151a44e85559c601b1",
+    "cost.json": "8fb97f6611406ab5de2814d2e4c0eb1674320036e70d380cd5a5795f13c3412b",
+    "critique.json": "c4e861bdcaa04ef9b2796e367a7137b072008b1acc51c4dbc499d2354b274acd",
+    "event.json": "cdf9859e1e0091de49fb3058bef9e363b3960f081080f608b4e1868b44b9d90c",
+    "evidence.json": "65eba5ef9c0d718a7eea0b8f6d3cb07395510d3a44d8406760019b6fbb65bc0c",
+    "invocation.json": "d6c202c5bbb5806467e1142d8be931c4c7468e93de946e6a942a904520796049",
+    "proposal.json": "01f6669c3b843348a8dfffa28f6358030872efcbe7c3837a158c834518e06505",
+    "task.json": "bb87d0acfc6e6bfb0c2c8b5df6865b6c172396f431bd1c748e9e287f612c9c8a",
+    "verification.json": "f908a572202a7a8c527c75742c05c1f24917e9865c075f1f8561f428855a68d8"
+  },
+  "0.1.1": {
+    "adjudication.json": "35700228ad02a581205f7b68b228ae776dd97418e0e55cfe7b75f0ca611ec09f",
+    "approval.json": "c44b443d7e07232e918aa6c2f9ce5cc7843f2361000f81e652ef932a792d700a",
+    "challenge.json": "b7a2334b6bdc53de676341941aa75b499756a4010336de2029d5a46ed749f728",
+    "claim.json": "2d1620678d2ad7bb7ace8f3efca6ce650319910910d0701a996f66dce71a36ee",
+    "cost.json": "3ab643586b9a2c2e87f0b82f5890368734ce83b0c16dbc30ce0188ce3775da11",
+    "critique.json": "3a9eebeaf07d4029dbd7bd80664a988d74ab5610299e32eeeacade7b9c36c53c",
+    "event.json": "cd27bc8413b1aff7ed3fcc62f65a65f40363ff67d99d8f5300e14e86794e3d08",
+    "evidence.json": "32ccc158802d24621e44cebce8aef271375505e88618e0276d83d97c58f683f3",
+    "invocation.json": "66344ecb18827ce8ce87057ffa5a7f0dfa929ee86dcd7dd620e01889d95c7465",
+    "proposal.json": "762fbedf226669da09ef29017a7bf9208e11fb2b2cf21088f9107fc34123f767",
+    "task.json": "077bd5e64cd64bbfe1fb05068470fa43489a5433faa2ee76c6401aea5e3bc271",
+    "verification.json": "76a419edaf4e37a12c43abf18c66346c053371a351ba069145e7c5b6e6acd900"
+  }
+}

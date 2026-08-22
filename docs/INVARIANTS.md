@@ -22,6 +22,8 @@ the allow list is honoured). No other test may spawn `git`.
 | Rule | Test |
 |---|---|
 | Canonical bytes of every record type are pinned per `SCHEMA_VERSION` | `test_schemas.py::test_golden_bytes_pinned`, `::test_every_record_type_has_a_golden_file` |
+| Committed goldens are IMMUTABLE (`tests/fixtures/records/MANIFEST.json` pins every file of every version); any serialization change = new `SCHEMA_VERSION` dir + manifest entry, and bump `eris.version` + CHANGELOG in the same commit | `test_schemas.py::test_committed_goldens_are_immutable`, `::test_current_schema_version_has_a_manifest_entry` |
+| Records from any other `schema_version` are refused at parse time (no 0.x migrations) | `test_schemas.py::test_old_schema_versions_are_rejected_on_parse` |
 | Every record carries `origin` and `schema_version`; extras forbidden; frozen | `test_schemas.py::test_every_record_carries_origin_and_schema_version`, `::test_extra_fields_are_forbidden`, `::test_records_are_frozen`, `::test_record_base_requires_origin` |
 | Timestamps are RFC 3339 `Z`; NaN refused | `test_schemas.py::test_timestamps_must_be_rfc3339_z`, `::test_canonical_bytes_refuse_nan` |
 | `dissent`/`residual_risks` are required keys but may be empty | `test_schemas.py::test_adjudication_allows_empty_dissent_and_risks` |

@@ -389,6 +389,20 @@ def validate_events(lines: Iterable[bytes]) -> list[Finding]:
         where = f"line:{index}"
         try:
             data: Any = json.loads(line)
+            if isinstance(data, dict) and data.get("schema_version") != SCHEMA_VERSION:
+                # Record parsing refuses foreign versions outright; the ledger
+                # validator reports the precise code instead, then checks the
+                # rest of the chain with the version substituted (the line's
+                # own bytes still feed the hash chain unchanged).
+                findings.append(
+                    _err(
+                        "SCHEMA_VERSION",
+                        f"event schema_version {data.get('schema_version')!r} != "
+                        f"{SCHEMA_VERSION!r}",
+                        f"seq:{data.get('seq')}" if "seq" in data else where,
+                    )
+                )
+                data = {**data, "schema_version": SCHEMA_VERSION}
             event = Event.model_validate(data)
         except (ValueError, ValidationError, TypeError) as exc:
             findings.append(_err("MALFORMED_LINE", f"unparsable event line: {exc!s:.120}", where))
@@ -396,14 +410,6 @@ def validate_events(lines: Iterable[bytes]) -> list[Finding]:
             expected_seq += 1
             continue
         where = f"seq:{event.seq}"
-        if event.schema_version != SCHEMA_VERSION:
-            findings.append(
-                _err(
-                    "SCHEMA_VERSION",
-                    f"event schema_version {event.schema_version!r} != {SCHEMA_VERSION!r}",
-                    where,
-                )
-            )
         if event.seq != expected_seq:
             findings.append(_err("SEQ_GAP", f"expected seq {expected_seq}, got {event.seq}", where))
             expected_seq = event.seq
