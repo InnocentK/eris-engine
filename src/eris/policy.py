@@ -273,7 +273,7 @@ def pin_executables(
     policy_path: Path,
     pins_path: Path | None = None,
     *,
-    which: Callable[[str], str | None] = shutil.which,
+    which: Callable[[str], str | None] | None = None,
 ) -> PinReport:
     """Compute sha256 of every declared executable and write ``pins.yaml``.
 
@@ -281,6 +281,7 @@ def pin_executables(
     Workers whose executable cannot be found are reported as missing and
     left UNPINNED (a recorded absence, never a substitution).
     """
+    which = which or shutil.which  # resolved at call time (see doctor.run_doctor)
     loaded = load_policy(policy_path, pins_path)
     pins_path = loaded.pins_path
     pinned: dict[str, str] = {}

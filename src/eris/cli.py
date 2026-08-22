@@ -1,4 +1,4 @@
-"""``eris`` console entry point: ``policy pin`` (``doctor`` is added with eris.doctor)."""
+"""``eris`` console entry point: ``doctor`` and ``policy pin``."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from eris.doctor import run_doctor
 from eris.policy import PolicyError, pin_executables
 
 DEFAULT_POLICY = Path("policies/default.yaml")
@@ -26,9 +27,23 @@ def _cmd_policy_pin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    report = run_doctor(
+        policy_path=Path(args.policy), env_file=Path(args.env_file), probe=bool(args.probe)
+    )
+    print(report.render())
+    return 0 if report.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="eris")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="preflight: config/filesystem only; prints key NAMES")
+    doctor.add_argument("--policy", default=str(DEFAULT_POLICY))
+    doctor.add_argument("--env-file", default=".env")
+    doctor.add_argument("--probe", action="store_true", help="also run `<cli> --version`")
+    doctor.set_defaults(func=_cmd_doctor)
 
     policy = sub.add_parser("policy", help="policy helpers")
     policy_sub = policy.add_subparsers(dest="policy_command", required=True)

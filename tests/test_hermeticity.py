@@ -8,9 +8,11 @@ import shutil
 import socket
 import subprocess
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from tests.conftest import WORKER_BINARIES, FakeProcess, HermeticityViolation
 
@@ -131,3 +133,36 @@ def test_fake_process_contract(fake_process: object) -> None:
     hanging.terminate()
     assert hanging.wait(timeout=1) < 0
     assert factory.instances == [proc]
+
+
+def test_guard_reaches_call_time_which_lookups(tmp_path: Path) -> None:
+    """Regression: a default argument bound to shutil.which at import time
+    bypassed the guard (the doctor once found the real grok binary)."""
+    from eris.doctor import run_doctor
+    from eris.policy import pin_executables
+
+    policy = tmp_path / "p.yaml"
+    policy.write_text(
+        yaml.safe_dump(
+            {
+                "policy_version": "t",
+                "runs_dir": str(tmp_path / "runs"),
+                "vendors_allowed": ["xai"],
+                "workers": {
+                    "grok": {
+                        "transport": "cli",
+                        "cli": "grok",
+                        "provider": "xai",
+                        "executable_sha256": "UNPINNED",
+                        "timeout_s": 1,
+                        "max_stdout_bytes": 1,
+                    }
+                },
+                "budgets": {"per_run_usd": 1, "per_call_usd": 1},
+            }
+        )
+    )
+    assert pin_executables(policy).missing == ["grok"]
+    report = run_doctor(policy_path=policy, env_file=tmp_path / ".env", home=tmp_path)
+    line = next(c for c in report.checks if c.name == "worker.grok")
+    assert "not found on PATH" in line.message

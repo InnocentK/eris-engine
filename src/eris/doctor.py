@@ -1,0 +1,210 @@
+"""``eris doctor``: filesystem/config-only preflight. Prints key NAMES, never
+values. A missing worker is a WARN (recorded absence), never a substitution.
+``--probe`` additionally runs ``<cli> --version`` through an injectable runner.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+from eris.launch import build_env
+from eris.policy import LoadedPolicy, PolicyError, load_policy, sha256_file
+from eris.redact import parse_dotenv
+from eris.schemas import Transport
+
+Status = Literal["OK", "WARN", "FAIL"]
+Runner = Callable[[list[str], dict[str, str]], str | None]
+
+
+@dataclass(frozen=True)
+class Check:
+    status: Status
+    name: str
+    message: str
+
+
+@dataclass
+class DoctorReport:
+    checks: list[Check] = field(default_factory=list)
+
+    def add(self, status: Status, name: str, message: str) -> None:
+        self.checks.append(Check(status, name, message))
+
+    @property
+    def ok(self) -> bool:
+        return all(c.status != "FAIL" for c in self.checks)
+
+    def render(self) -> str:
+        lines = [f"{c.status:<5}{c.name}: {c.message}" for c in self.checks]
+        worst = (
+            "FAIL"
+            if not self.ok
+            else ("WARN" if any(c.status == "WARN" for c in self.checks) else "OK")
+        )
+        lines.append(f"doctor: {worst} ({len(self.checks)} checks)")
+        return "\n".join(lines)
+
+
+def default_probe_runner(argv: list[str], env: dict[str, str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+
+
+def _flock_probe(runs_dir: Path) -> tuple[Status, str]:
+    try:
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        probe = runs_dir / ".doctor.lock"
+        with open(probe, "ab") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        probe.unlink()
+    except OSError as exc:
+        return "FAIL", f"flock probe failed in {runs_dir}: {exc.__class__.__name__}"
+    return "OK", f"{runs_dir} writable; flock works"
+
+
+def _env_names(env_file: Path) -> tuple[set[str], Status, str]:
+    if not env_file.exists():
+        return set(), "WARN", f"{env_file} not found (only needed for api workers / env_allow)"
+    try:
+        mode = env_file.stat().st_mode & 0o777
+        names = {k for k, v in parse_dotenv(env_file.read_text(encoding="utf-8")).items() if v}
+    except OSError as exc:
+        return set(), "FAIL", f"cannot read {env_file}: {exc.__class__.__name__}"
+    perm = f"; mode {mode:o} is group/world readable - chmod 600" if mode & 0o077 else ""
+    return names, ("WARN" if perm else "OK"), f"{len(names)} non-empty names{perm}"
+
+
+def run_doctor(
+    *,
+    policy_path: Path,
+    env_file: Path,
+    probe: bool = False,
+    runner: Runner = default_probe_runner,
+    home: Path | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> DoctorReport:
+    home = home or Path.home()
+    # Resolved at call time on purpose: a default argument would bind the
+    # original function and bypass the test suite's shutil.which guard.
+    which = which or shutil.which
+    report = DoctorReport()
+    v = sys.version_info
+    report.add(
+        "OK" if v >= (3, 12) else "FAIL",
+        "python",
+        f"{v.major}.{v.minor}.{v.micro} (>= 3.12 required)",
+    )
+    try:
+        loaded: LoadedPolicy = load_policy(policy_path)
+    except PolicyError as exc:
+        report.add("FAIL", "policy", str(exc).splitlines()[0])
+        return report
+    pol = loaded.policy
+    report.add(
+        "OK",
+        "policy",
+        f"{policy_path} sha256 {loaded.sha256[:12]}; pins "
+        + (f"{loaded.pins_sha256[:12]}" if loaded.pins_sha256 else "none")
+        + f"; trusted={pol.trusted}",
+    )
+    names, st, msg = _env_names(env_file)
+    report.add(st, "env-file", msg)
+
+    for wid, w in pol.workers.items():
+        if w.transport is Transport.API:
+            present = w.api_key_env in names
+            report.add(
+                "OK" if present else "WARN",
+                f"worker.{wid}",
+                f"api {w.provider} {w.base_url}; key name {w.api_key_env} "
+                + ("present" if present else "ABSENT in .env (worker unavailable)"),
+            )
+            continue
+        exe = w.executable
+        if exe is None:
+            found = which(w.cli or "")
+            if found is None:
+                report.add("WARN", f"worker.{wid}", f"{w.cli} not found on PATH (recorded absence)")
+            else:
+                report.add(
+                    "WARN",
+                    f"worker.{wid}",
+                    f"{w.cli} at {found} but UNPINNED (run `eris policy pin`)",
+                )
+            continue
+        if not Path(exe).is_file():
+            report.add("WARN", f"worker.{wid}", f"{exe} missing (recorded absence)")
+            continue
+        if not w.pinned:
+            report.add(
+                "WARN", f"worker.{wid}", f"{exe} present but UNPINNED (run `eris policy pin`)"
+            )
+        elif sha256_file(Path(exe)) != w.executable_sha256:
+            report.add(
+                "FAIL",
+                f"worker.{wid}",
+                f"{exe} sha256 differs from pin (binary changed; re-pin deliberately)",
+            )
+        else:
+            report.add("OK", f"worker.{wid}", f"{exe} pinned {w.executable_sha256[:12]}")
+        missing = [n for n in w.env_allow if n not in names]
+        if missing:
+            report.add("WARN", f"worker.{wid}.env", f"env_allow names absent from .env: {missing}")
+        if probe and w.pinned and w.cli:
+            env = build_env(
+                w.cli, path_env=pol.path_env, home=str(home), tmpdir="/tmp", policy_env=w.env
+            )
+            version = runner([exe, "--version"], env)
+            if version is None:
+                report.add("WARN", f"worker.{wid}.probe", "--version failed")
+            else:
+                report.add("OK", f"worker.{wid}.probe", f"--version: {version[:80]}")
+
+    for name, cmd in pol.verify.commands.items():
+        p = Path(cmd.executable)
+        if not p.is_file():
+            report.add("WARN", f"verify.{name}", f"{p} missing (command unavailable)")
+        elif not cmd.pinned:
+            report.add("WARN", f"verify.{name}", f"{p} UNPINNED")
+        else:
+            report.add("OK", f"verify.{name}", f"{p} pinned")
+
+    for raw in pol.credential_files:
+        path = (
+            Path(os.path.expanduser(raw.replace("~", str(home), 1)))
+            if raw.startswith("~")
+            else Path(raw)
+        )
+        report.add(
+            "OK" if path.exists() else "WARN",
+            "credential-file",
+            f"{raw}: {'present' if path.exists() else 'absent'}",
+        )
+
+    git = which("git")
+    report.add("OK" if git else "FAIL", "git", git or "git not found on PATH")
+    st, msg = _flock_probe(Path(pol.runs_dir))
+    report.add(st, "runs-dir", msg)
+    return report

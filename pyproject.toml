@@ -45,6 +45,7 @@ python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 files = ["src"]
+mypy_path = ["src"]
 warn_unreachable = true
 show_error_codes = true
 
