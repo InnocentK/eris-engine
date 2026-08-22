@@ -226,6 +226,8 @@ def cmd_invoke(
             output_file_truncated=result.output_file_truncated,
             output_file_size=result.output_file_size,
             cleanup_error=result.cleanup_error,
+            conversation_id=result.conversation_id,
+            worker_reported_duration_ms=result.worker_reported_duration_ms,
         )
         writer.append("invocation.finished", invocation)
         if result.cleanup_error:

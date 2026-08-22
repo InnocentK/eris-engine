@@ -16,20 +16,22 @@ import pytest
 from eris.launch import (
     FORBIDDEN_ARGV_TOKENS,
     GIT_HARDENING,
+    PARSERS,
+    PER_CLI_ENV,
     LaunchRefused,
     WorkerCall,
+    agy_print_timeout_s,
     assert_argv_safe,
     assert_env_safe,
+    build_argv_agy,
     build_argv_claude,
     build_argv_codex,
-    build_argv_gemini,
     build_argv_grok,
     build_env,
-    first_balanced_json,
     idempotency_key,
+    parse_agy,
     parse_claude,
     parse_codex,
-    parse_gemini,
     parse_grok,
     plan_call,
     preflight_executable,
@@ -109,18 +111,66 @@ def test_codex_argv_exactly_as_specified(tmp_path: Path) -> None:
     ]
 
 
-def test_gemini_and_grok_argv_exactly_as_specified() -> None:
-    assert build_argv_gemini("/x/gemini", PROMPT, model="g") == [
-        "/x/gemini",
+def test_agy_argv_exactly_as_specified() -> None:
+    argv = build_argv_agy(
+        "/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=570, schema_json="{}"
+    )
+    assert argv == [
+        "/x/agy",
         "-p",
         PROMPT,
-        "-m",
-        "g",
-        "--approval-mode",
+        "--model",
+        "gemini-3.1-pro-high",
+        "--mode",
         "plan",
-        "-o",
+        "--sandbox",
+        "--output-format",
         "json",
+        "--disable-slash-commands",
+        "--print-timeout",
+        "570s",
+        "--json-schema",
+        "{}",
     ]
+    bare = build_argv_agy("/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=30)
+    assert bare == argv[:-4] + ["--print-timeout", "30s"] and "--json-schema" not in bare
+    with pytest.raises(LaunchRefused, match="print-timeout"):
+        build_argv_agy("/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=0)
+
+
+def test_agy_argv_never_contains_continue_or_edit_flags() -> None:
+    """`-c` (continue a conversation) is not a substring token (it would hit
+    codex `-c project_doc_max_bytes=0` and git `--cached`), so the agy builder
+    is checked element by element: no `-c`, no `--continue`, no accept-edits,
+    no `--dangerously-skip-permissions`, with and without a schema."""
+    for schema in (None, "{}", '{"type":"object"}'):
+        argv = build_argv_agy(
+            "/x/agy", PROMPT, model="gemini-3.1-pro-high", print_timeout_s=30, schema_json=schema
+        )
+        for element in argv[1:]:
+            assert element != "-c"
+            assert element != "--continue" and element != "--conversation"
+            assert element not in ("--mode=accept-edits", "accept-edits", "--sandbox=off")
+            assert element != "--dangerously-skip-permissions"
+        assert argv[argv.index("--mode") + 1] == "plan"
+        assert argv.count("--mode") == 1 and argv.count("--print-timeout") == 1
+    # and the substring scan does refuse the long forms outside the prompt
+    for bad in ("--continue", "--conversation", "accept-edits", "--add-dir", "--agent"):
+        with pytest.raises(LaunchRefused, match="forbidden token"):
+            build_argv_agy("/x/agy", PROMPT, model=f"gemini-{bad}", print_timeout_s=30)
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "expected"), [(600, 570), (61, 31), (60, 30), (31, 30), (5, 30), (1, 30)]
+)
+def test_agy_print_timeout_derivation(timeout_s: int, expected: int) -> None:
+    """max(30, timeout_s - 30): agy's own timer fires first and still emits an
+    envelope (A7); Eris's timeout + group kill is the backstop."""
+    assert agy_print_timeout_s(timeout_s) == expected
+    assert agy_print_timeout_s(timeout_s) <= max(30, timeout_s)
+
+
+def test_grok_argv_exactly_as_specified() -> None:
     assert build_argv_grok("/x/grok", PROMPT, model="grok-4.6", schema_json="{}") == [
         "/x/grok",
         "-p",
@@ -147,12 +197,18 @@ def test_forbidden_tokens_are_refused_outside_the_prompt(token: str) -> None:
         build_argv_claude(f"/x/{token}/claude", "hi")
     with pytest.raises(LaunchRefused):
         build_argv_grok("/x/grok", "hi", model=f"m-{token}")
+    with pytest.raises(LaunchRefused):
+        build_argv_agy("/x/agy", "hi", model=f"gemini-{token}", print_timeout_s=30)
+    with pytest.raises(LaunchRefused):
+        build_argv_agy("/x/agy", "hi", model="gemini-x", print_timeout_s=30, schema_json=token)
     # The prompt element is exempt: reviewers legitimately quote these flags.
     argv = build_argv_claude("/x/claude", f"Is using {token} here defensible?")
     assert argv[2] == f"Is using {token} here defensible?"
     codex = build_argv_codex("/x/codex", f"Explain {token}", cwd=Path("/"), model="m")
     assert codex[-1] == f"Explain {token}"
     assert build_argv_grok("/x/grok", f"review {token}", model="m")[2] == f"review {token}"
+    agy = build_argv_agy("/x/agy", f"review {token}", model="gemini-x", print_timeout_s=30)
+    assert agy[2] == f"review {token}"
     # spawn honours the same exemption, and only for the declared index
     with pytest.raises(LaunchRefused):
         assert_argv_safe(["/x/claude", "-p", token], exempt=(1,))
@@ -166,8 +222,13 @@ def test_argv_hygiene() -> None:
         assert_argv_safe(["a\x00b"])
     with pytest.raises(LaunchRefused, match="starts with '-'"):
         build_argv_grok("/x/grok", "--help", model="m")
+    with pytest.raises(LaunchRefused, match="starts with '-'"):
+        build_argv_agy("/x/agy", " -c", model="gemini-x", print_timeout_s=30)
     with pytest.raises(LaunchRefused, match="empty prompt"):
         build_argv_codex("/x/codex", "  ", cwd=Path("/"), model="m")
+    # The existing builders are unaffected by the agy token additions.
+    assert "--no-session-persistence" in build_argv_claude("/x/claude", "ok")
+    assert "project_doc_max_bytes=0" in build_argv_codex("/x/codex", "ok", cwd=Path("/"), model="m")
     assert "--permission-mode" in build_argv_claude("/x/claude", "ok")
     assert "bypassPermissions" not in " ".join(build_argv_claude("/x/claude", "ok"))
 
@@ -202,6 +263,12 @@ def test_env_is_built_from_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
         "CLAUDECODE",
         "NODE_OPTIONS",
         "GEMINI_CLI_TRUST_WORKSPACE",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GEMINI_BASE_URL",
+        "AGY_ADC_AUTH",
+        "ANTIGRAVITY_SOMETHING",
     ],
 )
 def test_never_list_names_are_refused(name: str) -> None:
@@ -209,6 +276,25 @@ def test_never_list_names_are_refused(name: str) -> None:
         build_env("codex", path_env="/usr/bin", home="/h", tmpdir="/t", policy_env={name: "x"})
     with pytest.raises(LaunchRefused):
         build_env("codex", path_env="/usr/bin", home="/h", tmpdir="/t", secrets={name: "x"})
+    with pytest.raises(LaunchRefused):
+        build_env("agy", path_env="/usr/bin", home="/h", tmpdir="/t", policy_env={name: "x"})
+
+
+def test_agy_env_disables_auto_update_and_agy_prefix_is_not_banned() -> None:
+    env = build_env("agy", path_env="/usr/bin", home="/h", tmpdir="/t")
+    assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1" and PER_CLI_ENV["agy"] == {
+        "AGY_CLI_DISABLE_AUTO_UPDATE": "1"
+    }
+    assert "DISABLE_AUTOUPDATER" not in env  # claude's knob is not sprayed on agy
+    # the policy may set the same name (default.yaml does); AGY_ is not a banned prefix
+    env = build_env(
+        "agy",
+        path_env="/usr/bin",
+        home="/h",
+        tmpdir="/t",
+        policy_env={"AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
+    )
+    assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1"
 
 
 def test_git_hardening_values_are_the_only_git_vars_allowed() -> None:
@@ -597,37 +683,140 @@ def test_parse_grok_bad_shapes() -> None:
     assert parse_grok(b'{"text":"x","stopReason":"stop"}').error is None
 
 
-def test_parse_gemini_defensive_modes() -> None:
-    whole = json.dumps({"response": "hello", "stats": {"models": {"gemini-2.5-pro": {}}}}).encode()
-    env = parse_gemini(whole)
-    assert (
-        env.parse_mode == "json" and env.text == "hello" and env.model_executed == "gemini-2.5-pro"
-    )
-    noisy = b'Loaded extensions...\n{"response": "embedded {\\"x\\": 1}"}\ntrailing'
-    env = parse_gemini(noisy)
-    assert env.parse_mode == "balanced_extract" and env.text == 'embedded {"x": 1}'
-    env = parse_gemini(b"just prose, no json { unbalanced")
-    assert (
-        env.parse_mode == "none"
-        and env.text == "just prose, no json { unbalanced"
-        and not env.is_error
-    )
-    env = parse_gemini(b"")
-    assert env.is_error and env.error == "gemini: empty stdout"
-    env = parse_gemini(b'{"error": "IneligibleTierError"}')
-    assert env.is_error and env.error == "IneligibleTierError"
-    env = parse_gemini(b'{"unknown": 1}')
-    assert env.is_error and env.error == "gemini: no response text"
-    env = parse_gemini(b'{"text": "[1, 2]"}')
-    assert env.structured == [1, 2]
+def test_parse_grok_schema_fixture_prefers_structured_output() -> None:
+    """E9: with --json-schema the object lives under camelCase `structuredOutput`
+    and `text` holds the JSON string; the object is preferred."""
+    env = parse_grok(fixture("grok", "1.0.5", "schema.json"))
+    assert not env.is_error and env.error is None
+    assert env.structured == {"answer": "ok", "n": 7} and env.text == '{"answer":"ok","n":7}'
+    assert env.model_executed == "grok-4.6" and env.cost_usd == 0.034884
+    # structuredOutput wins over a text that parses differently; absent -> text is parsed
+    env = parse_grok(b'{"text":"{\\"a\\":1}","stopReason":"end_turn","structuredOutput":{"b":2}}')
+    assert env.structured == {"b": 2}
+    env = parse_grok(b'{"text":"{\\"a\\":1}","stopReason":"end_turn"}')
+    assert env.structured == {"a": 1}
 
 
-def test_first_balanced_json() -> None:
-    assert first_balanced_json('x {"a": "}"} y') == '{"a": "}"}'
-    assert first_balanced_json('{"a": "\\"}"}') == '{"a": "\\"}"}'
-    assert first_balanced_json("{ unbalanced {") is None
-    assert first_balanced_json("none") is None
-    assert first_balanced_json('{bad} {"ok": 1}') == "{bad}"
+def test_parse_claude_schema_and_notools_fixtures() -> None:
+    env = parse_claude(fixture("claude", "2.1.239", "schema.json"))
+    assert not env.is_error and env.structured == {"answer": "ok", "n": 7}
+    assert env.text == '{"answer":"ok","n":7}' and env.model_executed is None  # two models
+    env = parse_claude(fixture("claude", "2.1.239", "notools_text.json"))
+    assert env.text == "ok" and not env.is_error and env.cost_usd == 0.041041
+
+
+# --------------------------------------------------------------------------- agy envelopes
+
+
+def test_parse_agy_plain_fixture() -> None:
+    """A1: SUCCESS; no model id and no cost anywhere in the envelope."""
+    env = parse_agy(fixture("agy", "1.1.18", "plain.json"))
+    assert not env.is_error and env.error is None and env.parse_mode == "json"
+    assert env.text == "ok\n" and env.structured is None
+    assert env.model_executed is None and env.models_used == [] and env.cost_usd is None
+    assert env.usage is not None
+    assert (
+        env.usage.input_tokens,
+        env.usage.output_tokens,
+        env.usage.cached_input_tokens,
+        env.usage.reasoning_tokens,
+    ) == (13674, 27, 0, 26)
+    assert env.conversation_id == "ed889929-a04c-457f-91d1-194be848aa04"
+    assert env.worker_reported_duration_ms == 2646  # duration_seconds 2.64583
+    assert isinstance(env.raw, dict) and env.raw["usage"]["total_tokens"] == 13701  # kept in raw
+
+
+def test_parse_agy_schema_fixture_structured_output_is_exact() -> None:
+    """A3: structured_output is EXACTLY the schema object; the toolAction /
+    toolSummary extras live only inside the prose response."""
+    env = parse_agy(fixture("agy", "1.1.18", "schema.json"))
+    assert not env.is_error
+    assert env.structured == {"answer": "ok", "n": 7}
+    assert env.text is not None and "toolAction" in env.text and "/Users/USER/" in env.text
+    assert env.usage is not None and env.usage.cached_input_tokens == 16274
+    assert env.worker_reported_duration_ms == 18263
+
+
+@pytest.mark.parametrize(
+    ("name", "error_fragment", "input_tokens"),
+    [
+        ("shell_denied.json", 'permission check failed for command "pwd"', 45924),
+        ("read_denied.json", "permission check failed for read_file", 6765),
+        ("print_timeout.json", "timeout waiting for response", 0),
+        ("auth_failed.json", "authentication failed or timed out", 0),
+    ],
+)
+def test_parse_agy_error_fixtures_retain_usage(
+    name: str, error_fragment: str, input_tokens: int
+) -> None:
+    """status ERROR -> is_error with the worker's message; usage is still
+    recorded (a denied tool call consumed 45k input tokens in A5)."""
+    env = parse_agy(fixture("agy", "1.1.18", name))
+    assert env.is_error and env.error is not None and env.error.startswith("agy: ")
+    assert error_fragment in env.error
+    assert env.text is None and env.structured is None  # response "" -> None
+    assert env.usage is not None and env.usage.input_tokens == input_tokens
+    assert env.model_executed is None and env.cost_usd is None
+
+
+def test_parse_agy_auth_failed_has_no_conversation() -> None:
+    env = parse_agy(fixture("agy", "1.1.18", "auth_failed.json"))
+    assert env.conversation_id is None  # "" -> None
+    assert env.worker_reported_duration_ms == 0
+    env = parse_agy(fixture("agy", "1.1.18", "print_timeout.json"))
+    assert env.conversation_id == "913ea46c-5260-448e-9354-ed32e0dab003"
+    assert env.worker_reported_duration_ms == 1627
+
+
+def test_parse_agy_bad_shapes() -> None:
+    assert parse_agy(b"not json").is_error and "not JSON" in str(parse_agy(b"not json").error)
+    assert parse_agy(b"[1]").error == "agy: stdout JSON is not an object"
+    assert parse_agy(b"").is_error
+    env = parse_agy(b"{}")
+    assert env.is_error and env.error == "agy: status missing" and env.usage is not None
+    env = parse_agy(b'{"status":"WEIRD","response":"partial"}')
+    assert env.is_error and env.error == "agy: status='WEIRD'" and env.text == "partial"
+    env = parse_agy(b'{"status":"ERROR","error":""}')
+    assert env.error == "agy: status='ERROR'"  # empty error string falls back to the status
+    env = parse_agy(b'{"status":"ERROR","error":{"code":1}}')
+    assert env.error == "agy: status='ERROR'"  # non-string error is not interpolated
+    env = parse_agy(b'{"status":"SUCCESS","response":"{\\"a\\":1}"}')
+    assert env.structured == {"a": 1} and env.text == '{"a":1}'
+    env = parse_agy(b'{"status":"SUCCESS","response":"ok","usage":{"input_tokens":true}}')
+    assert env.usage is not None and env.usage.input_tokens is None  # bool is not a count
+    env = parse_agy(b'{"status":"SUCCESS","response":"ok","duration_seconds":"3"}')
+    assert env.worker_reported_duration_ms is None and env.conversation_id is None
+    env = parse_agy(b'{"status":"SUCCESS","response":"ok","duration_seconds":-1}')
+    assert env.worker_reported_duration_ms is None
+    env = parse_agy(b'{"status":"SUCCESS","response":"","conversation_id":7}')
+    assert env.text is None and env.conversation_id is None and not env.is_error
+
+
+def test_parse_agy_structured_output_any_shape_and_extra_keys() -> None:
+    """Synthetic: the envelope is recorded as-is - extra keys inside
+    structured_output are kept (the schema is not strictly enforced by agy),
+    and a non-object structured_output is still recorded."""
+    raw = json.loads(fixture("agy", "1.1.18", "schema.json"))
+    raw["structured_output"] = {"answer": "ok", "n": 7, "toolAction": "x", "toolSummary": "y"}
+    env = parse_agy(json.dumps(raw).encode())
+    assert env.structured == {"answer": "ok", "n": 7, "toolAction": "x", "toolSummary": "y"}
+    raw["structured_output"] = [1, 2]
+    assert parse_agy(json.dumps(raw).encode()).structured == [1, 2]
+    raw["structured_output"] = None  # explicit null -> fall back to the response text
+    raw["response"] = '{"from":"text"}'
+    assert parse_agy(json.dumps(raw).encode()).structured == {"from": "text"}
+    raw["unexpected_top_level"] = {"kept": True}
+    env = parse_agy(json.dumps(raw).encode())
+    assert env.raw["unexpected_top_level"] == {"kept": True}
+
+
+def test_parse_agy_strips_ansi() -> None:
+    raw = b"\x1b[32m" + fixture("agy", "1.1.18", "plain.json") + b"\x1b[0m"
+    assert parse_agy(raw).text == "ok\n"
+
+
+def test_parsers_table_matches_cli_names() -> None:
+    assert set(PARSERS) == {"claude", "codex", "agy", "grok"}
 
 
 # --------------------------------------------------------------------------- worker calls
@@ -724,14 +913,30 @@ def test_plan_call_per_cli(tmp_path: Path) -> None:
         plan_call(
             make_call(tmp_path, make_policy(tmp_path, "codex", provider="openai", model=None))
         )
-    gemini = make_policy(tmp_path, "gemini", provider="google", model="g")
-    assert "--approval-mode" in plan_call(make_call(tmp_path, gemini)).argv
-    with pytest.raises(LaunchRefused, match="requires a model"):
-        plan_call(
-            make_call(tmp_path, make_policy(tmp_path, "gemini", provider="google", model=None))
-        )
+    agy = make_policy(tmp_path, "agy", provider="google", model="gemini-3.1-pro-high")
+    argv = plan_call(make_call(tmp_path, agy)).argv
+    assert argv[1:3] == ["-p", PROMPT] and "--mode" in argv and "--sandbox" in argv
+    assert "--json-schema" not in argv
+    with_schema = plan_call(make_call(tmp_path, agy, schema={"b": 1, "a": 2})).argv
+    assert with_schema[-2:] == ["--json-schema", '{"a": 2, "b": 1}']  # inline, sorted keys
+    # the policy's lineage guard makes model=None unconstructible; the launcher
+    # still refuses it when reached through an unvalidated copy
+    unvalidated = agy.model_copy(update={"model": None})
+    with pytest.raises(LaunchRefused, match="agy requires a model"):
+        plan_call(make_call(tmp_path, unvalidated))
     with pytest.raises(LaunchRefused, match="requires a model"):
         plan_call(make_call(tmp_path, make_policy(tmp_path, model=None)))
+
+
+def test_plan_call_agy_print_timeout_tracks_policy_timeout(tmp_path: Path) -> None:
+    """--print-timeout = max(30, timeout_s - 30) seconds, rendered as '<N>s'."""
+    for timeout_s, expected in ((600, "570s"), (5, "30s"), (60, "30s"), (100, "70s")):
+        agy = make_policy(
+            tmp_path, "agy", provider="google", model="gemini-3.1-pro-high", timeout_s=timeout_s
+        )
+        argv = plan_call(make_call(tmp_path, agy)).argv
+        assert argv[argv.index("--print-timeout") + 1] == expected
+        assert argv.index("--print-timeout") > argv.index("--disable-slash-commands")
     api = WorkerPolicy(
         transport=Transport.API,
         provider="openai",
@@ -883,6 +1088,89 @@ def test_run_worker_failures(
     unkillable = fake_process(hang=True)
     res = run_worker(make_call(tmp_path, fast), popen=unkillable, killpg=lambda *_: None)
     assert res.status is WorkerStatus.REFUSED and "survived" in str(res.error)
+
+
+def _agy_policy(tmp_path: Path, **kw: Any) -> WorkerPolicy:
+    return make_policy(tmp_path, "agy", provider="google", model="gemini-3.1-pro-high", **kw)
+
+
+def test_run_worker_agy_success_threads_conversation_and_duration(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    t = iter([100.0, 100.5, 100.5, 100.5])
+    factory = fake_process(stdout=fixture("agy", "1.1.18", "plain.json"))
+    res = run_worker(
+        make_call(tmp_path, _agy_policy(tmp_path)),
+        popen=factory,
+        killpg=lambda *_: None,
+        clock=lambda: next(t),
+    )
+    assert res.status is WorkerStatus.OK and res.error is None and res.text == "ok\n"
+    assert res.model_executed is None and res.model_requested == "gemini-3.1-pro-high"
+    assert res.cost_usd is None and res.parse_mode == "json"
+    assert res.conversation_id == "ed889929-a04c-457f-91d1-194be848aa04"
+    # the worker's own figure is recorded separately; duration_ms stays clock-derived
+    assert res.worker_reported_duration_ms == 2646 and res.duration_ms == 500
+    env = factory.instances[0].popen_kwargs["env"]
+    assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1" and env["HOME"] == str(tmp_path / "home")
+    assert "--sandbox" in res.argv and "-c" not in res.argv
+
+
+def test_run_worker_agy_status_error_is_failed_even_with_exit_code_zero(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """A5/A10b shape with rc 0 (synthetic): the envelope's status wins."""
+    for name in ("shell_denied.json", "read_denied.json", "auth_failed.json"):
+        res = run_worker(
+            make_call(tmp_path, _agy_policy(tmp_path)),
+            popen=fake_process(stdout=fixture("agy", "1.1.18", name), returncode=0),
+            killpg=lambda *_: None,
+        )
+        assert res.status is WorkerStatus.FAILED, name
+        assert res.error is not None and res.error.startswith("agy: ")
+        assert res.exit_code == 0 and res.text is None and res.usage is not None
+    # and with the real rc 1 the message is the worker's, not "exit code 1"
+    res = run_worker(
+        make_call(tmp_path, _agy_policy(tmp_path)),
+        popen=fake_process(stdout=fixture("agy", "1.1.18", "shell_denied.json"), returncode=1),
+        killpg=lambda *_: None,
+    )
+    assert res.status is WorkerStatus.FAILED and 'command "pwd"' in str(res.error)
+    assert res.conversation_id == "67cbd893-cd84-463d-8067-3f898454ebec"
+
+
+def test_run_worker_agy_print_timeout_envelope_is_failed_with_zero_usage(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """A7: agy's own --print-timeout fired first: a parseable ERROR envelope,
+    FAILED (not TIMEOUT - Eris's timer did not fire), usage zeros retained."""
+    res = run_worker(
+        make_call(tmp_path, _agy_policy(tmp_path)),
+        popen=fake_process(stdout=fixture("agy", "1.1.18", "print_timeout.json"), returncode=1),
+        killpg=lambda *_: None,
+    )
+    assert res.status is WorkerStatus.FAILED and not res.timed_out
+    assert res.error == "agy: timeout waiting for response"
+    assert res.usage is not None and res.usage.input_tokens == 0 and res.usage.output_tokens == 0
+    assert res.worker_reported_duration_ms == 1627
+
+
+def test_run_worker_agy_eris_timeout_has_no_usage(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """Backstop: agy hangs past Eris's timeout_s -> group kill, TIMEOUT, usage
+    None, no conversation id (nothing parseable was emitted)."""
+    factory = fake_process(hang=True)
+
+    def killpg(_pgid: int, sig: int) -> None:
+        factory.instances[0].send_signal(sig)
+
+    res = run_worker(
+        make_call(tmp_path, _agy_policy(tmp_path, timeout_s=1)), popen=factory, killpg=killpg
+    )
+    assert res.status is WorkerStatus.TIMEOUT and res.timed_out
+    assert res.usage is None and res.conversation_id is None
+    assert res.worker_reported_duration_ms is None and "timed out after 1s" in str(res.error)
 
 
 def test_run_worker_codex_output_file_never_stays_on_disk(

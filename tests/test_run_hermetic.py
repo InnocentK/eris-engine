@@ -381,6 +381,75 @@ def test_invoke_persists_output_file_truncation_on_invocation(
     assert raw["output_file_sha256"] == inv.output_file_sha256
 
 
+def test_invoke_agy_persists_conversation_id_and_worker_duration(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """0.1.2: the persisted Invocation (read back from events.jsonl) carries
+    agy's conversation_id and worker_reported_duration_ms; duration_ms stays
+    Eris's clock figure; the argv on record is the hardened agy argv."""
+    from eris.schemas import Invocation
+
+    w = setup_world(tmp_path)
+    policy = yaml.safe_load(w["policy"].read_text())
+    policy["vendors_allowed"] = ["xai", "google"]
+    policy["workers"]["agy"] = {
+        "transport": "cli",
+        "cli": "agy",
+        "provider": "google",
+        "model": "gemini-3.1-pro-high",
+        "executable": str(w["exe"]),
+        "executable_sha256": hashlib.sha256(w["exe"].read_bytes()).hexdigest(),
+        "timeout_s": 600,
+        "max_stdout_bytes": 100_000,
+        "env": {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
+    }
+    w["policy"].write_text(yaml.safe_dump(policy))
+    args = [a if a != "grok" else "agy" for a in common_args(w)]
+    factory = fake_process(stdout=(FIX / "agy" / "1.1.18" / "plain.json").read_bytes())
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *args, "--runs-dir", str(tmp_path / "runs"), "--run-id", "r"],
+        out=out,
+        home=tmp_path,
+        popen=factory,
+        killpg=lambda *_: None,
+    )
+    assert rc == 0, out.getvalue()
+    assert json.loads(out.getvalue())["model_executed"] is None  # agy emits no model id
+    run_dir = tmp_path / "runs" / "r"
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_bytes().splitlines()]
+    inv = Invocation.model_validate(
+        next(e["payload"] for e in events if e["kind"] == "invocation.finished")
+    )
+    assert inv.conversation_id == "ed889929-a04c-457f-91d1-194be848aa04"
+    assert inv.worker_reported_duration_ms == 2646
+    assert inv.duration_ms is not None and inv.duration_ms >= 0  # Eris's clock, separate field
+    assert inv.status.value == "ok" and inv.model_requested == "gemini-3.1-pro-high"
+    assert inv.argv[1:3] == ["-p", "Review this repository. Reply in JSON.\n"]
+    assert (
+        "--print-timeout" in inv.argv and inv.argv[inv.argv.index("--print-timeout") + 1] == "570s"
+    )
+    assert "-c" not in inv.argv and "AGY_CLI_DISABLE_AUTO_UPDATE" in inv.env_names
+    # a grok invocation records neither field
+    grok = json.loads((FIX / "grok" / "1.0.5" / "plan.json").read_bytes())
+    grok["stopReason"] = "stop"
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(tmp_path / "runs"), "--run-id", "g"],
+        out=out,
+        home=tmp_path,
+        popen=fake_process(stdout=json.dumps(grok).encode()),
+        killpg=lambda *_: None,
+    )
+    assert rc == 0
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / "g" / "events.jsonl").read_bytes().splitlines()
+    ]
+    payload = next(e["payload"] for e in events if e["kind"] == "invocation.finished")
+    assert payload["conversation_id"] is None and payload["worker_reported_duration_ms"] is None
+
+
 def test_invoke_refuses_unparsable_credential_file(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
