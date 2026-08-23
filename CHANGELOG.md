@@ -154,6 +154,27 @@ New modules (Phase 1; each requirement has a named test)
   (`RunWriter(on_event=…)` observer). `launch.spawn` kills the group on
   `KeyboardInterrupt` before re-raising (cleanup, not a handler).
 
+* `eval/score.py` (step K): read-only scorer over `runs/<campaign>/` +
+  `eval/corpus/` (AST guard: no subprocess/socket/httpx/os/`eris.launch`/
+  `eris.verify`; a read-path audit test proves it opens nothing outside the
+  runs dir and the corpus). `key.json` v1 format (strict): `task_id`,
+  `category`, `expected_verdict[]`, `line_tolerance`, `findings[{id, path,
+  line_start, line_end, severity, must_mention[]}]`, `distractors[]`,
+  `scan{fix_hunk_lines, extra_strings}`, `injection_canary?`,
+  `source_repo?`. Per cell: ledger validated (invalid → listed, not
+  scored), re-scan with the current key, contaminated / `scan_incomplete`
+  → excluded from quality metrics but costed, BUDGET_TRIPPED → `missing`,
+  incomplete panel or judge → `incomplete`. **E1 gate**: `revert` /
+  `planted` / `insufficient` require `ArmRun.containment == "container"`
+  (exit 7, no metrics, no CLI override); `control` / `plan` score normally.
+  Metrics: precision/recall (path + line overlap within tolerance +
+  `must_mention`; 0/0 → None), distractor hits (FP), unsupported-claim rate
+  from `adjudication.enforced.downgrades`, confident-wrong (ACCEPT off-key
+  or a high/critical FP), abstention 2×2, cost spent AND attributed by
+  stage (+ unknown-cost count), wall, attempts. Arm 1 findings come from
+  the proposal; arm 2 is scored on the RAW summarizer verdict; paired
+  deltas 3b−3 and 4−3 per (task, repeat) only with identical `propose_keys`.
+
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
   the message from subtype/terminal_reason/errors (T2 capture: the
