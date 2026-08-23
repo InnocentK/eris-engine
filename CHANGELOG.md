@@ -35,6 +35,28 @@ Fixed, each with a test (`docs/INVARIANTS.md` "Advisor re-check"):
 `Claim.revised_at` = the Invocation's `finished_at` is deliberate: it is what
 makes a fresh record and a cache-replayed one byte-identical (tested).
 
+Final re-check (Codex at `47c9254`; conditions 2, 9, 13, 15 lifted). Fixed:
+* (cond 4) directory modes are preserved on the copy (root included), and a
+  read-only directory still gets removed;
+* (cond 5a) every command passes its own run ids to the sweep - `run`,
+  `campaign` (all planned cells) and `invoke`;
+* (cond 5b + consequence 1) the scratch path is validated BEFORE the writer
+  opens: a refusal creates no ledger, deletes nothing, names the path, and
+  leaves the run id reusable;
+* (cond 7) `stage.interrupted` closes exactly its own attempt, so a later
+  crashed attempt with the same key still yields an abandoned record;
+* (cond 10) `RunWriter.seal()` makes it structurally impossible to append
+  behind the final scan; post-scan failures go to stderr + the exit code;
+* (cond 12) planned calls come from the arm's steps, counting every judge
+  iteration;
+* (consequence 2) `Policy.scratch_retention_s` (7 days) is a hard sweep
+  bound, so unprovable liveness cannot let scratch accumulate.
+
+Documented, not changed (Codex's third note): a corrupt cell ledger reserves
+the worst case and can halt later cells on the campaign budget - intended
+fail-closed behaviour, operator-resolvable (`docs/SECURITY.md`,
+`docs/EVAL-PLAN.md`).
+
 ## 0.3.1 - schema 0.1.4 + advisor-round fixes (2026-08-23)
 
 Schema `SCHEMA_VERSION` 0.1.3 → **0.1.4** (new golden dir

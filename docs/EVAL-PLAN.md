@@ -24,6 +24,12 @@ experiments showed, and what must still run before any scored corpus run.
   **Caveat (testing critic, recorded):** `plan` keys are as readable to a
   worker as the others; `plan` and `control` are scored without
   containment by user decision, and their results carry the same E1 risk.
+* A campaign cell whose ledger is unreadable is reserved pessimistically
+  (every planned call of that arm, judge iterations included, at the worst
+  case the retry driver can reach), so a corruption can halt later cells on
+  the campaign budget. Intended fail-closed behaviour, resolvable by the
+  operator: inspect or remove the corrupt cell, or raise `per_campaign_usd`,
+  then `--resume`.
 * Until the E1 containment exists only `control`/`plan` and plumbing runs
   are scorable; a BUDGET_TRIPPED cell is MISSING; contaminated or
   `scan_incomplete` cells are excluded from quality metrics and counted in

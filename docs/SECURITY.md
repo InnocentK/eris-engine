@@ -325,8 +325,10 @@ the original and never in a sanitized copy. That profile strips NOTHING
 and differs from a raw `cp -a` in exactly two documented ways: `.git/hooks`
 is not copied (our allowlist runs `git`, so a repository hook would fire on
 the first invocation), and a symlink that is absolute, dangling or resolves
-outside the tree is dropped and recorded. File set, bytes, modes, kept
-symlink targets and `.git` itself are identical. `evidence.SnapshotGuard` compares
+outside the tree is dropped and recorded. File set, bytes, FILE AND
+DIRECTORY modes (the copy root included), kept symlink targets and `.git`
+itself are identical; a preserved read-only directory cannot wedge cleanup
+(owner write is restored on retry). `evidence.SnapshotGuard` compares
 the copy's tree hash after every command: a change is recorded
 (`snapshot.violated`, `EvidenceItem.violated`, the item's summary) and
 verification stops for the run; the original's tree hash is recorded in
@@ -347,11 +349,36 @@ copies, the pristine verification copy and the verify HOME live under the
 policy `scratch_dir` (default `cache/scratch/<run_id>/`, refused under
 `runs/`), are removed in `finally` on success, refusal and crash, and
 orphans are swept at startup. The sweep is conservative: an entry is removed
-only when it is provably not in use - not the current run's, not one whose
-run directory is unfinished while its writer lock is held (a platform where
-liveness cannot be disproved counts as HELD), and not one modified within
-the last hour - and both what was removed and what was kept, with reasons,
-are logged. A planted entry at a live run's path is refused, never deleted.
+only when it is provably not in use - not the current run's (every command
+passes its own run ids: `run`, `campaign` for every planned cell, `invoke`),
+not one whose run directory is unfinished while its writer lock is held (a
+platform where liveness cannot be disproved counts as HELD), and not one
+modified within the last hour - and both what was removed and what was kept,
+with reasons, are logged. Because "unprovable" would otherwise mean "kept
+forever", `Policy.scratch_retention_s` (7 days) is a HARD bound: past it an
+entry is swept whatever the lock says, logged as `forced_over_retention`.
+
+The scratch path is validated BEFORE the run's writer opens. A pre-existing
+or planted entry is refused with its path named: no run directory, no
+ledger, and NOTHING is deleted - the entry is left exactly as found for the
+operator to inspect, and the run id is reusable once it is cleared. A run
+only ever removes a scratch root it created itself.
+
+### The ledger's last word is the scan (item 10)
+After the final scan the ledger is SEALED: `RunWriter.seal()` makes any
+further `append` raise, while `finalize` may still write the manifest. A
+failure in the post-scan path (a manifest write, a late cleanup) is therefore
+reported on stderr and in the exit code, never as an event - nothing can
+appear behind `scan.result`, and nothing is silently dropped.
+
+### Fail-closed budgeting after a corruption (operator-resolvable)
+A cell whose ledger cannot be read is reserved pessimistically: every planned
+call of that arm (each judge iteration included) at the worst case the retry
+driver can reach (4x `per_call_usd`). One corrupted cell can therefore
+exhaust `per_campaign_usd` and make later cells trip the budget pre-check.
+That is deliberate - Eris refuses to spend money it cannot account for - and
+it is resolvable by the operator: inspect or remove the corrupt cell
+directory, or raise `per_campaign_usd`, then `--resume` the campaign.
 
 ### Records downstream are the redacted ones (item 1)
 Every record a later stage consumes is re-parsed from the redacted payload
