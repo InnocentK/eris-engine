@@ -438,6 +438,7 @@ class SpawnResult:
     timed_out: bool
     duration_ms: int
     killed_with: int | None = None
+    pgid: int | None = None  # == leader pid (start_new_session); resume kills a survivor
 
 
 class _Drain(threading.Thread):
@@ -557,6 +558,7 @@ def spawn(
         timed_out=timed_out,
         duration_ms=int((clock() - t0) * 1000),
         killed_with=killed_with,
+        pgid=int(proc.pid) if isinstance(proc.pid, int) and proc.pid > 0 else None,
     )
 
 
@@ -1111,6 +1113,7 @@ class WorkerResult:
     # (grok `stopReason: cancelled`, a claude non-success subtype). The message
     # lives here, never in `error`, which is reserved for non-OK statuses.
     warning: str | None = None
+    pgid: int | None = None  # process group of the spawned leader (None when nothing spawned)
 
 
 def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -> WorkerResult:
@@ -1139,6 +1142,16 @@ def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -
         timed_out=False,
         parse_mode="none",
     )
+
+
+def budget_tripped_result(call: WorkerCall, reason: str) -> WorkerResult:
+    """F4: the Eris budget pre-check refused to spawn. A recorded absence with
+    status BUDGET_TRIPPED; nothing ran, nothing was spent."""
+    try:
+        key = plan_call(call).idempotency_key
+    except LaunchRefused:
+        key = idempotency_key(call)
+    return _absent(call, WorkerStatus.BUDGET_TRIPPED, reason, key)
 
 
 def make_private_dir(path: Path) -> None:
@@ -1350,6 +1363,7 @@ def _execute(
         conversation_id=envelope.conversation_id,
         worker_reported_duration_ms=envelope.worker_reported_duration_ms,
         warning=warning,
+        pgid=spawned.pgid,
     )
 
 

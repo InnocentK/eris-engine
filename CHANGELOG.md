@@ -18,6 +18,20 @@ Schema `SCHEMA_VERSION` 0.1.2 → **0.1.3** (new golden dir
   `default.yaml`: agy and grok get `sanitize_snapshot: true`.
 * Coverage floor 80 → 90.
 
+New modules (Phase 1; each requirement has a named test)
+* `eris.retry`: pure classification (`classify`, pattern table as data,
+  tested against the captured fixtures: T2 budget, E2 401, A7/A5/A8 agy,
+  E17 grok, grok `cancelled`), backoff schedule (timeout 30 s × attempt,
+  transient 10·2^(n-1), malformed 0), retry weight budget (3; timeout
+  weight 2; malformed_output cap 2), judge TIMEOUT terminal; `BudgetLedger`
+  (known vs reserved spend, per-run and per-campaign pre-check, timeouts
+  reserve 2× `per_call_usd`); `run_with_retry` driver: every attempt =
+  `Invocation` + `CostRecord` + `RetryAttempt`, `retry.scheduled` before the
+  injected sleep, STOP between attempts, money pre-check before every spawn
+  (F4: `BUDGET_TRIPPED` is produced; the claude cap-trip envelope is recorded
+  with status `BUDGET_TRIPPED` and its real cost), writer errors propagate.
+  `WorkerResult.pgid` / `SpawnResult.pgid` record the process group.
+
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
   the message from subtype/terminal_reason/errors (T2 capture: the
