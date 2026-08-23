@@ -449,6 +449,16 @@ def run_with_retry(
         )
         if delay > 0:
             sleep(delay)
+        if stop_check():  # STOP appeared during the backoff: the retry never spawns
+            writer.append(
+                "retry.cancelled",
+                {
+                    "idempotency_key": result.idempotency_key,
+                    "attempt": attempt + 1,
+                    "reason": "STOP requested after backoff, before the retry spawn",
+                },
+            )
+            return RetryOutcome(attempts, stopped=True)
 
 
 def _record_attempt(

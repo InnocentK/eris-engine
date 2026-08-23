@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -497,10 +498,15 @@ def test_resume_replays_finished_stages_and_abandons_the_open_attempt(tmp_path: 
     assert len(prior.verification) >= 1 and prior.adjudications == {}
     assert [a["stage"] for a in prior.abandoned] == ["adjudicate"] and prior.stale_pgids == [4242]
     killed_with: list[tuple[int, int]] = []
+    live = {"alive": True}
+
+    def fake_killpg(pg: int, sig: int) -> None:
+        killed_with.append((pg, sig))
+        if sig == signal.SIGTERM:
+            live["alive"] = False
+
     killed = kill_stale_groups(
-        prior.stale_pgids,
-        killpg=lambda pg, sig: killed_with.append((pg, sig)),
-        alive=lambda _p: True,
+        prior.stale_pgids, killpg=fake_killpg, alive=lambda _p: live["alive"], grace_s=0.5
     )
     assert killed == [4242] and [k[0] for k in killed_with] == [4242, 4242]
     assert remove_stale_scratch(scratch_root) == ["call-deadbeef"]
@@ -584,3 +590,64 @@ def test_arm_stopped_is_an_exception_with_a_reason() -> None:
     assert Verdict.ABSTAIN.value == "ABSTAIN"  # the vocabulary the scorer reads
     assert TaskSpec.model_validate(task().model_dump()) == task()
     assert json.loads(json.dumps({"x": 1})) == {"x": 1}
+
+
+def test_resume_is_idempotent_and_restores_the_request_dedupe_set(tmp_path: Path) -> None:
+    """Items 7 + 8: a second resume does not re-append invocation.abandoned
+    (deduped by key + attempt); an already-executed request is a
+    verify.duplicate on resume, never re-executed."""
+    fleet = Fleet(tmp_path, answers(), cache=False)
+    fleet.spy = CrashingSpy(answers(), crash_on="adjudicate")
+    s = spec(Arm.INDEP_VERIFY)
+    ctx, env = fleet.open(s)
+    with pytest.raises(RuntimeError):
+        run_arm(s, ctx, env)
+    ctx.writer.close()
+    git_calls_before = sum(1 for p in fleet.popens for a, _ in p.calls if "ls-files" in a)
+    assert git_calls_before >= 1  # V1 executed the proposals' `git ls-files` request
+    # first resume: one abandoned record
+    ctx2, env2 = fleet.open(s, resume=True)
+    prior = load_prior(LedgerView.from_path(ctx2.writer.events_path), ctx2.writer, per_call_usd=0.5)
+    assert len(prior.abandoned) == 1 and prior.requests_executed
+    ctx2.writer.close()
+    # second resume (e.g. after another interruption before any progress): still one
+    ctx3, env3 = fleet.open(s, resume=True)
+    prior3 = load_prior(
+        LedgerView.from_path(ctx3.writer.events_path), ctx3.writer, per_call_usd=0.5
+    )
+    view = LedgerView.from_path(ctx3.writer.events_path)
+    assert view.kinds().count("invocation.abandoned") == 1 and len(prior3.abandoned) == 1
+    assert len([c for c in view.payloads("cost") if c["cost_known"] is False]) == 1
+    # the dedupe set: the proposals' request is a duplicate now, not a new spawn
+    ctx3.runner = fleet.spy = Spy(answers())
+    draft = run_arm(s, ctx3, env3, prior=prior3)
+    assert draft.status is ArmStatus.COMPLETE
+    after = LedgerView.from_path(ctx3.writer.events_path)
+    assert "verify.duplicate" in after.kinds()[len(view.events) :]
+    ls_files_spawns = sum(1 for a, _ in fleet.popens[-1].calls if "ls-files" in a)
+    assert ls_files_spawns == 0
+    ctx3.writer.close()
+
+
+def test_kill_stale_groups_waits_and_refuses_a_survivor() -> None:
+    """Item 7: a live pgid is killed through the launcher's path (SIGTERM,
+    wait, SIGKILL sweep) and the resume proceeds only once it is gone; a
+    survivor refuses the resume."""
+    signals: list[int] = []
+    state = {"alive": True, "polls": 0}
+
+    def alive(_pgid: int) -> bool:
+        state["polls"] += 1
+        return state["alive"]
+
+    def killpg(_pgid: int, sig: int) -> None:
+        signals.append(sig)
+        if sig == signal.SIGTERM:
+            state["alive"] = False  # dies on TERM, after a wait
+
+    killed = kill_stale_groups([4242], killpg=killpg, alive=alive, grace_s=0.5)
+    assert killed == [4242] and signals == [signal.SIGTERM, signal.SIGKILL]
+    assert state["polls"] >= 2  # it waited (polled) before the sweep and before proceeding
+    state["alive"] = True
+    with pytest.raises(ResumeRefused, match="survived"):
+        kill_stale_groups([4242], killpg=lambda *_: signals.append(0), alive=alive, grace_s=0.05)

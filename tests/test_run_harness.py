@@ -41,6 +41,13 @@ ADJ = {
 }
 
 
+def dead_killpg(_pgid: int, sig: int) -> None:
+    """A fake killpg over groups that are already gone: the signal-0 probe
+    raises ProcessLookupError (as os.killpg does), other signals are no-ops."""
+    if sig == 0:
+        raise ProcessLookupError
+
+
 def grok_envelope(structured: Any) -> bytes:
     return json.dumps(
         {
@@ -451,6 +458,12 @@ def test_sigint_kills_records_and_resume_completes(tmp_path: Path) -> None:
         c for c in view.payloads("cost") if c["invocation_id"] == interrupted[0]["invocation_id"]
     ][0]
     assert cost["cost_known"] is False and cost["estimated"] is True
+    attempts = [
+        a
+        for a in view.payloads("retry.attempt")
+        if a["invocation_id"] == interrupted[0]["invocation_id"]
+    ]
+    assert attempts and attempts[0]["decision"] == "stop" and "interrupted" in attempts[0]["reason"]
     assert any(k == "invocation.spawned" for k in kinds)
     assert any(line for line in err.getvalue().splitlines() if '"run.interrupted"' in line)
     # resume: proposals replayed, judge re-run, cell completes
@@ -462,7 +475,7 @@ def test_sigint_kills_records_and_resume_completes(tmp_path: Path) -> None:
         err=io.StringIO(),
         home=home,
         popen=popen2,
-        killpg=lambda *_: None,
+        killpg=dead_killpg,
     )
     assert rc == EXIT_OK, out.getvalue()
     assert [Path(a[0]).name for a, _ in popen2.calls if Path(a[0]).name in ("grok", "claude")] == [
@@ -593,7 +606,7 @@ def test_campaign_resume_skips_finalized_cells_and_resumes_unfinished(tmp_path: 
         err=io.StringIO(),
         home=home,
         popen=popen2,
-        killpg=lambda *_: None,
+        killpg=dead_killpg,
     )
     assert rc == EXIT_OK, out.getvalue()
     cview = events_of(w["runs"] / "c1")
@@ -736,3 +749,79 @@ def test_verification_violation_is_recorded_and_stops_verification(tmp_path: Pat
     assert refused and refused[0]["argv"] == ["git", "ls-files"]
     assert tree_sha256(w["snapshot"]) == before
     assert not (w["snapshot"] / "WRITTEN_BY_pytest").exists()
+
+
+def test_killpg_absence_is_a_documented_refusal_at_call_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 14: os.killpg is looked up when the command runs, not at import;
+    without it every spawning/resuming command is refused (exit 2) with the
+    documented message, while a dry-run still works."""
+    w = world(tmp_path)
+    monkeypatch.delattr(os, "killpg")
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "indep_verify", run_id="nokill"),
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+    )
+    assert rc == EXIT_CONFIG and "os.killpg is unavailable" in json.loads(out.getvalue())["error"]
+    assert not (w["runs"] / "nokill").exists()
+    out = io.StringIO()
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+            "--dry-run",
+        ],
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+    )
+    assert rc == EXIT_OK  # dry-run spawns nothing
+
+
+def test_writer_errors_on_the_error_path_are_never_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 15: a writer failure while recording a refusal propagates (the
+    ledger contract); it is never hidden behind the original error."""
+    import eval.run as run_mod
+
+    from eris.writer import RunWriter as RealWriter
+    from eris.writer import WriterError
+
+    class BrokenWriter(RealWriter):
+        def append(self, kind: str, payload: Any) -> Any:
+            if kind == "run.error":
+                raise WriterError("disk full while recording the error")
+            return super().append(kind, payload)
+
+    monkeypatch.setattr(run_mod, "RunWriter", BrokenWriter)
+    w = world(tmp_path)
+    import shutil
+
+    def broken_rmtree(path: Any, *a: Any, **k: Any) -> None:
+        raise OSError("EBUSY")  # a cleanup failure is recorded as run.error
+
+    monkeypatch.setattr(shutil, "rmtree", broken_rmtree)
+    with pytest.raises(WriterError, match="disk full"):
+        main(
+            run_args(w, "indep_verify", run_id="loud", no_cache=""),
+            out=io.StringIO(),
+            err=io.StringIO(),
+            home=tmp_path / "home",
+            popen=Popen(outputs()),
+            killpg=lambda *_: None,
+        )

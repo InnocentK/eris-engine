@@ -355,7 +355,7 @@ def test_driver_retries_a_timeout_once_then_succeeds(tmp_path: Path) -> None:
     )
     assert out.ok and not out.stopped and len(out.attempts) == 2 and len(runner.calls) == 2
     assert runner.calls[0] == runner.calls[1] == call  # identical call, fresh process
-    assert slept == [30.0] and stops == [1]
+    assert slept == [30.0] and stops == [1, 1]  # between attempts AND after the backoff
     a1, a2 = out.attempts
     assert a1.invocation.invocation_id.endswith("-a1") and a2.invocation.invocation_id.endswith(
         "-a2"
@@ -580,3 +580,29 @@ def test_stop_requested_checks_every_path(tmp_path: Path) -> None:
     assert not stop_requested(tmp_path / "STOP", tmp_path / "c" / "STOP")
     (tmp_path / "STOP").write_text("")
     assert stop_requested(tmp_path / "c" / "STOP", tmp_path / "STOP")
+
+
+def test_stop_during_the_backoff_sleep_cancels_the_retry_spawn(tmp_path: Path) -> None:
+    """Item 6: STOP appears while the driver sleeps; the retry never spawns
+    (retry.cancelled), the outcome is stopped."""
+    w = _writer(tmp_path)
+    runner, call = _runner(tmp_path, [None, grok_ok()])
+    flag = {"stop": False}
+
+    def sleep(_s: float) -> None:
+        flag["stop"] = True  # the file appears during the backoff
+
+    out = run_with_retry(
+        call,
+        writer=w,
+        budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=10.0),
+        stop_check=lambda: flag["stop"],
+        sleep=sleep,
+        runner=runner,
+    )
+    assert len(runner.calls) == 1 and out.stopped and len(out.attempts) == 1
+    assert out.attempts[0].retry.decision is RetryDecision.RETRY  # it WAS scheduled
+    kinds = [e["kind"] for e in _events(w)]
+    assert kinds[-2:] == ["retry.scheduled", "retry.cancelled"]
+    assert "STOP" in _events(w)[-1]["payload"]["reason"]
+    w.close()

@@ -82,8 +82,11 @@ from eris.schemas import (
     Arm,
     ArmStatus,
     CostRecord,
+    ErrorClass,
     Event,
     Invocation,
+    RetryAttempt,
+    RetryDecision,
     Stage,
     Transport,
     WorkerStatus,
@@ -832,23 +835,26 @@ def run_cell(
         outcome.exit_code, outcome.status = EXIT_SIGINT, "interrupted"
         return outcome
     except (LaunchRefused, ResumeRefused, LedgerCorrupt, PolicyError) as exc:
-        _safe_append(writer, "run.error", {"kind": type(exc).__name__, "error": str(exc)})
+        writer.append("run.error", {"kind": type(exc).__name__, "error": str(exc)})
         outcome.exit_code, outcome.status, outcome.error = EXIT_CONFIG, "refused", str(exc)
         return outcome
     except (SanitizeCleanupError, OSError, WriterError) as exc:
-        _safe_append(writer, "run.error", {"kind": type(exc).__name__, "error": str(exc)})
+        writer.append("run.error", {"kind": type(exc).__name__, "error": str(exc)})
         outcome.exit_code, outcome.status, outcome.error = EXIT_RUN_ERROR, "run_error", str(exc)
         return outcome
     finally:
-        if scratch.exists() or scratch.is_symlink():
-            try:
-                shutil.rmtree(scratch)
-            except OSError as exc:
-                _safe_append(
-                    writer, "run.error", {"kind": "scratch_cleanup_failed", "error": str(exc)}
-                )
-                outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
-        writer.close()
+        try:
+            if scratch.exists() or scratch.is_symlink():
+                try:
+                    shutil.rmtree(scratch)
+                except OSError as exc:
+                    # recorded loudly: a writer failure here propagates (ledger contract)
+                    writer.append(
+                        "run.error", {"kind": "scratch_cleanup_failed", "error": str(exc)}
+                    )
+                    outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
+        finally:
+            writer.close()  # always: no fd outlives the cell, whatever propagated
 
 
 @contextmanager
@@ -860,13 +866,6 @@ def _scratch_root(scratch: Path) -> Iterator[Path]:
         yield scratch
     finally:
         shutil.rmtree(scratch, ignore_errors=False)
-
-
-def _safe_append(writer: RunWriter, kind: str, payload: dict[str, Any]) -> None:
-    try:
-        writer.append(kind, payload)
-    except WriterError:
-        pass  # the original error is what the caller reports
 
 
 def _spent_from_view(view: LedgerView) -> tuple[float, float]:
@@ -956,6 +955,20 @@ def _record_interrupt(h: Harness, writer: RunWriter, ctx: StageContext) -> None:
                 counted=True,
                 estimated=True,
                 cost_known=False,
+            ),
+        )
+        writer.append(
+            "retry.attempt",
+            RetryAttempt(
+                invocation_id=inv.invocation_id,
+                attempt=attempt,
+                status=WorkerStatus.FAILED,
+                error_class=ErrorClass.UNKNOWN,
+                reason="interrupted (SIGINT): the group was killed; no retry",
+                weight=1,
+                budget_used_after=0,
+                backoff_s=0.0,
+                decision=RetryDecision.STOP,
             ),
         )
     writer.append(
@@ -1322,12 +1335,38 @@ def main(
     err: IO[str] | None = None,
     home: Path | None = None,
     popen: PopenFactory = subprocess.Popen,
-    killpg: KillPg = os.killpg,
+    killpg: KillPg | None = None,
 ) -> int:
     out = out or sys.stdout
     err = err or sys.stderr
     home = home or Path.home()
     args = build_parser().parse_args(argv)
+    if killpg is None:
+        # resolved at CALL time, never as an import-time default: on a platform
+        # without os.killpg (Windows) every command that may spawn or resume a
+        # worker is refused with a documented message (M2c adds the fallback)
+        resolved = getattr(os, "killpg", None)
+        if (
+            resolved is None
+            and args.command in ("invoke", "run", "campaign")
+            and not (
+                getattr(args, "campaign_command", None) == "status"
+                or getattr(args, "dry_run", False)
+            )
+        ):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "os.killpg is unavailable on this platform: Eris cannot kill "
+                        "a worker process group on timeout or resume; refusing to spawn "
+                        "(documented refusal; M2c adds a portable fallback)",
+                    }
+                ),
+                file=out,
+            )
+            return EXIT_CONFIG
+        killpg = resolved if resolved is not None else _no_killpg
     try:
         if args.command == "preflight":
             return cmd_preflight(args, out, home)
@@ -1345,6 +1384,10 @@ def main(
     except (PolicyError, LaunchRefused, CredentialFileError, OSError, ValueError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}), file=out)
         return EXIT_CONFIG
+
+
+def _no_killpg(pgid: int, sig: int) -> None:  # pragma: no cover - never reached (refused above)
+    raise OSError("os.killpg is unavailable on this platform")
 
 
 if __name__ == "__main__":

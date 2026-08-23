@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
+import subprocess
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from eris.evidence import (
     EvidenceStopped,
@@ -45,8 +46,9 @@ from eris.evidence import (
     build_evidence_pack,
     execute_evidence_requests,
     rebuild_pack,
+    request_key,
 )
-from eris.launch import KillPg
+from eris.launch import KillPg, LaunchRefused, _kill_group
 from eris.ledger import LedgerView, cost_totals
 from eris.schemas import (
     Adjudication,
@@ -151,6 +153,7 @@ class Prior:
     )
     abandoned: list[dict[str, Any]] = field(default_factory=list)
     stale_pgids: list[int] = field(default_factory=list)
+    requests_executed: dict[str, str] = field(default_factory=dict)  # request_key -> evidence_id
 
 
 def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> Prior:
@@ -178,6 +181,10 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
     for inv in view.payloads("invocation.finished"):
         k = str(inv.get("idempotency_key"))
         attempts[k] = max(attempts.get(k, 0), int(inv.get("attempt", 0)))
+    already = {
+        (str(a.get("idempotency_key")), int(a.get("attempt", 0)))
+        for a in view.payloads("invocation.abandoned")
+    }
     for (stage, worker_id, idem), started in open_stages.items():
         pgid = spawned.get(idem)
         attempt = attempts.get(idem, 0) + 1
@@ -189,6 +196,11 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
             "pgid": pgid,
             "role": started.get("role"),
         }
+        if pgid is not None:
+            prior.stale_pgids.append(pgid)
+        if (idem, attempt) in already:
+            prior.abandoned.append(payload)  # a repeated resume: recorded once, never twice
+            continue
         writer.append("invocation.abandoned", payload)
         writer.append(
             "cost",
@@ -203,8 +215,6 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
             ),
         )
         prior.abandoned.append(payload)
-        if pgid is not None:
-            prior.stale_pgids.append(pgid)
     # the pack
     packs = view.records("pack.built", EvidencePack)
     items = view.records("evidence.item", EvidenceItem)
@@ -234,6 +244,8 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
     for r in items:
         if r.phase is Phase.VERIFICATION and intact(r.content_sha256):
             prior.verification.append((r, (writer.blobs_dir / r.content_sha256).read_bytes()))
+            if r.argv:
+                prior.requests_executed[request_key(r.argv)] = r.evidence_id
     raws = {a.adjudication_id: a for a in view.records("adjudication.raw", Adjudication)}
     for enforced in view.records("adjudication.enforced", Adjudication):
         raw = raws.get(enforced.adjudication_id)
@@ -248,15 +260,47 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
     return prior
 
 
+class _GroupHandle:
+    """A PopenLike over a bare pgid so the existing ``_kill_group`` path
+    (SIGTERM, WAIT, SIGKILL sweep) can be reused on resume."""
+
+    def __init__(self, pgid: int, alive: Callable[[int], bool], clock: Callable[[], float]) -> None:
+        self.pid = pgid
+        self._alive = alive
+        self._clock = clock
+        self.returncode: int | None = None
+        self.stdout: IO[bytes] | None = None
+        self.stderr: IO[bytes] | None = None
+
+    def poll(self) -> int | None:
+        if self._alive(self.pid):
+            return None
+        self.returncode = 0
+        return 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = self._clock() + (timeout if timeout is not None else 0.0)
+        while self._alive(self.pid):
+            if timeout is None or self._clock() >= deadline:
+                raise subprocess.TimeoutExpired(f"pgid {self.pid}", timeout or 0.0)
+            time.sleep(0.01)
+        self.returncode = 0
+        return 0
+
+
 def kill_stale_groups(
     pgids: Sequence[int],
     *,
     killpg: KillPg | None = None,
     alive: Callable[[int], bool] | None = None,
+    grace_s: float = 2.0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> list[int]:
-    """Kill every recorded process group that is still alive (SIGTERM then
-    SIGKILL). Where ``os.killpg`` does not exist (Windows) resume is REFUSED
-    with a documented message - M2c adds the portable fallback."""
+    """Kill every recorded process group that is still alive through the
+    launcher's ``_kill_group`` (SIGTERM, wait up to ``grace_s``, SIGKILL
+    sweep, wait again). A group that survives refuses the resume. Where
+    ``os.killpg`` does not exist (Windows) resume is REFUSED with a
+    documented message - M2c adds the portable fallback."""
     if not pgids:
         return []
     if killpg is None:
@@ -283,11 +327,18 @@ def kill_stale_groups(
     for pgid in sorted(set(pgids)):
         if not alive(pgid):
             continue
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                killpg(pgid, int(sig))
-            except ProcessLookupError:
-                break
+        handle = _GroupHandle(pgid, alive, clock)
+        try:
+            _kill_group(handle, killpg, grace_s)
+        except LaunchRefused as exc:
+            raise ResumeRefused(
+                f"process group {pgid} from the interrupted run survived SIGKILL ({exc}); "
+                "refusing to resume while it may still write"
+            ) from exc
+        if alive(pgid):
+            raise ResumeRefused(
+                f"process group {pgid} from the interrupted run is still alive; refusing to resume"
+            )
         killed.append(pgid)
     return killed
 
@@ -370,7 +421,7 @@ def run_arm(
     )
     pack: PackBuild | None = prior.pack
     verification: list[tuple[EvidenceItem, bytes]] = list(prior.verification)
-    requests = RequestState(count=len(verification))
+    requests = RequestState(executed=dict(prior.requests_executed), count=len(verification))
     for step in steps:
         if draft.stopped is not None:
             w.append("stage.skipped", {"step": step, "reason": draft.stopped})
