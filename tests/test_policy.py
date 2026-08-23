@@ -487,3 +487,15 @@ def test_scratch_dir_defaults_under_cache_and_never_under_runs(tmp_path: Path) -
             load_policy(write(tmp_path, minimal_policy(runs_dir="runs", scratch_dir=bad)))
     ok = load_policy(write(tmp_path, minimal_policy(runs_dir="runs", scratch_dir="tmp/s"))).policy
     assert ok.scratch_dir == "tmp/s"
+
+
+def test_scratch_retention_is_a_strict_bounded_int(tmp_path: Path) -> None:
+    """New consequence 2: the hard retention bound is policy-configurable and
+    strictly validated (an hour to a year)."""
+    pol = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml")).policy
+    assert pol.scratch_retention_s == 604_800  # 7 days
+    ok = load_policy(write(tmp_path, minimal_policy(scratch_retention_s=7200))).policy
+    assert ok.scratch_retention_s == 7200
+    for bad in (60, "604800", 1.5, 40_000_000):
+        with pytest.raises(PolicyError):
+            load_policy(write(tmp_path, minimal_policy(scratch_retention_s=bad)))

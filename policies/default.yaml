@@ -14,6 +14,7 @@ trusted: false
 runs_dir: runs
 cache_dir: cache                # worker-call cache (redacted bytes only); never under runs/
 scratch_dir: cache/scratch      # every ephemeral file (per run id); never under runs/; swept at startup
+scratch_retention_s: 604800     # hard bound: scratch older than this is swept even if liveness is unprovable
 path_env: /usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
 vendors_allowed: [anthropic, openai, xai, google]
 api_hosts_allowed: [api.openai.com, api.x.ai, localhost, 127.0.0.1]

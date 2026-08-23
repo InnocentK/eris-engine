@@ -216,6 +216,10 @@ class Policy(_Strict):
     # verification copy, verify HOME) lives under scratch_dir/<run_id>/ - never
     # under runs/, where RunWriter is the only writer. Swept at startup.
     scratch_dir: str = "cache/scratch"
+    # Hard retention bound for scratch: an entry older than this is swept even
+    # when its liveness cannot be disproved, so scratch cannot grow without
+    # bound on a platform where the lock probe is unavailable (7 days).
+    scratch_retention_s: int = Field(default=604_800, strict=True, ge=3600, le=31_536_000)
     path_env: str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
     vendors_allowed: list[str] = Field(min_length=1)
     api_hosts_allowed: list[str] = Field(default_factory=list)

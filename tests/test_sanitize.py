@@ -267,6 +267,10 @@ def test_verification_copy_matches_the_original_except_hooks_and_escaping_links(
     from eris.sanitize import VERIFICATION_PROFILE
 
     original = build_original(tmp_path)
+    (original / "odd-mode-dir").mkdir()
+    (original / "odd-mode-dir" / "inner.txt").write_text("inner\n")
+    (original / "odd-mode-dir").chmod(0o701)  # a directory mode a raw copy would keep
+    (original / "src").chmod(0o750)
     (original / "secretive.sh").write_text("#!/bin/sh\necho hi\n")
     (original / "secretive.sh").chmod(0o700)
     (original / "src" / "app.py").chmod(0o644)
@@ -294,7 +298,7 @@ def test_verification_copy_matches_the_original_except_hooks_and_escaping_links(
             elif path.is_file():
                 out[rel] = ("file", f"{oct(path.stat().st_mode)}:{sha256_hex(path.read_bytes())}")
             else:
-                out[rel] = ("dir", "")
+                out[rel] = ("dir", oct(path.stat().st_mode))  # cond 4: modes, not just names
         return out
 
     original_entries = rel_entries(original)
@@ -304,4 +308,30 @@ def test_verification_copy_matches_the_original_except_hooks_and_escaping_links(
         if not rel.startswith(".git/hooks") and rel not in dropped
     }
     assert rel_entries(copy) == expected  # identical modulo the two documented exceptions
+    assert oct((copy / "odd-mode-dir").stat().st_mode) == oct(
+        (original / "odd-mode-dir").stat().st_mode
+    )
+    assert oct((copy / "src").stat().st_mode) == oct((original / "src").stat().st_mode)
+    assert oct(copy.stat().st_mode) == oct(original.stat().st_mode)  # the root too
     assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
+
+
+def test_a_copy_with_read_only_directories_is_still_removable(tmp_path: Path) -> None:
+    """cond 4: preserving directory modes must not wedge the cleanup - the
+    context manager restores owner write and retries."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    (original / "locked").mkdir(parents=True)
+    (original / "locked" / "file.txt").write_text("x")
+    (original / "locked").chmod(0o500)  # read+execute only: rmtree would fail
+    try:
+        with sanitized_copy(
+            original, tmp_path / "scratch", profile=VERIFICATION_PROFILE, worker_id="verify"
+        ) as (copy, _rec):
+            assert oct((copy / "locked").stat().st_mode) == oct(
+                (original / "locked").stat().st_mode
+            )
+        assert not (tmp_path / "scratch" / "sanitized-verify").exists()
+    finally:
+        (original / "locked").chmod(0o700)  # so pytest can clean up

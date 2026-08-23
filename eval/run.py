@@ -42,13 +42,13 @@ from typing import IO, Any
 
 from eris.arms import (
     ARM_ORDER,
-    ARM_STEPS,
     CellSpec,
     Prior,
     ResumeRefused,
     finish_arm,
     kill_stale_groups,
     load_prior,
+    planned_worker_calls,
     remove_stale_scratch,
     run_arm,
     stop_file_paths,
@@ -271,8 +271,20 @@ def cmd_invoke(
     scratch_root = Path(loaded.policy.scratch_dir)
     if _is_under(scratch_root, Path(args.runs_dir)):
         raise LaunchRefused(f"scratch_dir {scratch_root} must not be under the runs dir")
-    sweep_scratch(scratch_root, sys.stderr, runs_dir=Path(args.runs_dir), exclude=[run_id])
+    sweep_scratch(
+        scratch_root,
+        sys.stderr,
+        runs_dir=Path(args.runs_dir),
+        exclude=[run_id],
+        max_age_s=float(loaded.policy.scratch_retention_s),
+    )
     scratch = scratch_root / run_id  # path only; created AFTER the writer holds the lock
+    # cond 5b: refuse BEFORE anything is written, and leave the entry alone
+    if scratch.exists() or scratch.is_symlink():
+        raise LaunchRefused(
+            f"scratch path {scratch} already exists (or is a symlink); refusing before any "
+            "ledger is created. It was left untouched: remove it or use another run id."
+        )
     call = _build_call(loaded, args, env_values, home, scratch)
     plan_key = plan_call(call).idempotency_key if call.policy.executable else None
     with RunWriter(run_dir, redactor, run_id=run_id) as writer, _scratch_root(scratch):
@@ -440,6 +452,18 @@ class Harness:
     def scratch_dir(self) -> Path:
         return Path(self.policy.scratch_dir)
 
+    def sweep(self, exclude: Sequence[str]) -> list[str]:
+        """Sweep orphaned scratch, always naming the run ids of THIS command so
+        their paths are never touched (cond 5a)."""
+        self.swept = sweep_scratch(
+            self.scratch_dir,
+            self.err,
+            runs_dir=self.runs_dir,
+            exclude=exclude,
+            max_age_s=float(self.policy.scratch_retention_s),
+        )
+        return self.swept
+
     def scratch_for(self, run_id: str) -> Path:
         """``scratch_dir/<run_id>``: every ephemeral file of a run, never under runs/."""
         root = self.scratch_dir
@@ -505,22 +529,36 @@ def sweep_scratch(
     runs_dir: Path,
     exclude: Sequence[str] = (),
     min_age_s: float = SWEEP_MIN_AGE_S,
+    max_age_s: float | None = None,
     now: Callable[[], float] = time.time,
 ) -> list[str]:
     """Remove ORPHANED entries under ``scratch_dir`` and log what went. An
     entry is swept only when it is provably not in use: it is not this run's,
     its run directory (if any) is finalized or its writer lock is free, and it
     has not been touched within ``min_age_s``. Symlinks are unlinked, never
-    followed. A concurrent run's scratch is left alone."""
+    followed. A concurrent run's scratch is left alone.
+
+    ``max_age_s`` (the policy's ``scratch_retention_s``) is a HARD bound: an
+    entry older than it is swept even when liveness cannot be disproved, so a
+    platform without a working lock probe cannot accumulate scratch forever.
+    Those sweeps are logged separately as ``forced``."""
     removed: list[str] = []
+    forced: list[str] = []
     skipped: dict[str, str] = {}
     if not scratch_dir.is_dir() or scratch_dir.is_symlink():
         return removed
     excluded = set(exclude)
     for entry in sorted(scratch_dir.iterdir()):
         reason: str | None = None
-        if entry.name in excluded:
+        try:
+            age = now() - entry.lstat().st_mtime
+        except OSError:
+            age = 0.0
+        over_retention = max_age_s is not None and age >= max_age_s
+        if entry.name in excluded and not over_retention:
             reason = "current run"
+        elif over_retention:
+            forced.append(entry.name)  # hard bound: swept whatever the lock says
         else:
             run_dir = _find_run_dir(runs_dir, entry.name)
             if (
@@ -529,13 +567,8 @@ def sweep_scratch(
                 and _lock_is_held(run_dir / ".lock")
             ):
                 reason = "run is live (writer lock held)"
-            else:
-                try:
-                    age = now() - entry.lstat().st_mtime
-                except OSError:
-                    age = 0.0
-                if age < min_age_s:
-                    reason = f"modified {age:.0f}s ago (< {min_age_s:.0f}s)"
+            elif age < min_age_s:
+                reason = f"modified {age:.0f}s ago (< {min_age_s:.0f}s)"
         if reason is not None:
             skipped[entry.name] = reason
             continue
@@ -549,6 +582,7 @@ def sweep_scratch(
             "status": "scratch_swept",
             "scratch_dir": str(scratch_dir),
             "removed": removed,
+            "forced_over_retention": forced,
             "kept": skipped,
         }
         print(json.dumps(line), file=err, flush=True)
@@ -589,7 +623,9 @@ def load_harness(
     )
     if _is_under(h.scratch_dir, runs_dir):
         raise PolicyError(f"scratch_dir {h.scratch_dir} must not be under the runs dir")
-    h.swept = sweep_scratch(h.scratch_dir, err, runs_dir=runs_dir)
+    # NB: no sweep here - the run ids are not known yet, and a sweep that cannot
+    # name the current run could delete a live scratch dir. Each command calls
+    # `h.sweep(...)` once it knows them (cond 5a).
     return h
 
 
@@ -715,6 +751,20 @@ def run_cell(
     run_id = run_dir.name
     policy = h.policy
     stop_paths = stop_file_paths(h.runs_dir, campaign_id)
+    scratch = h.scratch_for(run_id)
+    if scratch.exists() or scratch.is_symlink():
+        # cond 5b: nothing is created and NOTHING is deleted. The entry (a crash
+        # leftover, or something planted) is left exactly as it was found.
+        return CellOutcome(
+            run_id,
+            EXIT_CONFIG,
+            "refused",
+            error=(
+                f"scratch path {scratch} already exists (or is a symlink); refusing before any "
+                "ledger is created. It was left untouched: remove it or use another run id."
+            ),
+        )
+    scratch_created = False
     try:
         writer = RunWriter(
             run_dir, h.redactor, run_id=run_id, resume=resume, on_event=_stream(h.err, run_id)
@@ -729,7 +779,6 @@ def run_cell(
     snapshot_sha = read_head_sha(snapshot)
     original_tree = tree_sha256(snapshot)
     outcome = CellOutcome(run_id, EXIT_OK, "running")
-    scratch = h.scratch_for(run_id)
     try:
         prior: Prior | None = None
         if resume:
@@ -750,6 +799,7 @@ def run_cell(
         else:
             base_known, base_reserved = 0.0, 0.0
         make_private_dir(scratch)  # after the lock; refuses a planted entry; never under runs/
+        scratch_created = True
         (scratch / "tmp").mkdir()
 
         def judge_workspace(role: str, iteration: int) -> Path:
@@ -909,6 +959,7 @@ def run_cell(
         # the FINAL scan is the LAST event: it covers arm.finished, the
         # cache-store events and any run.error above; the scorer reads it
         scan = scan_and_record(writer, patterns)
+        writer.seal()  # structural: any later append raises instead of slipping in
         scan_contaminated = first.contaminated or scan.contaminated
         scan_incomplete = first.scan_incomplete or scan.scan_incomplete
         totals = cost_totals(LedgerView.from_path(writer.events_path))
@@ -942,29 +993,21 @@ def run_cell(
         outcome.exit_code, outcome.status = EXIT_SIGINT, "interrupted"
         return outcome
     except (LaunchRefused, ResumeRefused, LedgerCorrupt, PolicyError) as exc:
-        writer.append("run.error", {"kind": type(exc).__name__, "error": str(exc)})
+        _record_run_error(writer, h, type(exc).__name__, str(exc))
         outcome.exit_code, outcome.status, outcome.error = EXIT_CONFIG, "refused", str(exc)
         return outcome
     except (SanitizeCleanupError, OSError, WriterError) as exc:
-        writer.append("run.error", {"kind": type(exc).__name__, "error": str(exc)})
+        _record_run_error(writer, h, type(exc).__name__, str(exc))
         outcome.exit_code, outcome.status, outcome.error = EXIT_RUN_ERROR, "run_error", str(exc)
         return outcome
     finally:
         try:
-            # exceptional paths only: the happy path removed the scratch above
-            error = _remove_scratch(scratch)
+            # exceptional paths only (the happy path removed it above), and only
+            # ever OUR directory: a refused pre-existing entry is never deleted
+            error = _remove_scratch(scratch) if scratch_created else None
             if error is not None:
                 outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
-                if writer.closed:
-                    # the ledger is sealed: say it loudly instead of swallowing it
-                    print(
-                        json.dumps({"status": "error", "scratch_cleanup_failed": error}),
-                        file=h.err,
-                        flush=True,
-                    )
-                else:
-                    # a writer failure here propagates (ledger contract)
-                    writer.append("run.error", {"kind": "scratch_cleanup_failed", "error": error})
+                _record_run_error(writer, h, "scratch_cleanup_failed", error)
         finally:
             writer.close()  # always: no fd outlives the cell, whatever propagated
 
@@ -987,6 +1030,21 @@ def assert_judge_workspace_empty(call: WorkerCall) -> None:
         raise LaunchRefused(
             f"judge workspace {cwd} is not empty ({entries[:5]}); refusing to spawn"
         )
+
+
+def _record_run_error(writer: RunWriter, h: Harness, kind: str, error: str) -> None:
+    """A run-level failure becomes a ``run.error`` EVENT while the ledger still
+    accepts events. Once the ledger is sealed (after the final scan) or closed
+    it goes to stderr and the exit code instead: nothing may appear behind
+    ``scan.result`` (cond 10), and nothing is silently dropped either."""
+    if writer.closed or writer.sealed:
+        print(
+            json.dumps({"status": "error", "kind": kind, "error": error, "after_scan": True}),
+            file=h.err,
+            flush=True,
+        )
+        return
+    writer.append("run.error", {"kind": kind, "error": error})
 
 
 def _remove_scratch(scratch: Path) -> str | None:
@@ -1146,6 +1204,7 @@ def cmd_run(
     spec = cell_spec_from_args(h, task, args, arm)
     run_id = validate_run_id(args.resume or args.run_id or spec.run_id)
     run_dir = run_dir_for(h.runs_dir, run_id)
+    h.sweep(exclude=[run_id])  # never this run's own scratch (cond 5a)
     with sigint_handler(h):
         outcome = run_cell(
             h,
@@ -1262,6 +1321,9 @@ def cmd_campaign(
         )
         return EXIT_OK
     stop_paths = stop_file_paths(h.runs_dir, campaign_id)
+    # every cell of this campaign is "current": none of their scratch may be
+    # swept, whatever their age or lock state (cond 5a)
+    h.sweep(exclude=[campaign_id, *(cell.run_id for cell, _t, _s in cells)])
     results: list[dict[str, Any]] = []
     exit_code = EXIT_OK
     with sigint_handler(h):
@@ -1379,14 +1441,10 @@ class CampaignSpend:
 
 
 def planned_calls(spec: CellSpec) -> int:
-    """Logical worker calls a cell makes (panel + critics + judge). Each may
-    RETRY, so a reservation multiplies this by
-    :func:`~eris.retry.worst_case_call_reservation`."""
-    return (
-        len(spec.panel)
-        + (len(spec.critics) if "critique" in ARM_STEPS[spec.arm] else 0)
-        + (1 if spec.judge else 0)
-    )
+    """Logical worker calls a cell makes, from the ARM's steps (the iterating
+    judge counts once per iteration). Each may RETRY, so a reservation
+    multiplies this by :func:`~eris.retry.worst_case_call_reservation`."""
+    return planned_worker_calls(spec)
 
 
 def _campaign_spent(

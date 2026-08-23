@@ -103,6 +103,7 @@ class RunWriter:
         self._blobs: dict[str, BlobRef] = {}
         self._redaction_totals: dict[str, int] = {}
         self._finalized = False
+        self._sealed = False
         self.torn_tail_truncated = False
         self.resumed_from_seq: int | None = None
         self.corrupt_blobs: list[str] = []  # names that did not re-hash on resume (F5)
@@ -129,6 +130,17 @@ class RunWriter:
     def closed(self) -> bool:
         """True once finalized or closed: nothing more can be appended."""
         return self._finalized or self._events_fh is None
+
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Close the ledger for EVENTS while leaving :meth:`finalize` able to
+        write the manifest. The harness seals right after its final scan so
+        that nothing can structurally appear behind ``scan.result``; a later
+        ``append`` raises :class:`WriterClosed` instead of slipping in."""
+        self._sealed = True
 
     @property
     def seq(self) -> int:
@@ -241,9 +253,11 @@ class RunWriter:
             f"{f.code}@{f.record_id}: {f.message}" for f in findings[:5]
         )
 
-    def _ensure_open(self) -> IO[bytes]:
+    def _ensure_open(self, *, for_event: bool = True) -> IO[bytes]:
         if self._finalized or self._events_fh is None:
             raise WriterClosed("writer is not open")
+        if for_event and self._sealed:
+            raise WriterClosed("ledger is sealed: no event may follow the final scan")
         return self._events_fh
 
     # ------------------------------------------------------------------ blobs
@@ -320,8 +334,9 @@ class RunWriter:
     # ------------------------------------------------------------------ finalize
 
     def finalize(self, extra: Mapping[str, Any] | None = None) -> Path:
-        """Write manifest.json LAST (temp+fsync+rename) and close."""
-        self._ensure_open()
+        """Write manifest.json LAST (temp+fsync+rename) and close. Allowed on a
+        sealed ledger: the manifest is not an event."""
+        self._ensure_open(for_event=False)
         manifest: dict[str, Any] = {
             "run_id": self.run_id,
             "schema_version": SCHEMA_VERSION,

@@ -184,6 +184,9 @@ def sanitize_snapshot(
     original_sha = tree_sha256(original)
     stripped: list[StrippedEntry] = []
     dropped: list[str] = []
+    # (source, copy) of every directory we create: their metadata is copied at
+    # the END, so a read-only directory can still be written into meanwhile.
+    made_dirs: list[tuple[Path, Path]] = [(original, dest)]
     for dirpath, dirnames, filenames in os.walk(original, topdown=True, followlinks=False):
         base = Path(dirpath)
         in_git = _rel(base, original).parts[:1] == (GIT_DIR,) if base != original else False
@@ -202,7 +205,8 @@ def sanitize_snapshot(
                 else:
                     dropped.append(rel.as_posix())
                 continue
-            (dest / rel).mkdir(mode=0o755)
+            (dest / rel).mkdir(mode=0o700)  # metadata copied below
+            made_dirs.append((src, dest / rel))
             keep_dirs.append(d)
         dirnames[:] = keep_dirs
         for f in sorted(filenames):
@@ -221,6 +225,10 @@ def sanitize_snapshot(
             if not stat.S_ISREG(st.st_mode):
                 raise SanitizeError(f"{rel}: not a regular file, directory or symlink; refusing")
             shutil.copy2(src, dest / rel, follow_symlinks=False)  # new inode, never a hardlink
+    # deepest first: a directory's mode may forbid writing, so it is applied
+    # only once everything below it exists (fidelity, cond 4)
+    for src_dir, copy_dir in reversed(made_dirs):
+        shutil.copystat(src_dir, copy_dir, follow_symlinks=False)
     return SnapshotSanitization(
         worker_id=worker_id,
         profile_sha256=profile.sha256,
@@ -283,6 +291,20 @@ identical to the original (``test_sanitize.py::test_verification_copy_
 matches_the_original_except_hooks_and_escaping_links``)."""
 
 
+def _force_writable(func: Callable[[str], None], path: str, _exc: BaseException) -> None:
+    """rmtree handler: the copy preserves the original's directory modes, so a
+    read-only directory can block its own removal. Restore owner write and
+    retry once; anything else propagates."""
+    target = Path(path)
+    parent = target.parent
+    for entry in (parent, target):
+        try:
+            entry.chmod(entry.stat().st_mode | stat.S_IRWXU)
+        except OSError:
+            pass
+    func(path)
+
+
 @contextmanager
 def sanitized_copy(
     original: Path,
@@ -301,7 +323,7 @@ def sanitized_copy(
         yield dest.resolve(), record
     finally:
         try:
-            shutil.rmtree(dest)
+            shutil.rmtree(dest, onexc=_force_writable)
         except OSError as exc:
             raise SanitizeCleanupError(
                 f"sanitized copy {dest} could not be removed: {exc}"

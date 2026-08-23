@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import signal
 import time
 from pathlib import Path
@@ -1049,3 +1050,186 @@ def test_scan_result_is_the_last_event_even_when_an_error_is_recorded(tmp_path: 
     errors = view.payloads("run.error")
     assert any(e["kind"] == "snapshot_modified" for e in errors)
     assert (w["snapshot"] / "TOUCHED_BY_grok").exists()  # the test's own tampering
+
+
+def test_sweep_excludes_the_current_run_on_the_run_and_campaign_paths(tmp_path: Path) -> None:
+    """cond 5a: whichever command creates runs, the sweep is told their ids,
+    so a scratch dir belonging to THIS command is never removed - even when it
+    looks old and its lock is free."""
+    w = world(tmp_path)
+    home = tmp_path / "home"
+    scratch_dir = tmp_path / "cache" / "scratch"
+    old = time.time() - 86_400
+
+    scratch_dir.mkdir(parents=True)
+    mine = scratch_dir / "t_01-r0-indep_verify"
+    mine.mkdir()
+    (mine / "leftover").write_text("x")
+    os.utime(mine, (old, old))
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "indep_verify"),
+        out=out,
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_CONFIG and mine.is_dir() and (mine / "leftover").exists()
+    assert "already exists" in json.loads(out.getvalue())["error"]
+    shutil.rmtree(mine)
+
+    for name in ("t_01-r0-single-grok", "t_01-r0-indep_verify", "c1"):
+        d = scratch_dir / name
+        d.mkdir(exist_ok=True)
+        os.utime(d, (old, old))
+    unrelated = scratch_dir / "someone-elses-old-run"
+    unrelated.mkdir()
+    os.utime(unrelated, (old, old))
+    err = io.StringIO()
+    main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c1",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single,indep_verify",
+        ],
+        out=io.StringIO(),
+        err=err,
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    swept = [json.loads(line) for line in err.getvalue().splitlines() if "scratch_swept" in line]
+    assert swept and swept[0]["removed"] == ["someone-elses-old-run"]
+    assert set(swept[0]["kept"]) >= {"c1", "t_01-r0-single-grok", "t_01-r0-indep_verify"}
+    assert all(v == "current run" for v in swept[0]["kept"].values())
+
+
+def test_a_refused_scratch_entry_is_never_deleted_and_the_run_id_stays_reusable(
+    tmp_path: Path,
+) -> None:
+    """cond 5b + consequence 1: the scratch path is validated BEFORE the writer
+    opens - a planted entry survives untouched, no run dir is created, and the
+    run id works again once the entry is removed."""
+    w = world(tmp_path)
+    home = tmp_path / "home"
+    scratch_dir = tmp_path / "cache" / "scratch"
+    scratch_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep").write_text("x")
+    planted = scratch_dir / "reuse"
+    planted.symlink_to(elsewhere)
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="reuse", panel="grok"),
+        out=out,
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_CONFIG
+    summary = json.loads(out.getvalue())
+    assert summary["status"] == "refused" and str(planted) in summary["error"]
+    assert planted.is_symlink()
+    assert sorted(q.name for q in elsewhere.iterdir()) == ["keep"]
+    assert not (w["runs"] / "reuse").exists()
+    planted.unlink()
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="reuse", panel="grok"),
+        out=out,
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_OK, out.getvalue()
+    assert (w["runs"] / "reuse" / "manifest.json").is_file()
+
+
+def test_a_post_scan_failure_never_appends_behind_the_final_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cond 10: after the final scan the ledger is SEALED - a failure in the
+    post-scan path is reported on stderr and the exit code, and an append
+    would raise rather than slip in behind scan.result."""
+    from eris.redact import Redactor
+    from eris.writer import RunWriter as RealWriter
+    from eris.writer import WriterClosed
+
+    real_finalize = RealWriter.finalize
+    calls = {"n": 0}
+
+    def broken_finalize(self: RealWriter, extra: Any = None) -> Path:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated manifest failure after the scan")
+        return real_finalize(self, extra)
+
+    monkeypatch.setattr(RealWriter, "finalize", broken_finalize)
+    w = world(tmp_path)
+    err, out = io.StringIO(), io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="sealed", panel="grok", no_cache=""),
+        out=out,
+        err=err,
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_RUN_ERROR
+    view = events_of(w["runs"] / "sealed")
+    assert view.kinds()[-1] == "scan.result"
+    reported = [json.loads(line) for line in err.getvalue().splitlines() if '"after_scan"' in line]
+    assert reported and "simulated manifest failure" in reported[0]["error"]
+    writer = RealWriter(tmp_path / "runs" / "sealcheck", Redactor(), run_id="sealcheck").open()
+    writer.append("run.started", {})
+    writer.seal()
+    with pytest.raises(WriterClosed, match="sealed"):
+        writer.append("run.error", {"kind": "late"})
+    writer.finalize({"ok": True})
+
+
+def test_scratch_over_the_retention_bound_is_swept_even_when_liveness_is_unprovable(
+    tmp_path: Path,
+) -> None:
+    """New consequence 2: unprovable liveness must not let scratch accumulate
+    forever - past `scratch_retention_s` an entry goes anyway, and is logged."""
+    from eval.run import sweep_scratch
+
+    from eris.redact import Redactor
+    from eris.writer import RunWriter
+
+    scratch = tmp_path / "scratch"
+    runs = tmp_path / "runs"
+    scratch.mkdir()
+    runs.mkdir()
+    now = 1_000_000.0
+    week = 604_800.0
+    for name in ("just-under", "just-over"):
+        (scratch / name).mkdir()
+    os.utime(scratch / "just-under", (now - week + 60, now - week + 60))
+    os.utime(scratch / "just-over", (now - week - 60, now - week - 60))
+    held = [RunWriter(runs / n, Redactor(), run_id=n).open() for n in ("just-under", "just-over")]
+    try:
+        err = io.StringIO()
+        removed = sweep_scratch(
+            scratch, err, runs_dir=runs, min_age_s=3600.0, max_age_s=week, now=lambda: now
+        )
+    finally:
+        for writer in held:
+            writer.close()
+    assert removed == ["just-over"]
+    assert (scratch / "just-under").is_dir() and not (scratch / "just-over").exists()
+    line = [json.loads(x) for x in err.getvalue().splitlines() if "scratch_swept" in x][0]
+    assert line["forced_over_retention"] == ["just-over"]
+    assert line["kept"]["just-under"].startswith("run is live")

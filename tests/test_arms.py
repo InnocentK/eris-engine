@@ -651,3 +651,115 @@ def test_kill_stale_groups_waits_and_refuses_a_survivor() -> None:
     state["alive"] = True
     with pytest.raises(ResumeRefused, match="survived"):
         kill_stale_groups([4242], killpg=lambda *_: signals.append(0), alive=alive, grace_s=0.05)
+
+
+def test_planned_worker_calls_counts_every_judge_iteration() -> None:
+    """cond 12: the reservation for an unreadable ledger must count what the
+    ARM can spend - `adjudicate_iter` re-runs the judge up to MAX_ITERATIONS
+    times, so it is not one judge call."""
+    from eris.arms import planned_worker_calls
+
+    single = spec(Arm.SINGLE, panel=("grok",), critics=(), judge=None)
+    assert planned_worker_calls(single) == 1
+    assert planned_worker_calls(spec(Arm.CONSENSUS)) == 2 + 1  # panel + summarizer
+    assert planned_worker_calls(spec(Arm.INDEP_VERIFY)) == 2 + 1
+    assert planned_worker_calls(spec(Arm.INDEP_VERIFY_ITER)) == 2 + MAX_ITERATIONS
+    assert planned_worker_calls(spec(Arm.INDEP_VERIFY_CRITIQUE)) == 2 + 1 + 1  # + critics
+    # and it really is what the arm can spend: the iterating judge ran 3 times
+    assert MAX_ITERATIONS == 3
+
+
+def test_sigint_closure_covers_only_its_own_attempt(tmp_path: Path) -> None:
+    """cond 7: a `stage.interrupted` closes exactly the attempt it names. A
+    LATER attempt with the same key that crashes without a record still gets
+    its abandoned entry (and its pessimistic cost)."""
+    from eris.launch import invocation_id_for
+    from eris.redact import Redactor
+    from eris.schemas import CostRecord, Invocation, Transport, WorkerStatus
+    from eris.writer import RunWriter
+
+    key = "e" * 64
+    run_dir = tmp_path / "runs" / "sig"
+
+    def invocation(attempt: int) -> Invocation:
+        ts = "2026-08-23T10:00:00Z"
+        return Invocation(
+            invocation_id=invocation_id_for(key, attempt),
+            task_id="t_01",
+            worker_id="grok",
+            provider="xai",
+            transport=Transport.CLI,
+            model_requested="grok-4.6",
+            model_executed=None,
+            stage=Stage.PROPOSE,
+            repeat_index=0,
+            attempt=attempt,
+            idempotency_key=key,
+            argv=[],
+            env_names=[],
+            cwd="/s",
+            executable_sha256=None,
+            cli_version=None,
+            started_at=ts,
+            finished_at=ts,
+            duration_ms=None,
+            exit_code=None,
+            timed_out=False,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            status=WorkerStatus.FAILED,
+            error="interrupted",
+            usage=None,
+            cost_usd=None,
+            stdout_sha256=None,
+            stderr_sha256=None,
+        )
+
+    w = RunWriter(run_dir, Redactor(), run_id="sig").open()
+    started = {"stage": "propose", "worker_id": "grok", "idempotency_key": key, "role": "proposer"}
+    w.append("stage.started", started)
+    w.append("invocation.spawned", {"idempotency_key": key, "pgid": 4242})
+    w.append("invocation.finished", invocation(1))
+    w.append(
+        "cost",
+        CostRecord(
+            invocation_id=invocation_id_for(key, 1),
+            attempt=1,
+            cost_usd=0.5,
+            counted=True,
+            estimated=True,
+            cost_known=False,
+        ),
+    )
+    w.append("stage.interrupted", {**started, "attempt": 1})
+    w.close()
+
+    # first resume: the interrupted attempt is already closed -> nothing invented
+    w2 = RunWriter(run_dir, Redactor(), run_id="sig", resume=True).open()
+    prior = load_prior(LedgerView.from_path(w2.events_path), w2, per_call_usd=0.5)
+    assert prior.abandoned == [] and prior.stale_pgids == [4242]
+    assert "invocation.abandoned" not in LedgerView.from_path(w2.events_path).kinds()
+    # the re-run starts attempt 2 and the harness crashes with nothing recorded
+    w2.append("stage.started", started)
+    w2.append("invocation.spawned", {"idempotency_key": key, "pgid": 5150})
+    w2.close()
+
+    # second resume: attempt 2 was NOT covered by the interruption -> abandoned
+    w3 = RunWriter(run_dir, Redactor(), run_id="sig", resume=True).open()
+    prior3 = load_prior(LedgerView.from_path(w3.events_path), w3, per_call_usd=0.5)
+    view = LedgerView.from_path(w3.events_path)
+    assert [a["attempt"] for a in prior3.abandoned] == [2]
+    assert view.kinds().count("invocation.abandoned") == 1
+    abandoned = view.payloads("invocation.abandoned")[0]
+    assert abandoned["attempt"] == 2 and abandoned["pgid"] == 5150
+    # one pgid per key: the newest spawn (the first group was reaped on resume 1)
+    assert prior3.stale_pgids == [5150]
+    costs = [c for c in view.payloads("cost") if c["cost_known"] is False]
+    assert len(costs) == 2  # one from the interrupt, one for the crashed attempt 2
+    w3.close()
+
+    # a third resume adds nothing (idempotent)
+    w4 = RunWriter(run_dir, Redactor(), run_id="sig", resume=True).open()
+    load_prior(LedgerView.from_path(w4.events_path), w4, per_call_usd=0.5)
+    assert LedgerView.from_path(w4.events_path).kinds().count("invocation.abandoned") == 1
+    w4.close()

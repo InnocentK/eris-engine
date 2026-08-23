@@ -97,6 +97,24 @@ JUDGED_ARMS: frozenset[Arm] = frozenset(
 )
 
 
+def planned_worker_calls(spec: "CellSpec") -> int:
+    """Worker calls this cell can make, derived from its steps: one per panel
+    member, one per critic when the arm critiques, and for the judge as many
+    as the arm's adjudication can iterate (``adjudicate_iter`` re-runs the
+    judge up to :data:`MAX_ITERATIONS` times). Used to reserve pessimistically
+    for a cell whose ledger cannot be read."""
+    steps = ARM_STEPS[spec.arm]
+    calls = len(spec.panel)
+    if "critique" in steps:
+        calls += len(spec.critics)
+    if spec.judge is not None:
+        if "adjudicate_iter" in steps:
+            calls += MAX_ITERATIONS
+        elif "adjudicate" in steps or "summarize" in steps:
+            calls += 1
+    return calls
+
+
 class ArmStopped(Exception):
     """STOP or budget ended the arm; the in-flight attempt completed first."""
 
@@ -165,20 +183,28 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
     # stage.started / stage.finished pairing by (stage, worker, key)
     open_stages: dict[tuple[str, str, str], dict[str, Any]] = {}
     spawned: dict[str, int] = {}
-    closed_by_sigint: set[tuple[str, str, str]] = set()
+    # (stage, worker, key) -> the attempt a SIGINT closed, kept only while it is
+    # still the LAST word on that stage: a later stage.started means a new attempt
+    # began (and may itself have crashed), so the closure no longer covers it.
+    closed_by_sigint: dict[tuple[str, str, str], int] = {}
     for ev in view.events:
         p = ev.payload
         if ev.kind == "stage.interrupted":
             # SIGINT already recorded that attempt (invocation.finished + cost):
             # the stage stays OPEN (it re-runs) but no abandoned attempt is invented
-            closed_by_sigint.add((str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"])))
+            closed_by_sigint[(str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))] = (
+                int(p["attempt"])
+            )
         elif ev.kind == "stage.started":
-            open_stages[(str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))] = p
+            key3 = (str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))
+            open_stages[key3] = p
+            closed_by_sigint.pop(key3, None)  # a NEW attempt started after the interruption
         elif ev.kind == "invocation.spawned":
             spawned[str(p.get("idempotency_key"))] = int(p["pgid"])
         elif ev.kind == "stage.finished":
             key = (str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))
             open_stages.pop(key, None)
+            closed_by_sigint.pop(key, None)
             blobs = [str(b) for b in p.get("blobs", [])]
             if all(intact(b) for b in blobs):
                 prior.finished[(key[0], key[1], int(p.get("iteration", 0)))] = p
@@ -203,8 +229,10 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
         }
         if pgid is not None:
             prior.stale_pgids.append(pgid)
-        if (stage, worker_id, idem) in closed_by_sigint:
-            continue  # closed by the SIGINT path; its cost is already on the ledger
+        if closed_by_sigint.get((stage, worker_id, idem)) == attempts.get(idem, 0):
+            # exactly THAT attempt was closed by the SIGINT path and its cost is
+            # already on the ledger; a later attempt (bigger number) is not covered
+            continue
         if (idem, attempt) in already:
             prior.abandoned.append(payload)  # a repeated resume: recorded once, never twice
             continue
