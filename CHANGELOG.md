@@ -31,6 +31,20 @@ New modules (Phase 1; each requirement has a named test)
   (F4: `BUDGET_TRIPPED` is produced; the claude cap-trip envelope is recorded
   with status `BUDGET_TRIPPED` and its real cost), writer errors propagate.
   `WorkerResult.pgid` / `SpawnResult.pgid` record the process group.
+* `eris.cache`: worker-call cache under `cache_dir` (never under `runs/`;
+  refused). Entry file = sha256 of its redacted bytes (they come out of
+  `RunWriter.put_blob`), `keys/<idempotency_key>` pointer, blob copies.
+  HIT requires hash == name, key/prompt/`executable_sha256` (current pin)
+  match, current `schema_version`, status ok, `scan_hits == 0`, model known,
+  same campaign unless `reuse_across_campaigns`; lstat + `O_NOFOLLOW`
+  reads; any failure is a reasoned miss. Write-once (`O_EXCL`); a differing
+  entry under the same key is a `conflict`, never an overwrite; `fresh`
+  skips the lookup. `replay_hit`: blobs re-enter the run through
+  `put_blob` (hash must survive re-redaction), the cached `Invocation` is
+  re-appended with `reused_from`, `CostRecord(counted=False)`,
+  `invocation.reused`. No `O_NOFOLLOW` (Windows) → `CacheUnsupported`
+  (documented refusal). `executable_sha256` joined the idempotency key
+  material (`idempotency_material`).
 
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes

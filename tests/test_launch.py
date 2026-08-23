@@ -967,6 +967,14 @@ def test_idempotency_key_excludes_arm_includes_repeat(tmp_path: Path) -> None:
     assert idempotency_key(make_call(tmp_path, policy, snapshot_sha="a" * 40)) != idempotency_key(
         make_call(tmp_path, policy, snapshot_sha="b" * 40)
     )
+    # M2b: the pinned executable is key material (a cache entry from another binary never hits)
+    repinned = make_policy(tmp_path, executable_sha256="e" * 64)
+    assert idempotency_key(call) != idempotency_key(make_call(tmp_path, repinned))
+    from eris.launch import idempotency_material
+
+    material = idempotency_material(call)
+    assert material["executable_sha256"] == policy.executable_sha256
+    assert "attempt" not in material and "arm" not in material
 
 
 def test_plan_call_builds_argv_env_cwd_without_spawning(tmp_path: Path) -> None:

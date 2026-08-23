@@ -945,15 +945,18 @@ class WorkerCall:
     snapshot_sha: str | None = None
 
 
-def idempotency_key(call: WorkerCall) -> str:
-    """Excludes the experimental arm (so arms share proposals); includes
-    repeat_index and the snapshot's base commit (a re-snapshotted task never
-    collides with the old one)."""
-    material = {
+def idempotency_material(call: WorkerCall) -> dict[str, Any]:
+    """The key's inputs. Excludes the experimental arm (so arms share
+    proposals) and the attempt; includes repeat_index, the snapshot's base
+    commit (a re-snapshotted task never collides with the old one) and, since
+    M2b, the pinned executable's sha256 (a cache entry produced by another
+    binary is never a hit)."""
+    return {
         "snapshot_sha": call.snapshot_sha,
         "worker_id": call.worker_id,
         "provider": call.policy.provider,
         "model": call.policy.model,
+        "executable_sha256": call.policy.executable_sha256,
         "stage": call.stage.value,
         "task_id": call.task_id,
         "prompt_sha256": sha256_hex(call.prompt.encode("utf-8")),
@@ -961,7 +964,10 @@ def idempotency_key(call: WorkerCall) -> str:
         "repeat_index": call.repeat_index,
         "policy_sha256": call.policy_sha256,
     }
-    return sha256_hex(canonical_bytes(material))
+
+
+def idempotency_key(call: WorkerCall) -> str:
+    return sha256_hex(canonical_bytes(idempotency_material(call)))
 
 
 @dataclass
