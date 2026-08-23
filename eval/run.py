@@ -33,7 +33,15 @@ from eris.launch import (
 )
 from eris.policy import LoadedPolicy, PolicyError, load_policy
 from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
-from eris.schemas import CostRecord, Invocation, Stage, Transport, WorkerStatus, now_ts
+from eris.schemas import (
+    CostRecord,
+    Invocation,
+    Stage,
+    Transport,
+    WorkerStatus,
+    now_ts,
+    sha256_hex,
+)
 from eris.snapshot import read_head_sha
 from eris.version import __version__
 from eris.writer import RunWriter
@@ -229,6 +237,8 @@ def cmd_invoke(
             cleanup_error=result.cleanup_error,
             conversation_id=result.conversation_id,
             worker_reported_duration_ms=result.worker_reported_duration_ms,
+            prompt_sha256=sha256_hex(call.prompt.encode("utf-8")),
+            warning=result.warning,
         )
         writer.append("invocation.finished", invocation)
         if result.cleanup_error:

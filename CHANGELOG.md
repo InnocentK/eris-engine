@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.0 - Milestone 2b, Phase 1: harness modules (2026-08-22, in progress)
+
+Schema `SCHEMA_VERSION` 0.1.2 → **0.1.3** (new golden dir
+`tests/fixtures/records/0.1.3/`, MANIFEST block pinned; 0.1.0–0.1.2 untouched)
+* New records (all `mechanically_observed`): `EvidencePack`, `RetryAttempt`
+  (the retry DECISION), `ScanResult` (pattern hashes + counts only),
+  `SnapshotSanitization`, `ArmRun`. New enums `ErrorClass`, `RetryDecision`,
+  `Arm`, `ArmStatus`; `Stage` gains `verify` and `summarize` (F6).
+* Field additions: `Invocation.{prompt_sha256, reused_from, pgid, warning}`,
+  `CostRecord.{estimated, cost_known}`, `Proposal.evidence_requests`,
+  `Adjudication.evidence_requests`, `EvidenceRequest.expect_exit_code`.
+* Policy: `WorkerPolicy.{sanitize_snapshot, role_tools}`, `Policy.cache_dir`
+  (never under `runs/`), `Budgets.per_campaign_usd`,
+  `verify.{max_requests_per_run=12, max_wall_s=1800}`, `sanitize.{strip_names,
+  strip_dirs}` (additions to the enforced R3.1 minimum), `scan.patterns_from_policy`.
+  `default.yaml`: agy and grok get `sanitize_snapshot: true`.
+* Coverage floor 80 → 90.
+
+Defect fixes (step A; each with a test)
+* F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
+  the message from subtype/terminal_reason/errors (T2 capture: the
+  `--max-budget-usd 0.10` cap tripped at $0.129 — the cap overshoots).
+* F2 `invocation_id` is unique per attempt: `inv-<key[:16]>-a<n>`.
+* F3 "OK with error" → status OK + `warning` (`WorkerResult.warning`,
+  `Invocation.warning`); `error` is None on OK.
+* F5 `RunWriter` re-hashes every blob on resume; a blob that does not hash
+  to its name (or is a symlink) is reported in `corrupt_blobs`, not indexed.
+* `parse_codex` unwraps the `turn.failed` error object (E2 401 capture);
+  `parse_grok` surfaces `{type: error, message}` (E17 403 refusal).
+* Fixtures: `claude/2.1.239/budget_tripped.json`, `codex/0.147.0/auth_401.jsonl`,
+  `grok/1.0.5/api_error_403.json` with provenance sidecars.
+
 ## 0.2.0 - Milestone 2a: Antigravity `agy` worker, E-experiment results (2026-08-22)
 
 Added

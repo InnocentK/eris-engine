@@ -10,7 +10,9 @@ Allowed occurrences (each is about something that still exists):
   OAuth file there (credential_files, brain-dir derivation);
 * the model-id prefix ``"gemini-"`` - the agy lineage guard in policy.py;
 * ``GEMINI.md`` - the repository rules file agy injects from a declared
-  workspace (A15), named in the ``TODO(m2b)`` sanitization note.
+  workspace (A15), named in the ``TODO(m2b)`` sanitization note;
+* ``".gemini"`` - the directory name in ``policy.SANITIZE_MIN_DIRS`` that
+  ``eris.sanitize`` strips from a worker's snapshot copy (M2b).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ ALLOWED: tuple[str, ...] = (
     ".gemini/",
     '"gemini-"',
     "GEMINI.md",
+    '".gemini"',
 )
 _GEMINI = re.compile(r"gemini", re.IGNORECASE)
 
@@ -72,3 +75,4 @@ def test_the_allowed_gemini_occurrences_are_the_only_ones() -> None:
     assert '"gemini-"' in text  # AGY_MODEL_PREFIX
     assert ".gemini/" in text  # brain-dir / credential paths
     assert "GEMINI.md" in text and "TODO(m2b)" in text  # the sanitization note
+    assert '".gemini"' in text  # SANITIZE_MIN_DIRS entry

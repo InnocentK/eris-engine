@@ -386,3 +386,92 @@ def test_cli_policy_pin(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert rc == 0 and "PINNED  claude:" in out and "wrote" in out
     rc = eris_main(["policy", "pin", "--policy", str(tmp_path / "missing.yaml")])
     assert rc == 2 and "FAIL" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- M2b policy additions
+
+
+def test_repo_default_policy_m2b_fields() -> None:
+    """cache_dir, sanitize_snapshot for agy and grok, evidence-request caps,
+    per-campaign budget, sanitize/scan sections - and the R3.1 minimum strip
+    list is always in effect (the policy can only add to it)."""
+    from eris.policy import SANITIZE_MIN_DIRS, SANITIZE_MIN_NAMES
+
+    pol = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml")).policy
+    assert pol.cache_dir == "cache" and pol.runs_dir == "runs"
+    assert pol.workers["agy"].sanitize_snapshot and pol.workers["grok"].sanitize_snapshot
+    assert not pol.workers["claude"].sanitize_snapshot
+    assert not pol.workers["codex"].sanitize_snapshot
+    assert pol.verify.max_requests_per_run == 12 and pol.verify.max_wall_s == 1800
+    assert pol.budgets.per_campaign_usd == 200.0
+    minimum_names = {"AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "GEMINI.md", "GROK.md"}
+    minimum_dirs = {
+        ".agents",
+        ".claude",
+        ".codex",
+        ".gemini",
+        ".grok",
+        ".antigravity",
+        ".cursor",
+        ".github/copilot-instructions.md",
+    }
+    assert minimum_names <= SANITIZE_MIN_NAMES and minimum_dirs <= SANITIZE_MIN_DIRS
+    assert pol.sanitize.effective_names >= SANITIZE_MIN_NAMES
+    assert pol.sanitize.effective_dirs >= SANITIZE_MIN_DIRS
+    assert pol.scan.patterns_from_policy == []
+
+
+def test_sanitize_policy_adds_but_never_removes_the_minimum(tmp_path: Path) -> None:
+    from eris.policy import SANITIZE_MIN_DIRS, SANITIZE_MIN_NAMES
+
+    data = minimal_policy(sanitize={"strip_names": ["NOTES.md"], "strip_dirs": [".vscode"]})
+    pol = load_policy(write(tmp_path, data)).policy
+    assert "NOTES.md" in pol.sanitize.effective_names
+    assert pol.sanitize.effective_names > SANITIZE_MIN_NAMES
+    assert ".vscode" in pol.sanitize.effective_dirs
+    assert pol.sanitize.effective_dirs > SANITIZE_MIN_DIRS
+    for bad in ("", "/etc", "..", "."):
+        with pytest.raises(PolicyError):
+            load_policy(write(tmp_path, minimal_policy(sanitize={"strip_names": [bad]})))
+
+
+def test_cache_dir_must_not_be_under_runs(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="cache_dir"):
+        load_policy(write(tmp_path, minimal_policy(runs_dir="runs", cache_dir="runs/cache")))
+    with pytest.raises(PolicyError, match="cache_dir"):
+        load_policy(write(tmp_path, minimal_policy(runs_dir="runs", cache_dir="runs")))
+    pol = load_policy(write(tmp_path, minimal_policy(runs_dir="runs", cache_dir="elsewhere")))
+    assert pol.policy.cache_dir == "elsewhere"
+
+
+def _claude_worker(**kw: object) -> WorkerPolicy:
+    base: dict[str, object] = {
+        "transport": "cli",
+        "cli": "claude",
+        "provider": "anthropic",
+        "executable_sha256": UNPINNED,
+        "timeout_s": 60,
+        "max_stdout_bytes": 1000,
+    }
+    base.update(kw)
+    return WorkerPolicy.model_validate(base)
+
+
+def test_role_tools_keys_are_validated_and_override_tools() -> None:
+    w = _claude_worker(tools=["Read", "Grep"], role_tools={"adjudicator": [], "summarizer": []})
+    assert w.tools_for_role("proposer") == ["Read", "Grep"]
+    assert w.tools_for_role("adjudicator") == [] and w.tools_for_role("summarizer") == []
+    with pytest.raises(ValueError, match="role_tools"):
+        _claude_worker(role_tools={"judge": []})
+    assert _claude_worker().sanitize_snapshot is False  # default: the original snapshot
+
+
+def test_verify_caps_and_campaign_budget_are_strict(tmp_path: Path) -> None:
+    ok = minimal_policy(verify={"max_requests_per_run": 0, "max_wall_s": 1})
+    assert load_policy(write(tmp_path, ok)).policy.verify.max_requests_per_run == 0
+    for bad in ({"max_requests_per_run": "12"}, {"max_wall_s": 0}, {"max_wall_s": 1.5}):
+        with pytest.raises(PolicyError):
+            load_policy(write(tmp_path, minimal_policy(verify=bad)))
+    budgets = {"per_run_usd": 1, "per_call_usd": 1, "per_campaign_usd": 0}
+    with pytest.raises(PolicyError):
+        load_policy(write(tmp_path, minimal_policy(budgets=budgets)))

@@ -1,0 +1,1 @@
+{"attempt":1,"backoff_s":30.0,"budget_used_after":2,"decision":"retry","error_class":"timeout","invocation_id":"inv-bbbbbbbbbbbbbbbb-a1","origin":"mechanically_observed","reason":"status TIMEOUT","schema_version":"0.1.3","status":"timeout","weight":2}
