@@ -474,13 +474,39 @@ class _Drain(threading.Thread):
         return b"".join(self.chunks)
 
 
-def _kill_group(proc: PopenLike, killpg: KillPg, grace_s: float) -> int:
+EPERM_SWEEP_RETRIES = 20
+EPERM_SWEEP_INTERVAL_S = 0.05
+
+
+def _sweep_sigkill(proc: PopenLike, killpg: KillPg, sleep: Callable[[float], None]) -> None:
+    """SIGKILL the whole group. macOS reports EPERM (not ESRCH) while a
+    member that already died is still an unreaped zombie (its parent, the
+    leader, is gone and launchd reaps it asynchronously): retry briefly.
+    EPERM that persists means a member we cannot signal - refuse loudly."""
+    for attempt in range(EPERM_SWEEP_RETRIES + 1):
+        try:
+            killpg(proc.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            if attempt == EPERM_SWEEP_RETRIES:
+                raise LaunchRefused(
+                    f"process group {proc.pid} could not be signalled ({exc}); a member may "
+                    "have survived the SIGKILL sweep"
+                ) from exc
+            sleep(EPERM_SWEEP_INTERVAL_S)
+
+
+def _kill_group(
+    proc: PopenLike, killpg: KillPg, grace_s: float, sleep: Callable[[float], None] = time.sleep
+) -> int:
     """SIGTERM the group, wait for the leader, then ALWAYS sweep the group
     with SIGKILL: members may ignore SIGTERM or outlive the leader. Returns
     the signal that ended the leader."""
     try:
         killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):  # EPERM: go straight to the sweep
         pass
     leader_gone = False
     try:
@@ -488,10 +514,7 @@ def _kill_group(proc: PopenLike, killpg: KillPg, grace_s: float) -> int:
         leader_gone = True
     except subprocess.TimeoutExpired:
         pass
-    try:
-        killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    _sweep_sigkill(proc, killpg, sleep)
     if leader_gone:
         return int(signal.SIGTERM)
     try:
@@ -544,21 +567,26 @@ def spawn(
     timed_out = False
     killed_with: int | None = None
     try:
-        exit_code: int | None = proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        killed_with = _kill_group(proc, killpg, grace_s)
-        exit_code = proc.poll()
-    except KeyboardInterrupt:
-        # Ctrl-C in the harness: the worker group is killed through the same
-        # path as a timeout, then the interrupt propagates (no handler here).
-        _kill_group(proc, killpg, grace_s)
-        raise
-    out.join(timeout=grace_s + 5)
-    err.join(timeout=grace_s + 5)
-    for stream in (proc.stdout, proc.stderr):
-        if stream is not None:
-            stream.close()
+        try:
+            exit_code: int | None = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            killed_with = _kill_group(proc, killpg, grace_s)
+            exit_code = proc.poll()
+        except KeyboardInterrupt:
+            # Ctrl-C in the harness: the worker group is killed through the same
+            # path as a timeout, then the interrupt propagates (no handler here).
+            _kill_group(proc, killpg, grace_s)
+            raise
+        out.join(timeout=grace_s + 5)
+        err.join(timeout=grace_s + 5)
+    finally:
+        # The pipes are closed on EVERY exit path. A refusal that escaped with
+        # them open used to leak fds whose finalizer (a ResourceWarning) then
+        # surfaced inside an unrelated test.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
     return SpawnResult(
         exit_code=exit_code,
         stdout=out.data,

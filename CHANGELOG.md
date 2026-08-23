@@ -175,6 +175,14 @@ New modules (Phase 1; each requirement has a named test)
   the proposal; arm 2 is scored on the RAW summarizer verdict; paired
   deltas 3b−3 and 4−3 per (task, repeat) only with identical `propose_keys`.
 
+Flakiness root cause (item 9): `launch.spawn` let a `PermissionError`
+(macOS `killpg` EPERM while a dead group member is an unreaped zombie)
+escape with the worker's pipes open; the leaked fds' `ResourceWarning`
+finalizers then failed whichever unrelated test was running under
+`filterwarnings = error` (`test_repo_default_policy…`, the 50 MB redaction
+test). Fix: the SIGKILL sweep retries EPERM briefly and refuses loudly only
+if it persists; `spawn` closes the pipes on every exit path. Two tests.
+
 Docs: INVARIANTS rows for every M2b rule; PROTOCOL stage contracts;
 SECURITY (sanitization + residuals, scan + false-negative limits, cache,
 prompt envelope, retry/budget/STOP/resume/SIGINT, A17, E17); EVAL-PLAN

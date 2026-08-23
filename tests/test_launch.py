@@ -1709,3 +1709,100 @@ def test_invocation_id_is_unique_per_attempt() -> None:
     assert invocation_id_for("a" * 64, 1) != invocation_id_for("b" * 64, 1)
     with pytest.raises(ValueError):
         invocation_id_for(key, 0)
+
+
+# --------------------------------------------------------------------------- EPERM sweep
+
+
+def test_sigkill_sweep_retries_eperm_then_treats_gone_as_swept(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """macOS reports EPERM while a dead member is an unreaped zombie: the
+    sweep retries; ESRCH afterwards means the group is gone; the pipes are
+    closed on every path."""
+    factory = fake_process(hang=True)
+    signals: list[int] = []
+    eperm_left = {"n": 2}
+
+    def killpg(pgid: int, sig: int) -> None:
+        signals.append(sig)
+        if sig == signal.SIGTERM:
+            factory.instances[0].send_signal(sig)
+            return
+        if eperm_left["n"]:
+            eperm_left["n"] -= 1
+            raise PermissionError(1, "Operation not permitted")
+        raise ProcessLookupError
+
+    slept: list[float] = []
+    from eris import launch as launch_mod
+
+    original = launch_mod._kill_group
+
+    def patched(proc: Any, kp: Any, grace: float, sleep: Any = None) -> int:
+        return original(proc, kp, grace, slept.append)
+
+    launch_mod._kill_group = patched  # type: ignore[assignment]
+    try:
+        res = spawn(
+            ["/x/w"],
+            env={},
+            cwd=tmp_path,
+            timeout_s=0.05,
+            max_stdout_bytes=10,
+            max_stderr_bytes=10,
+            popen=factory,
+            killpg=killpg,
+            grace_s=0.1,
+        )
+    finally:
+        launch_mod._kill_group = original  # type: ignore[assignment]
+    assert res.timed_out and res.killed_with == signal.SIGTERM
+    assert signals == [signal.SIGTERM, signal.SIGKILL, signal.SIGKILL, signal.SIGKILL]
+    assert slept == [launch_mod.EPERM_SWEEP_INTERVAL_S] * 2
+    proc = factory.instances[0]
+    assert proc.stdout.closed and proc.stderr.closed
+
+
+def test_sigkill_sweep_persistent_eperm_is_a_refusal_and_closes_the_pipes(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    factory = fake_process(hang=True)
+
+    def killpg(pgid: int, sig: int) -> None:
+        if sig == signal.SIGTERM:
+            factory.instances[0].send_signal(sig)
+            return
+        raise PermissionError(1, "Operation not permitted")
+
+    from eris import launch as launch_mod
+
+    original = launch_mod._kill_group
+    launch_mod._kill_group = lambda proc, kp, grace, sleep=None: original(  # type: ignore[assignment]
+        proc, kp, grace, lambda _s: None
+    )
+    try:
+        with pytest.raises(LaunchRefused, match="could not be signalled"):
+            spawn(
+                ["/x/w"],
+                env={},
+                cwd=tmp_path,
+                timeout_s=0.05,
+                max_stdout_bytes=10,
+                max_stderr_bytes=10,
+                popen=factory,
+                killpg=killpg,
+                grace_s=0.1,
+            )
+    finally:
+        launch_mod._kill_group = original  # type: ignore[assignment]
+    proc = factory.instances[0]
+    assert proc.stdout.closed and proc.stderr.closed  # no fd leaks out of a refusal
+    # and through run_worker it is a REFUSED status, never an exception
+    res = run_worker(
+        make_call(tmp_path, make_policy(tmp_path, timeout_s=1)),
+        popen=fake_process(hang=True),
+        killpg=lambda *_: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted")),
+        clock=time.monotonic,
+    )
+    assert res.status is WorkerStatus.REFUSED and "could not be signalled" in str(res.error)
