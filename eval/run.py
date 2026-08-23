@@ -41,6 +41,7 @@ from typing import IO, Any
 
 from eris.arms import (
     ARM_ORDER,
+    ARM_STEPS,
     CellSpec,
     Prior,
     ResumeRefused,
@@ -786,16 +787,22 @@ def run_cell(
             except KeyboardInterrupt:
                 _record_interrupt(h, writer, ctx)
                 raise
-            scan = scan_and_record(writer, patterns)
+            # scan #1 decides the ArmRun's contamination and the cache entries' scan_hits
+            first = scan_and_record(writer, patterns)
             hits: dict[str, int] = {}
-            for hit in scan.hits:
+            for hit in first.hits:
                 if hit.where.startswith("blob:"):
                     hits[hit.where[5:]] = hits.get(hit.where[5:], 0) + hit.count
-            store_pending_cache(ctx, hits)
             view = LedgerView.from_path(writer.events_path)
             record = finish_arm(
-                draft, ctx, view, contaminated=scan.contaminated, containment=policy.containment
+                draft, ctx, view, contaminated=first.contaminated, containment=policy.containment
             )
+            store_pending_cache(ctx, hits)  # cache.* events carry hashes and keys only
+        # the FINAL scan is the last event before finalize: it covers arm.finished and
+        # the cache-store events too; the scorer reads the last scan.result
+        scan = scan_and_record(writer, patterns)
+        scan_contaminated = first.contaminated or scan.contaminated
+        scan_incomplete = first.scan_incomplete or scan.scan_incomplete
         if tree_sha256(snapshot) != original_tree:
             writer.append(
                 "run.error",
@@ -810,8 +817,8 @@ def run_cell(
             {
                 "arm": spec.arm.value,
                 "status": record.status.value,
-                "contaminated": record.contaminated,
-                "scan_incomplete": scan.scan_incomplete,
+                "contaminated": scan_contaminated,
+                "scan_incomplete": scan_incomplete,
                 "stopped": draft.stopped,
                 "spent_known_usd": budget.spent_known_usd,
                 "spent_reserved_usd": budget.reserved_usd,
@@ -819,14 +826,14 @@ def run_cell(
                 "run_errors": len(run_errors),
             }
         )
-        outcome.contaminated = record.contaminated
+        outcome.contaminated = scan_contaminated
         outcome.stopped = draft.stopped
         outcome.status = record.status.value
         if run_errors:
             outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
         elif draft.stopped is not None:
             outcome.exit_code = EXIT_STOP
-        elif record.contaminated or scan.scan_incomplete:
+        elif scan_contaminated or scan_incomplete:
             outcome.exit_code = EXIT_CONTAMINATED
         elif record.status is not ArmStatus.COMPLETE:
             outcome.exit_code = EXIT_INCOMPLETE
@@ -1141,7 +1148,12 @@ def cmd_campaign(
                     writer.append("cell.skipped", {"run_id": spec.run_id, "reason": "stop"})
                     exit_code = EXIT_STOP
                     continue
-                known, reserved = _campaign_spent(campaign_dir, cells)
+                spend = _campaign_spent(
+                    campaign_dir,
+                    cells,
+                    per_call_usd=h.policy.budgets.per_call_usd,
+                    exclude_run_id=spec.run_id,
+                )
                 writer.append(
                     "cell.started",
                     {
@@ -1150,6 +1162,12 @@ def cmd_campaign(
                         "task_id": spec.task.task_id,
                         "repeat_index": spec.repeat_index,
                         "resume": state == "unfinished",
+                        "campaign_budget": {
+                            "known_usd": spend.known_usd,
+                            "reserved_usd": spend.reserved_usd,
+                            "corrupt_cells": spend.corrupt_cells,
+                            "counted_cells": spend.counted_cells,
+                        },
                     },
                 )
                 try:
@@ -1161,7 +1179,7 @@ def cmd_campaign(
                         run_dir=cell_dir,
                         campaign_id=campaign_id,
                         resume=state == "unfinished",
-                        campaign_budget=(known, reserved),
+                        campaign_budget=(spend.known_usd, spend.reserved_usd),
                     )
                 except KeyboardInterrupt:
                     writer.append("cell.interrupted", {"run_id": spec.run_id})
@@ -1203,22 +1221,54 @@ def cmd_campaign(
     return exit_code
 
 
+@dataclass
+class CampaignSpend:
+    known_usd: float
+    reserved_usd: float
+    corrupt_cells: list[str]
+    counted_cells: list[str]
+
+
+def planned_calls(spec: CellSpec) -> int:
+    """Worker calls a cell makes at most once each (panel + critics + judge);
+    the pessimistic reservation for a cell whose ledger cannot be read."""
+    return (
+        len(spec.panel)
+        + (len(spec.critics) if "critique" in ARM_STEPS[spec.arm] else 0)
+        + (1 if spec.judge else 0)
+    )
+
+
 def _campaign_spent(
-    campaign_dir: Path, cells: Sequence[tuple[CellSpec, Path, Path]]
-) -> tuple[float, float]:
-    """Known + reserved spend of every cell ledger already on disk (resume-safe)."""
+    campaign_dir: Path,
+    cells: Sequence[tuple[CellSpec, Path, Path]],
+    *,
+    per_call_usd: float,
+    exclude_run_id: str | None = None,
+) -> CampaignSpend:
+    """Known + reserved spend of every OTHER cell ledger on disk. A corrupt
+    ledger is never ignored: it reserves per_call x planned calls and is
+    reported. The cell being run/resumed is excluded (its own ledger seeds
+    its run-level budget; it must not be counted twice)."""
     known = reserved = 0.0
+    corrupt: list[str] = []
+    counted: list[str] = []
     for spec, _t, _s in cells:
+        if spec.run_id == exclude_run_id:
+            continue
         events = campaign_dir / spec.run_id / "events.jsonl"
         if not events.is_file():
             continue
         try:
             totals = cost_totals(LedgerView.from_path(events))
         except LedgerCorrupt:
+            corrupt.append(spec.run_id)
+            reserved += per_call_usd * planned_calls(spec)
             continue
+        counted.append(spec.run_id)
         known += totals.known_usd
         reserved += totals.reserved_usd
-    return known, reserved
+    return CampaignSpend(round(known, 6), round(reserved, 6), corrupt, counted)
 
 
 def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:

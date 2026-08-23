@@ -304,7 +304,12 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
         "summarizer",
     }
     assert started["containment"] is None and started["snapshot_sha"] == "f" * 40
-    assert "snapshot.sanitized" in kinds and "scan.result" in kinds and kinds[-1] == "arm.finished"
+    assert "snapshot.sanitized" in kinds and kinds[-1] == "scan.result"  # the scan runs LAST
+    assert kinds.index("arm.finished") < kinds.index("cache.stored") < len(kinds) - 1
+    assert kinds.count("scan.result") == 2  # #1 decides the ArmRun + cache scan_hits; #2 is final
+    for e in view.of_kind("cache.stored"):
+        assert set(e.payload) <= {"idempotency_key", "entry_sha256", "existing_sha256", "scan_hits"}
+        assert all(v is None or isinstance(v, int) or len(str(v)) == 64 for v in e.payload.values())
     assert "scan.patterns" in kinds and view.payloads("scan.patterns")[0]["pattern_count"] >= 1
     # grok ran in its sanitized copy (no AGENTS.md), git ran on the ORIGINAL
     grok_calls = [kw for argv, kw in popen.calls if Path(argv[0]).name == "grok"]
@@ -323,7 +328,7 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
     assert lines and all({"ts", "run_id", "seq", "kind"} <= set(line) for line in lines)
     assert [line["kind"] for line in lines][0] == "run.started" and lines[-1][
         "kind"
-    ] == "arm.finished"
+    ] == "scan.result"
     assert any(
         line["kind"] == "stage.finished" and line.get("worker_id") == "grok" for line in lines
     )
@@ -825,3 +830,54 @@ def test_writer_errors_on_the_error_path_are_never_swallowed(
             popen=Popen(outputs()),
             killpg=lambda *_: None,
         )
+
+
+def test_campaign_budget_counts_corrupt_cells_pessimistically_and_not_the_current_cell(
+    tmp_path: Path,
+) -> None:
+    """Item 12: a corrupt cell ledger reserves per_call x planned calls and
+    is reported; the cell being resumed is excluded from the campaign base
+    (its own ledger seeds its run budget, never counted twice)."""
+    w = world(tmp_path)
+    home = tmp_path / "home"
+    camp = [
+        "campaign",
+        *base_args(w),
+        "--campaign-id",
+        "c1",
+        "--corpus",
+        str(w["corpus"]),
+        "--repeats",
+        "1",
+        "--arms",
+        "single,indep_verify",
+    ]
+    popen = Popen(outputs())
+    popen.interrupt_on = "claude"
+    rc = main(
+        camp, out=io.StringIO(), err=io.StringIO(), home=home, popen=popen, killpg=lambda *_: None
+    )
+    assert rc == EXIT_SIGINT
+    single = w["runs"] / "c1" / "t_01-r0-single-grok"
+    lines = (single / "events.jsonl").read_bytes().splitlines(keepends=True)
+    lines[1] = b"{not json}\n"
+    (single / "events.jsonl").write_bytes(b"".join(lines))
+    out = io.StringIO()
+    rc = main(
+        [*camp, "--resume"],
+        out=out,
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=dead_killpg,
+    )
+    assert rc == EXIT_OK, out.getvalue()
+    cview = events_of(w["runs"] / "c1")
+    started = [p for p in cview.payloads("cell.started") if p["run_id"] == "t_01-r0-indep_verify"][
+        -1
+    ]
+    budget = started["campaign_budget"]
+    assert budget["corrupt_cells"] == ["t_01-r0-single-grok"]
+    assert budget["reserved_usd"] == pytest.approx(0.5 * 1)  # single: one planned call x per_call
+    assert budget["known_usd"] == 0.0  # the resumed cell's own spend is NOT in the base
+    assert "t_01-r0-indep_verify" not in budget["counted_cells"]

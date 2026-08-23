@@ -502,3 +502,48 @@ def test_read_cell_and_load_key_errors(tmp_path: Path) -> None:
         load_key(w["corpus"], "nope")
     cell = read_cell(cdir / "t_01-r0-single-grok")
     assert cell.arm_run.arm.value == "single" and cell.enforced is None and cell.scan is not None
+
+
+def test_cells_without_a_scan_result_are_refused_when_gated_and_plumbing_otherwise(
+    tmp_path: Path,
+) -> None:
+    """Item 10: no ScanResult -> gated categories are refused (exit 7);
+    control/plan cells are excluded as `no_scan` (never a quality metric)."""
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    events = cdir / "t_01-r0-single-grok" / "events.jsonl"
+    from eris.redact import Redactor
+    from eris.writer import RunWriter as RW
+
+    # rebuild the ledger without its scan.result lines (a valid chain again)
+    lines = [json.loads(line) for line in events.read_bytes().splitlines()]
+    kept = [e for e in lines if e["kind"] != "scan.result"]
+    (cdir / "t_01-r0-single-grok" / "manifest.json").unlink()
+    events.unlink()
+    (cdir / "t_01-r0-single-grok" / ".lock").unlink(missing_ok=True)
+    rw = RW(cdir / "t_01-r0-single-grok", Redactor(), run_id="t_01-r0-single-grok").open()
+    for e in kept:
+        rw.append(e["kind"], e["payload"])
+    rw.finalize({"arm": "single"})
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    cell = summary["cells"][0]
+    assert cell["included"] is False and cell["exclusion"] == "no_scan"
+    assert summary["per_arm"]["single"]["excluded"]["no_scan"] == 1
+    # the same cell under a gated category is refused outright
+    task = json.loads(w["task"].read_text())
+    w["task"].write_text(json.dumps({**task, "category": "planted"}))
+    write_key(w, category="planted")
+    arm_run = next(e for e in kept if e["kind"] == "arm.finished")
+    rw2_lines = [e for e in kept]
+    for e in rw2_lines:
+        if e["kind"] == "arm.finished":
+            e["payload"] = {**arm_run["payload"], "category": "planted", "containment": "container"}
+    (cdir / "t_01-r0-single-grok" / "manifest.json").unlink()
+    events.unlink()
+    rw = RW(cdir / "t_01-r0-single-grok", Redactor(), run_id="t_01-r0-single-grok").open()
+    for e in rw2_lines:
+        rw.append(e["kind"], e["payload"])
+    rw.finalize({"arm": "single"})
+    with pytest.raises(GateRefused, match="no ScanResult"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")

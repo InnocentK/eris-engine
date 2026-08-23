@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -295,7 +296,9 @@ def test_tampered_entry_symlinked_files_and_bad_blobs_are_refused(
     w.entry_path().unlink()
     w.entry_path().symlink_to(elsewhere)
     miss = w.lookup()
-    assert isinstance(miss, CacheMiss) and "not a regular file" in miss.reason
+    assert isinstance(miss, CacheMiss) and (
+        "not a regular file" in miss.reason or "outside the cache root" in miss.reason
+    )
     w.entry_path().unlink()
     w.entry_path().write_bytes(entry_bytes)
     # symlinked key pointer
@@ -304,7 +307,9 @@ def test_tampered_entry_symlinked_files_and_bad_blobs_are_refused(
     (tmp_path / "ptr").write_bytes(pointer)
     w.key_path().symlink_to(tmp_path / "ptr")
     miss = w.lookup()
-    assert isinstance(miss, CacheMiss) and "not a regular file" in miss.reason
+    assert isinstance(miss, CacheMiss) and (
+        "not a regular file" in miss.reason or "outside the cache root" in miss.reason
+    )
     w.key_path().unlink()
     w.key_path().write_bytes(pointer)
     # key pointing at garbage
@@ -322,7 +327,9 @@ def test_tampered_entry_symlinked_files_and_bad_blobs_are_refused(
     (tmp_path / "blob").write_bytes(good)
     blob.symlink_to(tmp_path / "blob")
     miss = w.lookup()
-    assert isinstance(miss, CacheMiss) and "not a regular file" in miss.reason
+    assert isinstance(miss, CacheMiss) and (
+        "not a regular file" in miss.reason or "outside the cache root" in miss.reason
+    )
     blob.unlink()
     blob.write_bytes(good)
     assert isinstance(w.lookup(), CacheHit)
@@ -425,3 +432,42 @@ def test_store_refuses_mismatched_key_and_symlinked_dirs(
             campaign_id=None,
         )
     run2.close()
+
+
+def test_ancestor_symlink_out_of_the_cache_root_is_refused(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """Item 9: the realpath of every key/entry/blob must lie under the cache
+    root's realpath - a `keys` (or `blobs`) directory replaced by a symlink
+    to elsewhere is a reasoned miss on lookup and a refusal on store."""
+    w = World(tmp_path, fake_process)
+    assert isinstance(w.lookup(), CacheHit)
+    outside = tmp_path / "outside-keys"
+    shutil.copytree(w.cache.keys_dir, outside)
+    shutil.rmtree(w.cache.keys_dir)
+    w.cache.keys_dir.symlink_to(outside)
+    miss = w.lookup()
+    assert isinstance(miss, CacheMiss) and "outside the cache root" in miss.reason
+    run2 = _writer(tmp_path, "run2")
+    with pytest.raises(CacheError, match="outside the cache root|symlink"):
+        w.cache.store(
+            run2,
+            result=w.result,
+            invocation=w.invocation,
+            key_material=idempotency_material(w.call),
+            prompt_sha256=w.prompt_sha,
+            blobs={k: run2.put_blob(v.path.read_bytes()) for k, v in w.blobs.items()},
+            scan_hits=0,
+            campaign_id=w.campaign,
+        )
+    run2.close()
+    w.cache.keys_dir.unlink()
+    shutil.copytree(outside, w.cache.keys_dir)
+    assert isinstance(w.lookup(), CacheHit)
+    # a blobs dir behind a symlink is refused the same way
+    outside_blobs = tmp_path / "outside-blobs"
+    shutil.copytree(w.cache.blobs_dir, outside_blobs)
+    shutil.rmtree(w.cache.blobs_dir)
+    w.cache.blobs_dir.symlink_to(outside_blobs)
+    miss = w.lookup()
+    assert isinstance(miss, CacheMiss) and "outside the cache root" in miss.reason

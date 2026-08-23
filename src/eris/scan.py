@@ -210,8 +210,14 @@ def scan_run(
                 where = f"event:{event['seq']}"
             if isinstance(payload, dict):
                 if event.get("kind") == "invocation.finished":
-                    if payload.get("stdout_truncated") is True or (
-                        payload.get("status") == "timeout" and payload.get("stdout_sha256") is None
+                    if (
+                        payload.get("stdout_truncated") is True
+                        or payload.get("stderr_truncated") is True
+                        or payload.get("output_file_truncated") is True
+                        or (
+                            payload.get("status") == "timeout"
+                            and payload.get("stdout_sha256") is None
+                        )
                     ):
                         tally.incomplete = True
                 text = canonical_bytes(payload).decode("utf-8")

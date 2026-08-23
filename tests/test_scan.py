@@ -185,9 +185,13 @@ def test_scan_incomplete_on_truncated_stdout_or_empty_timeout(tmp_path: Path) ->
     inv = example_records()["invocation"]
     for update in (
         {"stdout_truncated": True},
+        {"stderr_truncated": True},  # item 10: every truncated stream is an incomplete scan
+        {"output_file_truncated": True},
         {"status": WorkerStatus.TIMEOUT, "timed_out": True, "stdout_sha256": None},
     ):
-        w = RunWriter(tmp_path / "runs" / f"r-{len(update)}", Redactor(), run_id="x").open()
+        w = RunWriter(
+            tmp_path / "runs" / f"r-{'-'.join(sorted(update))}", Redactor(), run_id="x"
+        ).open()
         w.append("invocation.finished", inv.model_copy(update=update))
         res = scan_and_record(w, ps)
         w.close()

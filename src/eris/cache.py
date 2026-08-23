@@ -230,6 +230,19 @@ class Cache:
     def blobs_dir(self) -> Path:
         return self.root / "blobs" / "sha256"
 
+    def _inside(self, path: Path, *, miss: bool) -> Path:
+        """The realpath of ``path`` must lie under the cache root's realpath:
+        an ancestor symlink (``keys`` -> elsewhere) is refused even though
+        the final component is opened ``O_NOFOLLOW``."""
+        root = self.root.resolve()
+        real = path.resolve()
+        try:
+            real.relative_to(root)
+        except ValueError:
+            reason = f"{path} resolves outside the cache root {root} (ancestor symlink?)"
+            raise (CacheMissError(reason) if miss else CacheError(reason)) from None
+        return real
+
     def _ensure_dirs(self) -> None:
         for d in (self.entries_dir, self.keys_dir, self.blobs_dir):
             if d.is_symlink():
@@ -262,10 +275,16 @@ class Cache:
     def _lookup(
         self, key: str, prompt_sha256: str, executable_sha256: str, campaign_id: str | None
     ) -> CacheHit:
-        pointer = _read_regular_nofollow(self.keys_dir / key, 256).decode("ascii").strip()
+        pointer = (
+            _read_regular_nofollow(self._inside(self.keys_dir / key, miss=True), 256)
+            .decode("ascii")
+            .strip()
+        )
         if not is_sha256(pointer):
             raise CacheMissError("key file does not name an entry sha256")
-        raw = _read_regular_nofollow(self.entries_dir / pointer, MAX_ENTRY_BYTES)
+        raw = _read_regular_nofollow(
+            self._inside(self.entries_dir / pointer, miss=True), MAX_ENTRY_BYTES
+        )
         if sha256_hex(raw) != pointer:
             raise CacheMissError("entry bytes do not hash to the entry name")
         entry = json.loads(raw)
@@ -307,7 +326,9 @@ class Cache:
                 continue
             if not isinstance(sha, str) or not is_sha256(sha):
                 raise CacheMissError(f"blob sha for {kind} is not a sha256")
-            data = _read_regular_nofollow(self.blobs_dir / sha, MAX_ENTRY_BYTES)
+            data = _read_regular_nofollow(
+                self._inside(self.blobs_dir / sha, miss=True), MAX_ENTRY_BYTES
+            )
             if sha256_hex(data) != sha:
                 raise CacheMissError(f"blob {kind} does not hash to its name")
             blobs[kind] = data
@@ -354,7 +375,9 @@ class Cache:
         if sha256_hex(data) != ref.sha256:
             raise CacheRefused("the run's entry blob does not hash to its name")
         self._ensure_dirs()
-        key_path = self.keys_dir / invocation.idempotency_key
+        for d in (self.entries_dir, self.keys_dir, self.blobs_dir):
+            self._inside(d, miss=False)
+        key_path = self._inside(self.keys_dir / invocation.idempotency_key, miss=False)
         if key_path.is_symlink() or key_path.exists():
             try:
                 existing = _read_regular_nofollow(key_path, 256).decode("ascii").strip()

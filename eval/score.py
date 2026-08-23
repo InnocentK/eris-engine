@@ -368,14 +368,21 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
             "defect-detection and ABSTAIN results without containment are not evidence (E1)"
         )
     totals = cost_totals(cell.view)
-    rescanned = rescan(cell, key, home=home, corpus=corpus)
     recorded_scan = cell.scan
+    if recorded_scan is None and ar.category in GATED_CATEGORIES:
+        raise GateRefused(
+            f"{cell.run_dir.name}: no ScanResult recorded for a {ar.category.value} cell; "
+            "an unscanned defect/ABSTAIN result is not evidence"
+        )
+    rescanned = rescan(cell, key, home=home, corpus=corpus)
     contaminated = ar.contaminated or (recorded_scan.contaminated if recorded_scan else False)
     scan_incomplete = (
         bool(recorded_scan and recorded_scan.scan_incomplete) or rescanned.scan_incomplete
     )
     exclusion: str | None = None
-    if contaminated or rescanned.contaminated or scan_incomplete:
+    if recorded_scan is None:
+        exclusion = "no_scan"  # plumbing only: never a quality metric
+    elif contaminated or rescanned.contaminated or scan_incomplete:
         exclusion = "contaminated"
     elif any(m.reason.startswith("budget") for m in ar.missing_cells):
         exclusion = "missing"
@@ -468,7 +475,7 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             "included": len(inc),
             "excluded": {
                 k: len([s for s in cells if s.exclusion == k])
-                for k in ("contaminated", "missing", "incomplete", "ledger_invalid")
+                for k in ("contaminated", "missing", "incomplete", "ledger_invalid", "no_scan")
             },
             "precision": _mean([s.precision for s in inc]),
             "recall": _mean([s.recall for s in inc]),
