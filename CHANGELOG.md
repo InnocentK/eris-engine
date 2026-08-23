@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.3 - final advisor fix round (2026-08-23)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; every committed golden is
+untouched). Seven blocking items from the cross-family advisor's confirmation
+pass on `c30f3f4`, each with a named test (`docs/INVARIANTS.md` "Final fix
+round"):
+
+1. **Exclusion outranks retention** in the scratch sweep: a path whose run id
+   belongs to the current command is never swept, at any age. The 7-day
+   `scratch_retention_s` bound applies to orphans only.
+2. **The scratch reservation is the `mkdir(exist_ok=False)`**, taken BEFORE
+   the writer opens (`run` and `invoke`). An entry appearing between the
+   precheck and the mkdir refuses with no ledger, no run directory and
+   nothing deleted; a writer-open failure gives the reservation back.
+3. **Monotonic attempt numbering across resumes**: the next attempt number is
+   derived from every recorded attempt (finished, abandoned, interrupted) and
+   `run_with_retry(first_attempt=...)` continues from the ledger instead of
+   restarting at 1, so no two attempts share a number or an invocation id.
+   Abandoning stays idempotent, and the backoff still counts tries within the
+   driver run.
+4. **Durable sealing**: a ledger whose last event is `scan.result` reopens
+   SEALED, so a resume after a failed finalize cannot append behind the final
+   scan.
+5. **True worst-case reservation**: `worst_case_call_reservation` walks the
+   real retry budget and per-attempt reservation factors instead of guessing
+   a closed form. The attainable mixed chain (timeout -> transient ->
+   timeout) reserves **5x** `per_call_usd`, not 4x; the test brute-forces
+   every class sequence the driver can produce.
+6. **`_force_writable` scoped**: removing a sanitized copy restores owner rwx
+   on real directories inside the copy root only - never a symlink, never a
+   parent - re-raises anything that is not a permission error, and no longer
+   calls the rmtree primitive back (invalid for `os.open`).
+7. **Durable post-scan failure + fsync-after-rename**: a failure after the
+   seal is recorded in `manifest.json` (`post_scan_errors`), not stderr-only;
+   a manifest renamed into place whose directory fsync fails is "finalized but
+   not fsynced" - `ManifestNotDurable`, a `not_durable` log line and its own
+   exit code **8**, never a run error. Both documented in `docs/SECURITY.md`.
+
 ## 0.3.2 - schema 0.1.5 + advisor re-check fixes (2026-08-23)
 
 Schema `SCHEMA_VERSION` 0.1.4 → **0.1.5** (new golden dir

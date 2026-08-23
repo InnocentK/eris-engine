@@ -259,6 +259,14 @@ and not into a stripped entry (every other link is dropped and recorded);
 profile hash, the original's tree hash, the copy's tree hash, every stripped
 file (relpath, size, sha256) and every dropped link.
 
+Removing the copy restores owner rwx on the REAL directories inside the copy
+root (the copy preserves the original's directory modes, and a read-only
+directory blocks the removal of its own entries). Nothing outside the copy
+root is touched - never a parent, and never a symlink, so a link a worker
+left pointing outside cannot be used to change the mode of anything else.
+A removal error that is not a permission error propagates
+(`SanitizeCleanupError`); it is never swallowed.
+
 **Residual (in-band instruction channels that remain):** comments,
 docstrings, READMEs and commit messages are still read by the worker; a
 worker with git tools can still `git show HEAD:AGENTS.md`; the
@@ -355,26 +363,54 @@ not one whose run directory is unfinished while its writer lock is held (a
 platform where liveness cannot be disproved counts as HELD), and not one
 modified within the last hour - and both what was removed and what was kept,
 with reasons, are logged. Because "unprovable" would otherwise mean "kept
-forever", `Policy.scratch_retention_s` (7 days) is a HARD bound: past it an
-entry is swept whatever the lock says, logged as `forced_over_retention`.
+forever", `Policy.scratch_retention_s` (7 days) is a HARD bound on ORPHANS:
+past it an entry is swept whatever the lock says, logged as
+`forced_over_retention`. **Exclusion outranks retention**: an entry whose run
+id belongs to the command doing the sweep is never removed, at any age -
+deleting a live run's scratch is worse than leaking a stale directory, and
+an over-retention entry of a live run is a bug to be reported, not deleted.
 
-The scratch path is validated BEFORE the run's writer opens. A pre-existing
-or planted entry is refused with its path named: no run directory, no
-ledger, and NOTHING is deleted - the entry is left exactly as found for the
-operator to inspect, and the run id is reusable once it is cleared. A run
-only ever removes a scratch root it created itself.
+The scratch path is validated BEFORE the run's writer opens, and the
+`mkdir(exist_ok=False)` that creates it IS the reservation: it happens before
+the writer opens, so an entry appearing between the check and the mkdir
+refuses with no run directory, no ledger, and NOTHING deleted - the entry is
+left exactly as found for the operator to inspect, and the run id is reusable
+once it is cleared. A run only ever removes a scratch root it created itself.
 
 ### The ledger's last word is the scan (item 10)
 After the final scan the ledger is SEALED: `RunWriter.seal()` makes any
-further `append` raise, while `finalize` may still write the manifest. A
-failure in the post-scan path (a manifest write, a late cleanup) is therefore
-reported on stderr and in the exit code, never as an event - nothing can
-appear behind `scan.result`, and nothing is silently dropped.
+further `append` raise, while `finalize` may still write the manifest. The
+seal is DURABLE, not a property of the process that set it: a writer opened
+on a ledger whose last event is `scan.result` opens SEALED, so a `--resume`
+after a failed finalize cannot append behind the final scan either.
+
+A failure in the post-scan path (a manifest write, a late cleanup) cannot be
+an event. It is reported on stderr and in the exit code AND recorded in
+`manifest.json` under `post_scan_errors` - the manifest is written after the
+scan, so that record is durable rather than living only in a terminal that
+may be gone. If the failure prevented the manifest itself, the harness
+finalizes the run once more from its cleanup path so the failure still
+reaches disk.
+
+### Durability of the record: finalized vs fsynced (exit code 8)
+`finalize` writes `manifest.json` as temp file -> fsync -> rename -> fsync of
+the run directory. Once the rename has succeeded the run IS finalized for
+every future reader (a later open refuses with `RunExists`, `campaign
+--resume` skips the cell); only its survival of a power loss is unproven. A
+failure of that last directory fsync is therefore NOT a finalize failure: it
+raises `ManifestNotDurable`, logs `{"status": "not_durable", ...}` and exits
+with its own code **8** (`EXIT_NOT_DURABLE`), distinct from 4
+(`run_error`) and 2 (config refusal). Treat it as an operator signal about
+the filesystem, not as a broken run: the manifest is there, and re-running
+the cell would refuse it as finalized.
 
 ### Fail-closed budgeting after a corruption (operator-resolvable)
 A cell whose ledger cannot be read is reserved pessimistically: every planned
 call of that arm (each judge iteration included) at the worst case the retry
-driver can reach (4x `per_call_usd`). One corrupted cell can therefore
+driver can reach - walked over the real retry budget and the real
+per-attempt reservation factors, mixed chains included (a timeout ->
+transient -> timeout chain reserves 5x `per_call_usd`, more than either
+pure chain). One corrupted cell can therefore
 exhaust `per_campaign_usd` and make later cells trip the budget pre-check.
 That is deliberate - Eris refuses to spend money it cannot account for - and
 it is resolvable by the operator: inspect or remove the corrupt cell
@@ -403,7 +439,11 @@ worker call, every attempt and every verification command; the attempt in
 flight always completes. Resume replays only stages whose blobs re-hash,
 records abandoned attempts with a pessimistic cost, kills surviving process
 groups recorded at spawn time (refused where `os.killpg` is missing) and
-removes stale scratch. The SIGINT handler lives only in `eval/run.py`.
+removes stale scratch. Attempt numbers are MONOTONIC across resumes: the next
+number is derived from every attempt the ledger records (finished, abandoned
+and interrupted alike) and the driver continues from it instead of restarting
+at 1, so no two attempts of a call share a number or an invocation id, and a
+crash on a later resume is never mistaken for a repeat of an earlier one. The SIGINT handler lives only in `eval/run.py`.
 
 ## Residual risks (UNKNOWN / not enforced)
 * Workers other than agy READ outside the snapshot (E1, measured): see the
