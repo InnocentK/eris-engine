@@ -45,7 +45,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from eris.ledger import LedgerCorrupt, LedgerView, cost_totals
 from eris.scan import build_patterns, scan_run
@@ -70,6 +70,10 @@ GATED_CATEGORIES: frozenset[TaskCategory] = frozenset(
     {TaskCategory.REVERT, TaskCategory.PLANTED, TaskCategory.INSUFFICIENT}
 )
 CONTAINMENT_ACCEPTED: frozenset[str] = frozenset({"container"})
+CONTAINMENT_BASIS = (
+    "policy declaration (`containment` in the policy file, recorded on the ArmRun); the "
+    "scorer gates on the declaration and cannot verify it - M2c builds the container"
+)
 PAIRS: tuple[tuple[str, Arm, Arm], ...] = (
     ("3b-3", Arm.INDEP_VERIFY_ITER, Arm.INDEP_VERIFY),
     ("4-3", Arm.INDEP_VERIFY_CRITIQUE, Arm.INDEP_VERIFY),
@@ -87,19 +91,26 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class KeyFinding(_Strict):
-    id: str = Field(min_length=1)
+class _Span(_Strict):
     path: str = Field(min_length=1)
     line_start: int = Field(ge=1)
     line_end: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> _Span:
+        if self.line_end < self.line_start:
+            raise ValueError("line_end must be >= line_start")
+        return self
+
+
+class KeyFinding(_Span):
+    id: str = Field(min_length=1)
     severity: Severity
     must_mention: list[str] = Field(default_factory=list)
 
 
-class Distractor(_Strict):
-    path: str = Field(min_length=1)
-    line_start: int = Field(ge=1)
-    line_end: int = Field(ge=1)
+class Distractor(_Span):
+    pass
 
 
 class KeyScan(_Strict):
@@ -356,11 +367,24 @@ class CellScore:
     scan_incomplete: bool
     rescan_contaminated: bool
     containment: str | None
+    containment_basis: str = CONTAINMENT_BASIS
     missing_cells: list[dict[str, str]] = field(default_factory=list)
 
 
 def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellScore:
     ar = cell.arm_run
+    # the key must be the key OF THIS LEDGER: a gated task can never be scored
+    # behind an ArmRun that recorded another task or a scorable category
+    if key.task_id != ar.task_id:
+        raise GateRefused(
+            f"{cell.run_dir.name}: key.json task_id {key.task_id!r} != ArmRun.task_id "
+            f"{ar.task_id!r}; refusing the cell"
+        )
+    if key.category is not ar.category:
+        raise GateRefused(
+            f"{cell.run_dir.name}: key.json category {key.category.value!r} != the category "
+            f"recorded at run time {ar.category.value!r} (task.json); refusing the cell"
+        )
     if ar.category in GATED_CATEGORIES and (ar.containment or "") not in CONTAINMENT_ACCEPTED:
         raise GateRefused(
             f"{cell.run_dir.name}: category {ar.category.value} requires "
@@ -545,8 +569,12 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
 
 
 def cell_dirs(campaign_dir: Path) -> list[Path]:
+    """Finalized cell dirs; a symlinked entry is never followed (a link could
+    point a scorer at a run dir outside the campaign)."""
     return sorted(
-        p for p in Path(campaign_dir).iterdir() if p.is_dir() and (p / "manifest.json").is_file()
+        p
+        for p in Path(campaign_dir).iterdir()
+        if p.is_dir() and not p.is_symlink() and (p / "manifest.json").is_file()
     )
 
 
@@ -570,6 +598,7 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         "pre_registration_notes": [
             "arm consensus is scored on the RAW summarizer verdict (enforced is also recorded)",
             "categories revert/planted/insufficient require ArmRun.containment == container (E1)",
+            "containment basis: " + CONTAINMENT_BASIS,
             "plan tasks are scored without containment by user decision; plan keys are as "
             "readable as the others (testing critic) - recorded caveat",
         ],

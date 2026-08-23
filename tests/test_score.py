@@ -7,7 +7,6 @@ import ast
 import builtins
 import io
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +121,8 @@ def test_key_format_is_strict() -> None:
 
 
 def test_score_imports_nothing_that_executes() -> None:
+    """Item 13: the AST guard asserts the REAL import set of eval/score.py -
+    an explicit allowlist - so a new executing import cannot slip in."""
     tree = ast.parse(SCORE_PY.read_text())
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -129,29 +130,43 @@ def test_score_imports_nothing_that_executes() -> None:
             names.update(a.name for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
-    forbidden = {"subprocess", "socket", "httpx", "eris.launch", "eris.verify", "asyncio", "shutil"}
-    assert not (names & forbidden), names & forbidden
-    assert "os" not in names  # no os.system / os.popen possible
-    src = SCORE_PY.read_text().replace(ast.get_docstring(tree) or "", "")
-    assert "os.system" not in src and "os.popen" not in src and "Popen" not in src
-    # and transitively: importing the scorer never loads the launcher or the verifier
-    assert (
-        "eris.launch" not in sys.modules or True
-    )  # other tests load it; check the scorer's own graph:
-    graph = {
+    assert names == {
+        "__future__",
+        "argparse",
+        "json",
+        "sys",
+        "collections.abc",
+        "dataclasses",
+        "pathlib",
+        "typing",
+        "pydantic",
         "eris.ledger",
         "eris.scan",
         "eris.schemas",
-        "eris.validate",
-        "eris.redact",
-        "eris.writer",
-        "eris.version",
+    }, names
+    forbidden = {
+        "subprocess",
+        "socket",
+        "httpx",
+        "os",
+        "shutil",
+        "asyncio",
+        "eris.launch",
+        "eris.verify",
     }
-    for mod in ("eris.ledger", "eris.scan"):
-        module = __import__(mod, fromlist=["x"])
-        imported = {n.split(".")[0] if not n.startswith("eris") else n for n in dir(module)}
-        assert not ({"launch", "verify", "subprocess"} & imported), mod
-    assert graph  # documented closure
+    assert not (names & forbidden)
+    body = SCORE_PY.read_text().replace(ast.get_docstring(tree) or "", "")
+    assert "os.system" not in body and "os.popen" not in body and "Popen" not in body
+    # the transitive closure of the scorer's eris imports never reaches the launcher/verifier
+    import importlib
+
+    for mod in ("eris.ledger", "eris.scan", "eris.schemas"):
+        module = importlib.import_module(mod)
+        src = Path(module.__file__ or "").read_text()
+        imports = {
+            n.module for n in ast.walk(ast.parse(src)) if isinstance(n, ast.ImportFrom) and n.module
+        } | {a.name for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Import) for a in n.names}
+        assert not ({"eris.launch", "eris.verify", "subprocess", "socket", "httpx"} & imports), mod
 
 
 def test_scorer_opens_nothing_outside_runs_and_corpus(
@@ -547,3 +562,46 @@ def test_cells_without_a_scan_result_are_refused_when_gated_and_plumbing_otherwi
     rw.finalize({"arm": "single"})
     with pytest.raises(GateRefused, match="no ScanResult"):
         score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+
+def test_key_must_match_the_ledger_task_and_category(tmp_path: Path) -> None:
+    """Item 3: a gated task can never be scored behind a `control` ArmRun:
+    key.task_id and key.category must equal what the ledger recorded."""
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    write_key(w, category="planted")  # the key says planted; the ledger recorded control
+    with pytest.raises(GateRefused, match="category"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    write_key(w, task_id="t_99")
+    with pytest.raises(GateRefused, match="task_id"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    write_key(w)
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert summary["cells"][0]["containment_basis"].startswith("policy declaration")
+    assert any("containment basis" in n for n in summary["pre_registration_notes"])
+
+
+def test_key_line_order_and_symlinked_cell_dirs(tmp_path: Path) -> None:
+    """Item 13: key spans need line_end >= line_start; a symlinked entry in
+    the campaign dir is never followed."""
+    with pytest.raises(ValidationError, match="line_end"):
+        Key.model_validate(
+            key_dict(
+                findings=[
+                    {"id": "k", "path": "p", "line_start": 9, "line_end": 3, "severity": "low"}
+                ]
+            )
+        )
+    with pytest.raises(ValidationError, match="line_end"):
+        Key.model_validate(key_dict(distractors=[{"path": "p", "line_start": 5, "line_end": 1}]))
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    elsewhere = tmp_path / "elsewhere-cell"
+    import shutil
+
+    shutil.copytree(cdir / "t_01-r0-single-grok", elsewhere)
+    (cdir / "linked-cell").symlink_to(elsewhere)
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert [c["run_id"] for c in summary["cells"]] == ["t_01-r0-single-grok"]

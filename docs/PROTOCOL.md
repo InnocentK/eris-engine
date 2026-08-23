@@ -53,10 +53,14 @@ appends:
   `additionalProperties: false` and every key required.
 
 **Wire models** (`ProposalOut`, `CritiqueOut`, `AdjudicationOut`;
-`extra="forbid"`) are the ONLY way model output enters Eris. A model-supplied
+`extra="forbid"`, NO defaults, strict JSON validation) are the ONLY way
+model output enters Eris. A model-supplied
 id, `origin`, `schema_version` or engine field is `malformed_output`: the
 call is retried with the IDENTICAL prompt in a fresh process (cap 2), then
-recorded as `worker.absent`. `Record.model_validate(model_json)` is never
+recorded as `worker.absent`; a semantic violation (unknown label, claim
+index out of range, invalid ref) is treated the same way. Every record a
+later stage consumes is re-parsed from the redacted payload the writer
+persisted. `Record.model_validate(model_json)` is never
 called. Eris assigns every id: claims `clm-<propose_key[:12]>-<i>`, findings
 `fnd-…`, proposals `prop-…`, challenges `<critique_key[:12]>-p<k>-c<n>`,
 dissent `dis-…`.
@@ -74,15 +78,18 @@ across arms. The rendered pack carries no timestamp or run id.
 `P1..Pn` and never each other (all critic prompts share one hash); every
 critic carries the `framing` lens. **Adjudicator / summarizer** (the
 dedicated `judge` worker: text only, `tools: []`, timeout 300 s, a TIMEOUT is
-terminal) see evidence blocks (16 KiB head+tail cap), `P1..Pn` (label →
-worker in `proposal.labels`), `C1..` (arm 4 only) and verification items -
+terminal; cwd and workspace = an EMPTY private dir, never the snapshot) see
+evidence blocks (16 KiB head+tail cap), `P1..Pn` (label → worker in
+`proposal.labels`), `C1..` (arm 4 only) and verification items -
 never raw repository files, rationale blobs, another stage's instruction
 text or a host absolute path (executables are rendered by basename). After
 the judge: `adjudication.raw` → `enforce_rulings` → `adjudication.enforced`
 → `validate.findings`.
 
 **Evidence requests** come only from structured output. Each is re-checked
-by `check_command` inside `run_allowlisted` on the ORIGINAL snapshot;
+by `check_command` inside `run_allowlisted` in a PRISTINE copy of the
+original snapshot (a command that changes the copy is `snapshot.violated`
+and stops verification);
 refusals are `verify.refused` events (the challenge stays UNVERIFIED);
 duplicates by canonical argv are `verify.duplicate`; `verify.max_requests_per_run`
 (12) and `verify.max_wall_s` cap a run; STOP is checked before every command.

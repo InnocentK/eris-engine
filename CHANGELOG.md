@@ -175,7 +175,28 @@ New modules (Phase 1; each requirement has a named test)
   the proposal; arm 2 is scored on the RAW summarizer verdict; paired
   deltas 3b−3 and 4−3 per (task, repeat) only with identical `propose_keys`.
 
-Flakiness root cause (item 9): `launch.spawn` let a `PermissionError`
+Advisor round (Codex review, 15 items; each with a test - `docs/INVARIANTS.md`
+"Advisor round"):
+* (1) downstream records are the REDACTED ones the writer persisted (fresh
+  == cache-hit bytes); (2) the judge/summarizer runs in an EMPTY private dir;
+  (3) the scorer cross-checks `key.json` `task_id`/`category` against the
+  ArmRun and states that `containment` is a declaration; (4) verification
+  runs in a PRISTINE copy with a tree-hash guard (`snapshot.violated`,
+  `EvidenceItem.violated` - schema 0.1.3 → **0.1.4**, new golden dir +
+  pinned block), pytest `-p no:cacheprovider`; (5) every ephemeral file
+  lives under `Policy.scratch_dir` (default `cache/scratch/<run_id>/`),
+  never under `runs/`, swept at startup; (6) STOP re-checked after the
+  backoff sleep; (7) idempotent resume + waited group kill; (8) the request
+  dedupe set survives resume; (9) cache realpath containment; (10) the final
+  scan is the last event before finalize, stderr/output-file truncation →
+  `scan_incomplete`, no ScanResult → refused when gated; (11) wire models
+  without defaults, strict, semantic violations retryable; (12) corrupt cell
+  ledgers reserved pessimistically, the resumed cell never counted twice;
+  (13) key span order, symlinked cell dirs ignored, real AST allowlist;
+  (14) `os.killpg` resolved at call time; (15) SIGINT `RetryAttempt`, writer
+  errors never swallowed.
+
+Flakiness root cause (item 9 of the Phase 2 instructions): `launch.spawn` let a `PermissionError`
 (macOS `killpg` EPERM while a dead group member is an unreaped zombie)
 escape with the worker's pipes open; the leaked fds' `ResourceWarning`
 finalizers then failed whichever unrelated test was running under

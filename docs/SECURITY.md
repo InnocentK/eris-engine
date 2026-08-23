@@ -271,8 +271,10 @@ check, fixture `grok/1.0.5/api_error_403.json`); E1's grok reply had begun
 sanitized anyway (cheap) and the result is recorded honestly.
 
 ### Contamination scan (`src/eris/scan.py`) - tripwire, detect only
-Every run is scanned BEFORE finalize and re-scanned read-only by the
-scorer: every blob, every event payload, the rendered pack and any reused
+Every run is scanned twice - once to decide the `ArmRun` and the cache
+entries' `scan_hits`, and a FINAL time as the last event before finalize
+(after `arm.finished` and the cache-store events, which carry hashes and
+keys only) - and re-scanned read-only by the scorer: every blob, every event payload, the rendered pack and any reused
 cache entry. Patterns are derived at RUN TIME - the source repository's
 path (`key.json.source_repo`) and `Path.home()`-rooted vendor memory stores
 (`~/.claude/projects`, `~/.codex/sessions`,
@@ -282,8 +284,9 @@ policy strings - whitespace-folded and sha256-named. The ledger carries
 pattern hashes and counts ONLY (`ScanResult`); no fix-hunk text exists in
 this repository or in any run. A hit marks the run `contaminated` (exit 6;
 the scorer excludes it from quality metrics and counts its cost); a
-truncated stdout or an empty-stdout TIMEOUT makes the scan `scan_incomplete`
-(treated as contaminated).
+truncated stdout, stderr or output file, or an empty-stdout TIMEOUT, makes
+the scan `scan_incomplete` (treated as contaminated); a cell with no
+`ScanResult` is refused for gated categories and plumbing-only otherwise.
 
 **False-negative limits (documented, not fixed):** a worker that read the
 answer key but paraphrased it leaves no pattern; patterns shorter than 12
@@ -305,10 +308,41 @@ executable pin, key + prompt match, same campaign (unless
 `--reuse-across-campaigns`), status ok, `scan_hits == 0` (a contaminated
 entry is never reused), a known model, the current schema version, the
 entry hash == name and every blob re-hashing; every file is `lstat`-checked
-and opened `O_NOFOLLOW`; any failure is a reasoned miss and a fresh call.
+and opened `O_NOFOLLOW`, and every key/entry/blob must RESOLVE under the
+cache root's realpath (an ancestor symlink is refused); any failure is a
+reasoned miss and a fresh call.
 A replay whose blob changes under the reusing run's redactor (a secret
 learned later) is refused. Without `O_NOFOLLOW` (Windows) the cache refuses
 to construct (documented; M2c adds a portable fallback).
+
+### Verification runs on a PRISTINE copy (advisor round, item 4)
+A trusted `pytest` executes repository code and could modify it. Every
+verification command therefore runs in a fresh pristine copy of the
+original (`sanitize.PRISTINE_PROFILE`: nothing stripped, hooks removed,
+escaping symlinks dropped) under the run's scratch root - never in the
+original and never in a sanitized copy. `evidence.SnapshotGuard` compares
+the copy's tree hash after every command: a change is recorded
+(`snapshot.violated`, `EvidenceItem.violated`, the item's summary) and
+verification stops for the run; the original's tree hash is recorded in
+`run.started` and asserted unchanged at the end (`run.error
+snapshot_modified`). pytest always carries `-p no:cacheprovider`.
+
+### The judge never sees the snapshot (item 2)
+The adjudicator/summarizer cwd - and agy's `--add-dir`, codex's `-C` - is an
+EMPTY private directory under the scratch root. Its only input is the
+prompt.
+
+### Ephemeral files never live under `runs/` (item 5)
+`RunWriter` is the only writer under `runs/`. Worker scratch, sanitized
+copies, the pristine verification copy and the verify HOME live under the
+policy `scratch_dir` (default `cache/scratch/<run_id>/`, refused under
+`runs/`), are removed in `finally` on success, refusal and crash, and
+orphans are swept at startup (symlinks unlinked, never followed; logged).
+
+### Records downstream are the redacted ones (item 1)
+Every record a later stage consumes is re-parsed from the redacted payload
+the writer persisted, so a secret or host path in a proposal never reaches
+a critic or the judge, and the fresh and cache-hit paths are byte-identical.
 
 ### Prompt envelope (`src/eris/stages.py`)
 DATA is one canonical-JSON document between nonce delimiters; repository
