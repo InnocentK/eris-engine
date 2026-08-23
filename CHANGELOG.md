@@ -57,6 +57,19 @@ New modules (Phase 1; each requirement has a named test)
   `sanitized_copy()` context manager: private dir under the run scratch,
   removed in `finally`, cleanup failure raised (`SanitizeCleanupError`).
   Tests pin the original's tree hash + inodes and agy's `--add-dir` == copy.
+* `eris.scan`: contamination tripwire (detect only). Patterns derived at
+  run time (source-repo path, `athena-assistant`, `eval/corpus/`,
+  `key.json`, `~/.claude/projects`, `~/.codex/sessions`,
+  `~/.gemini/antigravity-cli/brain`, key.json fix-hunk lines + extra
+  strings, policy strings; never `must_mention`), whitespace-folded;
+  dropped (counted, never listed) when shorter than 12 chars (the fixed
+  markers are exempt), present in the pre-fix tree, or contained in the
+  harness's own recorded paths (`known_texts`: the snapshot/run dirs Eris
+  writes into `run.started` / `Invocation.cwd` — a spec gap, see report).
+  Scans every blob, every event payload, the pack and reused cache
+  entries; `scan_incomplete` on truncated stdout or empty-stdout TIMEOUT;
+  `scan.result` carries `ScanResult` (pattern hashes + counts only);
+  re-scanning over the scan event adds no hits.
 
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
