@@ -291,18 +291,71 @@ identical to the original (``test_sanitize.py::test_verification_copy_
 matches_the_original_except_hooks_and_escaping_links``)."""
 
 
-def _force_writable(func: Callable[[str], None], path: str, _exc: BaseException) -> None:
-    """rmtree handler: the copy preserves the original's directory modes, so a
-    read-only directory can block its own removal. Restore owner write and
-    retry once; anything else propagates."""
-    target = Path(path)
-    parent = target.parent
-    for entry in (parent, target):
+# O_NOFOLLOW | O_DIRECTORY makes the chmod target unambiguous (never a symlink,
+# never a file). Both are POSIX; on a platform without them (Windows) the
+# fallback is a plain chmod after an lstat check, which is the same guarantee
+# with a TOCTOU window inside our own private scratch dir.
+_NOFOLLOW_DIR = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+
+
+def _grant_owner_access(path: Path) -> None:
+    """Add owner rwx to ``path`` if - and only if - it is a REAL directory.
+    A symlink is never followed and never chmod'd; anything that is not a
+    directory is left alone."""
+    st = path.lstat()  # never stat(): a symlink must not be followed
+    if not stat.S_ISDIR(st.st_mode) or st.st_mode & stat.S_IRWXU == stat.S_IRWXU:
+        return
+    mode = stat.S_IMODE(st.st_mode) | stat.S_IRWXU
+    if _NOFOLLOW_DIR:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW_DIR)
         try:
-            entry.chmod(entry.stat().st_mode | stat.S_IRWXU)
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+    else:  # pragma: no cover - only on a platform without O_NOFOLLOW/O_DIRECTORY
+        os.chmod(path, mode)
+
+
+def _restore_owner_access(root: Path) -> None:
+    """Give the owner rwx on every REAL directory INSIDE ``root`` (root
+    included) so ``rmtree`` can unlink their contents: the copy preserves the
+    original's directory modes, and a read-only directory blocks the removal
+    of its own entries. Nothing outside ``root`` is touched - no parent, and
+    no symlink (a link inside the copy may point anywhere)."""
+    if root.is_symlink() or not root.is_dir():
+        return
+    _grant_owner_access(root)
+    for dirpath, dirnames, _files in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+        for d in dirnames:  # top-down: a dir is made accessible before we descend
+            _grant_owner_access(base / d)
+
+
+def _force_writable(
+    root: Path,
+) -> Callable[[Callable[..., object], str, BaseException], None]:
+    """Build the ``rmtree`` onexc handler for the copy rooted at ``root``.
+
+    A PERMISSION error on a real directory inside ``root`` restores owner
+    access (the pre-pass above may have raced with a mode change); anything
+    else - a different errno, a symlink, a path outside the root - is
+    re-raised, so a removal failure is never swallowed. The handler never
+    retries ``func``: its signature is not the same for every rmtree
+    primitive (``os.open`` takes flags), so calling it back is invalid."""
+
+    def handler(_func: Callable[..., object], path: str, exc: BaseException) -> None:
+        if not isinstance(exc, PermissionError):
+            raise exc
+        target = Path(path)
+        if not _is_under(target, root):
+            raise exc
+        try:
+            _grant_owner_access(target)  # a real directory only; never a parent
         except OSError:
-            pass
-    func(path)
+            raise exc from None
+
+    return handler
 
 
 @contextmanager
@@ -323,7 +376,8 @@ def sanitized_copy(
         yield dest.resolve(), record
     finally:
         try:
-            shutil.rmtree(dest, onexc=_force_writable)
+            _restore_owner_access(dest)  # inside the copy only; never a parent
+            shutil.rmtree(dest, onexc=_force_writable(dest))
         except OSError as exc:
             raise SanitizeCleanupError(
                 f"sanitized copy {dest} could not be removed: {exc}"

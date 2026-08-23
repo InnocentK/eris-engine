@@ -335,3 +335,74 @@ def test_a_copy_with_read_only_directories_is_still_removable(tmp_path: Path) ->
         assert not (tmp_path / "scratch" / "sanitized-verify").exists()
     finally:
         (original / "locked").chmod(0o700)  # so pytest can clean up
+
+
+def test_a_symlink_inside_the_copy_is_never_chmodded_when_the_copy_is_removed(
+    tmp_path: Path,
+) -> None:
+    """Final item 6: removing the copy restores owner access on REAL
+    directories inside the copy root only. A symlink a worker left behind
+    (here inside a read-only directory, so its removal really does hit
+    EACCES) is never followed: its target's mode is unchanged, and nothing
+    outside the copy root is touched."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    original.mkdir()
+    (original / "README.md").write_text("x")
+    victim = tmp_path / "outside"
+    victim.mkdir()
+    (victim / "keep").write_text("secret")
+    victim.chmod(0o500)  # read+execute only, and it must STAY that way
+    scratch = tmp_path / "scratch"
+    parent_mode = oct(scratch.stat().st_mode) if scratch.exists() else None
+    try:
+        with sanitized_copy(
+            original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"
+        ) as (copy, _rec):
+            locked = copy / "locked"  # what a worker left in its cwd
+            locked.mkdir()
+            (locked / "escape").symlink_to(victim)
+            locked.chmod(0o500)  # unlinking `escape` now raises EACCES
+        assert not (scratch / "sanitized-verify").exists()  # the copy IS gone
+        assert oct(victim.stat().st_mode) == oct(0o40500)  # never chmod'd through the link
+        assert (victim / "keep").read_text() == "secret"
+        assert parent_mode is None or oct(scratch.stat().st_mode) == parent_mode
+    finally:
+        victim.chmod(0o700)
+
+
+def test_the_removal_handler_re_raises_anything_that_is_not_a_permission_error(
+    tmp_path: Path,
+) -> None:
+    """Final item 6: the handler is not a catch-all. A non-permission error, or
+    a permission error on a path outside the copy root, propagates - a removal
+    failure is never swallowed - and the handler never calls ``func`` back
+    (its signature differs per rmtree primitive: ``os.open`` takes flags)."""
+    import errno
+    import os as _os
+
+    from eris.sanitize import _force_writable
+
+    root = tmp_path / "copy"
+    (root / "sub").mkdir(parents=True)
+    handler = _force_writable(root)
+    calls: list[str] = []
+
+    def func(path: str) -> None:  # pragma: no cover - must never be called
+        calls.append(path)
+
+    with pytest.raises(OSError) as busy:
+        handler(func, str(root / "sub"), OSError(errno.EBUSY, "device busy"))
+    assert busy.value.errno == errno.EBUSY
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    with pytest.raises(PermissionError):
+        handler(func, str(outside), PermissionError(errno.EACCES, "denied"))
+    assert oct(outside.stat().st_mode) == oct(_os.stat(outside).st_mode)  # untouched
+    # a permission error on a real directory INSIDE the root is handled: owner
+    # access is restored, and func is still never retried
+    (root / "sub").chmod(0o500)
+    handler(func, str(root / "sub"), PermissionError(errno.EACCES, "denied"))
+    assert (root / "sub").stat().st_mode & 0o700 == 0o700
+    assert calls == []

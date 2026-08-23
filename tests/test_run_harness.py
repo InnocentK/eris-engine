@@ -908,7 +908,7 @@ def test_campaign_budget_counts_corrupt_cells_pessimistically_and_not_the_curren
     from eris.retry import worst_case_call_reservation
 
     assert budget["reserved_usd"] == pytest.approx(worst_case_call_reservation(0.5))
-    assert budget["reserved_usd"] == pytest.approx(2.0)  # 4 x per_call
+    assert budget["reserved_usd"] == pytest.approx(2.5)  # 5 x per_call (the mixed chain)
     assert budget["known_usd"] == 0.0  # the resumed cell's own spend is NOT in the base
     assert "t_01-r0-indep_verify" not in budget["counted_cells"]
 

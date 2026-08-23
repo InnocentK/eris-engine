@@ -32,7 +32,7 @@ import os
 import shutil
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -165,6 +165,7 @@ class Prior:
     proposals: dict[str, Proposal] = field(default_factory=dict)
     critiques: dict[str, Critique] = field(default_factory=dict)
     finished: dict[tuple[str, str, int], dict[str, Any]] = field(default_factory=dict)
+    attempts: dict[str, int] = field(default_factory=dict)  # key -> highest attempt recorded
     verification: list[tuple[EvidenceItem, bytes]] = field(default_factory=list)
     adjudications: dict[tuple[str, int], tuple[Adjudication, Adjudication]] = field(
         default_factory=dict
@@ -174,74 +175,100 @@ class Prior:
     requests_executed: dict[str, str] = field(default_factory=dict)  # request_key -> evidence_id
 
 
+def _abandoned_payload(
+    key3: tuple[str, str, str], attempt: int, pgid: int | None, started: Mapping[str, Any]
+) -> dict[str, Any]:
+    stage, worker_id, idem = key3
+    return {
+        "stage": stage,
+        "worker_id": worker_id,
+        "idempotency_key": idem,
+        "attempt": attempt,
+        "pgid": pgid,
+        "role": started.get("role"),
+    }
+
+
 def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> Prior:
     """Rebuild the prior state of a run being resumed. Writes
     ``invocation.abandoned`` + a pessimistic ``cost`` for every attempt that
-    started and never finished. Never trusts a blob that does not re-hash."""
+    started and never finished. Never trusts a blob that does not re-hash.
+    ``Prior.attempts`` carries the highest attempt number recorded per
+    idempotency key so the driver keeps numbering monotonically."""
     prior = Prior()
     intact = writer.blob_intact
-    # stage.started / stage.finished pairing by (stage, worker, key)
+    # ONE ordered walk. Per (stage, worker, key) it tracks which attempt is in
+    # flight and which attempt numbers the ledger already RECORDS, so that:
+    #  * numbering is monotonic across resumes (every recorded attempt counts,
+    #    finished, abandoned and interrupted alike);
+    #  * a crashed attempt is abandoned exactly once, however often the run is
+    #    resumed (the record it wrote covers it on the next walk).
     open_stages: dict[tuple[str, str, str], dict[str, Any]] = {}
     spawned: dict[str, int] = {}
-    # (stage, worker, key) -> the attempt a SIGINT closed, kept only while it is
-    # still the LAST word on that stage: a later stage.started means a new attempt
-    # began (and may itself have crashed), so the closure no longer covers it.
-    closed_by_sigint: dict[tuple[str, str, str], int] = {}
+    recorded: dict[str, set[int]] = {}  # key -> every attempt number on the ledger
+    inflight: dict[tuple[str, str, str], int] = {}  # started, no record yet
+    abandoned_inflight: dict[tuple[str, str, str], int] = {}  # covered by an abandoned record
+
+    def key3_of(p: Mapping[str, Any]) -> tuple[str, str, str]:
+        return (str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))
+
+    def note(key3: tuple[str, str, str], idem: str, attempt: int, *, abandoned: bool) -> None:
+        recorded.setdefault(idem, set()).add(attempt)
+        if inflight.get(key3) == attempt:
+            del inflight[key3]
+            if abandoned:
+                abandoned_inflight[key3] = attempt
+
     for ev in view.events:
         p = ev.payload
-        if ev.kind == "stage.interrupted":
-            # SIGINT already recorded that attempt (invocation.finished + cost):
-            # the stage stays OPEN (it re-runs) but no abandoned attempt is invented
-            closed_by_sigint[(str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))] = (
-                int(p["attempt"])
-            )
-        elif ev.kind == "stage.started":
-            key3 = (str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))
+        idem = str(p.get("idempotency_key"))
+        if ev.kind == "stage.started":
+            key3 = key3_of(p)
             open_stages[key3] = p
-            closed_by_sigint.pop(key3, None)  # a NEW attempt started after the interruption
+            # the driver numbers its first attempt after the highest on record
+            inflight[key3] = max(recorded.get(idem, {0})) + 1
+            abandoned_inflight.pop(key3, None)
+        elif ev.kind == "retry.scheduled":
+            for k3 in [k for k in inflight | abandoned_inflight if k[2] == idem]:
+                inflight[k3] = int(p["attempt"])  # the next attempt is announced
+                abandoned_inflight.pop(k3, None)
         elif ev.kind == "invocation.spawned":
-            spawned[str(p.get("idempotency_key"))] = int(p["pgid"])
+            spawned[idem] = int(p["pgid"])
+        elif ev.kind in ("invocation.finished", "stage.interrupted", "invocation.abandoned"):
+            attempt = int(p.get("attempt", 0))
+            recorded.setdefault(idem, set()).add(attempt)
+            for k3 in [k for k in inflight if k[2] == idem and inflight[k] == attempt]:
+                note(k3, idem, attempt, abandoned=ev.kind == "invocation.abandoned")
         elif ev.kind == "stage.finished":
-            key = (str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))
-            open_stages.pop(key, None)
-            closed_by_sigint.pop(key, None)
+            key3 = key3_of(p)
+            open_stages.pop(key3, None)
+            inflight.pop(key3, None)
+            abandoned_inflight.pop(key3, None)
             blobs = [str(b) for b in p.get("blobs", [])]
             if all(intact(b) for b in blobs):
-                prior.finished[(key[0], key[1], int(p.get("iteration", 0)))] = p
-    attempts: dict[str, int] = {}
-    for inv in view.payloads("invocation.finished"):
-        k = str(inv.get("idempotency_key"))
-        attempts[k] = max(attempts.get(k, 0), int(inv.get("attempt", 0)))
-    already = {
-        (str(a.get("idempotency_key")), int(a.get("attempt", 0)))
-        for a in view.payloads("invocation.abandoned")
-    }
-    for (stage, worker_id, idem), started in open_stages.items():
+                prior.finished[(key3[0], key3[1], int(p.get("iteration", 0)))] = p
+    for key3, started in open_stages.items():
+        idem = key3[2]
         pgid = spawned.get(idem)
-        attempt = attempts.get(idem, 0) + 1
-        payload = {
-            "stage": stage,
-            "worker_id": worker_id,
-            "idempotency_key": idem,
-            "attempt": attempt,
-            "pgid": pgid,
-            "role": started.get("role"),
-        }
         if pgid is not None:
             prior.stale_pgids.append(pgid)
-        if closed_by_sigint.get((stage, worker_id, idem)) == attempts.get(idem, 0):
-            # exactly THAT attempt was closed by the SIGINT path and its cost is
-            # already on the ledger; a later attempt (bigger number) is not covered
+        pending = inflight.get(key3)
+        if pending is None:
+            # nothing is in flight: either a SIGINT closed the attempt (its
+            # cost is already on the ledger) or a previous resume abandoned it
+            covered = abandoned_inflight.get(key3)
+            if covered is not None:
+                prior.abandoned.append(
+                    _abandoned_payload(key3, covered, pgid, started)
+                )  # recorded once, never twice
             continue
-        if (idem, attempt) in already:
-            prior.abandoned.append(payload)  # a repeated resume: recorded once, never twice
-            continue
+        payload = _abandoned_payload(key3, pending, pgid, started)
         writer.append("invocation.abandoned", payload)
         writer.append(
             "cost",
             CostRecord(
-                invocation_id=f"inv-{idem[:16]}-a{attempt}",
-                attempt=attempt,
+                invocation_id=f"inv-{idem[:16]}-a{pending}",
+                attempt=pending,
                 cost_usd=per_call_usd,
                 usage=None,
                 counted=True,
@@ -250,6 +277,9 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
             ),
         )
         prior.abandoned.append(payload)
+        recorded.setdefault(idem, set()).add(pending)
+    # what the retry driver continues from: never 1 again on a resume
+    prior.attempts = {k: max(v) for k, v in recorded.items() if v}
     # the pack
     packs = view.records("pack.built", EvidencePack)
     items = view.records("evidence.item", EvidenceItem)

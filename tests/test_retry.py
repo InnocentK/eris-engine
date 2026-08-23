@@ -608,55 +608,103 @@ def test_stop_during_the_backoff_sleep_cancels_the_retry_spawn(tmp_path: Path) -
     w.close()
 
 
-def test_worst_case_call_reservation_matches_what_the_driver_can_reserve(tmp_path: Path) -> None:
-    """cond 12: the pessimistic per-call reservation used for corrupt cell
-    ledgers is exactly what the driver can actually reserve when no cost is
-    ever reported - for a timeout chain (2 attempts x 2) and for a transient
-    chain (4 attempts x 1) alike."""
+def test_worst_case_call_reservation_equals_the_brute_forced_maximum(tmp_path: Path) -> None:
+    """cond 12 + final item 5: the pessimistic per-call reservation used for a
+    corrupt cell ledger is the maximum over EVERY class sequence the driver can
+    actually produce - brute-forced here, not a hand-picked chain. A pure
+    timeout chain (2 x 2) and a pure transient chain (4 x 1) both reserve 4x,
+    but the attainable MIXED chain timeout -> transient -> timeout reserves 5x,
+    and the helper must not be below it."""
+    import itertools
+
     from eris.retry import worst_case_call_reservation
 
     per_call = 0.5
-    assert worst_case_call_reservation(per_call) == pytest.approx(4 * per_call)
+    classes = {
+        "malformed": lambda: _absent_like(WorkerStatus.OK, None, idempotency_key="c" * 64),
+        "timeout": lambda: _absent_like(
+            WorkerStatus.TIMEOUT, "timed out after 1s", idempotency_key="c" * 64
+        ),
+        "transient": lambda: _absent_like(
+            WorkerStatus.FAILED, "spawn failed: denied", idempotency_key="c" * 64
+        ),
+    }
 
-    # a call that only ever times out: weight 2 each, budget 3 -> 2 attempts, 2x each
-    w = _writer(tmp_path, "timeouts")
-    runner, call = _runner(tmp_path, [None, None, None, None])
-    budget = BudgetLedger(per_call_usd=per_call, run_ceiling_usd=1000.0)
+    class ScriptedRunner:
+        def __init__(self, names: tuple[str, ...]) -> None:
+            self.names = names
+            self.i = 0
+
+        def __call__(self, call: WorkerCall) -> WorkerResult:
+            name = self.names[min(self.i, len(self.names) - 1)]
+            self.i += 1
+            return classes[name]()
+
+    _spy, call = _runner(tmp_path, [])
+    observed: dict[tuple[str, ...], float] = {}
+    # 5 = more attempts than the weight budget can ever allow, so no sequence is
+    # cut short by the script running out
+    for n, names in enumerate(itertools.product(sorted(classes), repeat=5)):
+        w = RunWriter(
+            tmp_path / "runs" / f"brute-{n}", Redactor(), run_id="brute", fsync=lambda _fd: None
+        ).open()
+        budget = BudgetLedger(per_call_usd=per_call, run_ceiling_usd=1_000_000.0)
+        out = run_with_retry(
+            call,
+            writer=w,
+            budget=budget,
+            stop_check=lambda: False,
+            sleep=lambda _s: None,
+            runner=ScriptedRunner(names),
+            output_check=lambda r: "malformed" if r.status is WorkerStatus.OK else None,
+        )
+        w.close()
+        assert budget.spent_known_usd == 0.0  # no cost is ever reported
+        observed[names[: len(out.attempts)]] = budget.reserved_usd
+
+    worst = max(observed.values())
+    assert worst_case_call_reservation(per_call) == pytest.approx(worst)
+    assert worst == pytest.approx(5 * per_call)  # the mixed chain, not 4x
+    assert observed[("timeout", "transient", "timeout")] == pytest.approx(worst)
+    assert observed[("timeout", "timeout")] == pytest.approx(4 * per_call)  # pure timeout chain
+    assert observed[("transient",) * 4] == pytest.approx(4 * per_call)  # pure transient chain
+    # and it IS an upper bound: no producible sequence reserves more
+    assert all(v <= worst_case_call_reservation(per_call) + 1e-9 for v in observed.values())
+
+
+def test_the_driver_continues_attempt_numbering_from_the_ledger(tmp_path: Path) -> None:
+    """Final item 3: on a resume the driver starts at the ledger's next attempt
+    number, so invocation ids stay unique and attempts stay monotonic. The
+    backoff schedule still counts tries within THIS driver run."""
+    w = _writer(tmp_path, "resumed")
+    runner, call = _runner(tmp_path, [None, grok_ok('{"ok": true}')])
+    slept: list[float] = []
     out = run_with_retry(
         call,
         writer=w,
-        budget=budget,
+        budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=10.0),
         stop_check=lambda: False,
-        sleep=lambda _s: None,
+        sleep=slept.append,
         runner=runner,
+        first_attempt=3,
     )
     w.close()
-    assert len(out.attempts) == 2 and budget.spent_known_usd == 0.0
-    assert budget.reserved_usd == pytest.approx(worst_case_call_reservation(per_call))
-
-    # a call that only fails transiently: weight 1 each, budget 3 -> 4 attempts, 1x each
-    w2 = _writer(tmp_path, "transient")
-    spawn_failed = _absent_like(
-        WorkerStatus.FAILED, "spawn failed: denied", idempotency_key="d" * 64
-    )
-    runner2 = WorkerRunnerSpy([])
-    runner2.__call__ = None  # type: ignore[method-assign]
-
-    class TransientSpy(WorkerRunnerSpy):
-        def __call__(self, call: WorkerCall) -> WorkerResult:
-            self.calls.append(call)
-            return spawn_failed
-
-    runner2 = TransientSpy([])
-    budget2 = BudgetLedger(per_call_usd=per_call, run_ceiling_usd=1000.0)
-    out2 = run_with_retry(
-        call,
-        writer=w2,
-        budget=budget2,
-        stop_check=lambda: False,
-        sleep=lambda _s: None,
-        runner=runner2,
-    )
-    w2.close()
-    assert len(out2.attempts) == 4 and budget2.spent_known_usd == 0.0
-    assert budget2.reserved_usd == pytest.approx(worst_case_call_reservation(per_call))
+    assert [a.invocation.attempt for a in out.attempts] == [3, 4]
+    assert [a.retry.attempt for a in out.attempts] == [3, 4]
+    assert out.attempts[0].invocation.invocation_id.endswith("-a3")
+    assert out.attempts[1].invocation.invocation_id.endswith("-a4")
+    assert slept == [30.0] and out.attempts[0].retry.backoff_s == 30.0  # tries, not 3 x 30
+    scheduled = [e for e in _events(w) if e["kind"] == "retry.scheduled"]
+    assert [e["payload"]["attempt"] for e in scheduled] == [4]
+    bad = _writer(tmp_path, "bad")
+    with pytest.raises(ValueError, match="first_attempt"):
+        run_with_retry(
+            call,
+            writer=bad,
+            budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=10.0),
+            stop_check=lambda: False,
+            sleep=slept.append,
+            runner=runner,
+            first_attempt=0,
+        )
+    bad.close()

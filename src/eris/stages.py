@@ -626,6 +626,9 @@ class StageContext:
     cache: Cache | None = None
     campaign_id: str | None = None
     ts: Callable[[], str] = now_ts
+    # idempotency key -> highest attempt number already on the ledger (from a
+    # resumed run): the driver continues the numbering instead of restarting
+    prior_attempts: dict[str, int] = field(default_factory=dict)
     pending_cache: list[PendingCacheEntry] = field(default_factory=list)
     pack_items: list[PackItem] = field(default_factory=list)
     verification: list[tuple[EvidenceItem, bytes]] = field(default_factory=list)
@@ -777,7 +780,9 @@ def invoke(
         runner=ctx.runner,
         clock=ctx.ts,
         output_check=output_check,
+        first_attempt=ctx.prior_attempts.get(key, 0) + 1,  # monotonic across resumes
     )
+    ctx.prior_attempts[key] = outcome.final.retry.attempt
     final = outcome.final
     if outcome.ok:
         parsed, _ = parse_and_convert(role, final.result, convert, final.invocation.invocation_id)

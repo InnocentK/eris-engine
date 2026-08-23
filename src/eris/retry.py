@@ -116,6 +116,11 @@ _COMPILED: tuple[tuple[ErrorPattern, re.Pattern[str]], ...] = tuple(
 RETRYABLE: frozenset[ErrorClass] = frozenset(
     {ErrorClass.TIMEOUT, ErrorClass.TRANSIENT_IO, ErrorClass.MALFORMED_OUTPUT}
 )
+# The classes an attempt can have when the worst-case reservation is walked -
+# DERIVED from RETRYABLE, so a new retryable class is covered automatically. A
+# terminal class only ends the chain: it never reserves more than the
+# retryable class of the same reservation factor already does.
+_WORST_CASE_CLASSES: tuple[ErrorClass, ...] = tuple(sorted(RETRYABLE, key=lambda e: e.value))
 # INTERRUPTED is never produced by `classify`: only the harness's SIGINT path
 # records it, and it is terminal (the run is over; `--resume` continues it).
 WEIGHT: dict[ErrorClass, int] = {ErrorClass.TIMEOUT: 2}
@@ -276,18 +281,40 @@ class BudgetLedger:
 # --------------------------------------------------------------------------- retry weight budget
 
 
+def _reservation_factor(cls: Classification) -> int:
+    """What one attempt of this class reserves, in units of ``per_call_usd``,
+    when the worker reports no cost (:meth:`BudgetLedger.record`)."""
+    return TIMEOUT_RESERVATION_FACTOR if cls.error_class is ErrorClass.TIMEOUT else 1
+
+
+def _worst_case_units(state: RetryState) -> int:
+    """The most units the REMAINING attempts of one call can reserve, given
+    the retry budget already used. At least one attempt happens; it may be of
+    any class, and the walk continues only where the driver would really
+    retry (:meth:`RetryState.may_retry`), so the value is the maximum over
+    the class sequences the driver can actually produce - a MIXED chain
+    included (timeout -> transient -> timeout costs more than either pure
+    chain)."""
+    best = 0
+    for error_class in _WORST_CASE_CLASSES:
+        cls = _cls(error_class, "worst case")
+        units = _reservation_factor(cls)
+        if state.may_retry(cls) is None:
+            nxt = RetryState(state.weight_used, state.malformed_retries)
+            nxt.charge(cls)
+            units += _worst_case_units(nxt)
+        best = max(best, units)
+    return best
+
+
 def worst_case_call_reservation(per_call_usd: float) -> float:
-    """The most a SINGLE call can reserve when its cost is never reported:
-    attempts x the per-attempt reservation factor, maximised over the retry
-    classes. Derived from the real constants so it tracks any change to them
-    (weight 1: ``1 + RETRY_WEIGHT_MAX`` attempts at 1x; timeout weight 2:
-    ``1 + RETRY_WEIGHT_MAX // 2`` attempts at ``TIMEOUT_RESERVATION_FACTOR``).
-    Used to reserve pessimistically for a cell whose ledger cannot be read."""
-    worst = 0.0
-    for weight, factor in ((1, 1), (2, TIMEOUT_RESERVATION_FACTOR)):
-        attempts = 1 + RETRY_WEIGHT_MAX // weight
-        worst = max(worst, attempts * factor * per_call_usd)
-    return worst
+    """The most a SINGLE call can reserve when its cost is never reported.
+
+    Walked over the real retry budget and the real per-class reservation
+    factors rather than guessed in closed form, so it tracks any change to
+    the constants AND covers mixed chains. Used to reserve pessimistically
+    for a cell whose ledger cannot be read."""
+    return _worst_case_units(RetryState()) * per_call_usd
 
 
 @dataclass
@@ -369,19 +396,30 @@ def run_with_retry(
     runner: WorkerRunner = run_worker,
     clock: Callable[[], str] = now_ts,
     output_check: Callable[[WorkerResult], str | None] | None = None,
+    first_attempt: int = 1,
 ) -> RetryOutcome:
     """Drive attempts of ONE call until success, a terminal class, the retry
     weight budget, STOP, or the money pre-check ends it. Never raises on
     worker behaviour; writer errors propagate. ``output_check`` (the stage's
     wire-model parse) turns an OK result into ``malformed_output`` when it
-    returns a rejection reason: retried with the IDENTICAL prompt, cap 2."""
+    returns a rejection reason: retried with the IDENTICAL prompt, cap 2.
+
+    ``first_attempt`` is the number of THIS driver's first attempt: on a
+    resume the caller passes the ledger's highest recorded attempt + 1, so
+    attempt numbers (and the invocation ids derived from them) stay monotonic
+    across resumes instead of restarting at 1. The backoff schedule is
+    unaffected - it counts tries within this driver run."""
+    if first_attempt < 1:
+        raise ValueError("first_attempt must be >= 1")
     state = RetryState()
     attempts: list[AttemptRecord] = []
     schema_requested = call.schema is not None
     prompt_sha = sha256_hex(call.prompt.encode("utf-8"))
-    attempt = 0
+    attempt = first_attempt - 1
+    tries = 0  # attempts made by THIS driver run: the backoff index
     while True:
         attempt += 1
+        tries += 1
         # money pre-check before EVERY spawn (F4): nothing is spawned on a trip
         reason = budget.precheck()
         if reason is not None:
@@ -410,6 +448,7 @@ def run_with_retry(
                 state,
                 RetryDecision.STOP,
                 reason,
+                0.0,
             )
             attempts.append(rec)
             return RetryOutcome(attempts)
@@ -436,6 +475,7 @@ def run_with_retry(
             reason = f"retry {cls.error_class.value}: {cls.reason}"
         else:
             reason = f"{why_not} ({cls.reason})"
+        delay = backoff_s(cls.error_class, tries)
         rec = _record_attempt(
             writer,
             call,
@@ -449,11 +489,11 @@ def run_with_retry(
             state,
             decision,
             reason,
+            delay,
         )
         attempts.append(rec)
         if decision is RetryDecision.STOP:
             return RetryOutcome(attempts, stopped=stopped)
-        delay = backoff_s(cls.error_class, attempt)
         writer.append(
             "retry.scheduled",
             {
@@ -490,6 +530,7 @@ def _record_attempt(
     state: RetryState,
     decision: RetryDecision,
     reason: str,
+    backoff: float,
 ) -> AttemptRecord:
     blobs: dict[str, BlobRef] = {}
     if result.stdout:
@@ -565,7 +606,7 @@ def _record_attempt(
         reason=reason,
         weight=cls.weight,
         budget_used_after=state.weight_used,
-        backoff_s=backoff_s(cls.error_class, attempt) if decision is RetryDecision.RETRY else 0.0,
+        backoff_s=backoff if decision is RetryDecision.RETRY else 0.0,
         decision=decision,
     )
     writer.append("retry.attempt", retry)

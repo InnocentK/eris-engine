@@ -18,6 +18,7 @@ from eris.arms import (
     MAX_ITERATIONS,
     ArmStopped,
     CellSpec,
+    Prior,
     ResumeRefused,
     finish_arm,
     kill_stale_groups,
@@ -667,6 +668,116 @@ def test_planned_worker_calls_counts_every_judge_iteration() -> None:
     assert planned_worker_calls(spec(Arm.INDEP_VERIFY_CRITIQUE)) == 2 + 1 + 1  # + critics
     # and it really is what the arm can spend: the iterating judge ran 3 times
     assert MAX_ITERATIONS == 3
+
+
+def test_attempt_numbers_stay_monotonic_across_sigint_closures_and_crashes(
+    tmp_path: Path,
+) -> None:
+    """Final item 3: the next attempt number is derived from EVERY recorded
+    attempt (finished, abandoned, interrupted), never from the finished ones
+    alone. Two SIGINT closures followed by two crashed resumes produce four
+    DISTINCT attempt numbers, and the second crash is not swallowed as a
+    repeat of the first closure's number."""
+    from eris.launch import invocation_id_for
+    from eris.redact import Redactor
+    from eris.schemas import CostRecord, Invocation, Transport, WorkerStatus
+    from eris.writer import RunWriter
+
+    key = "f" * 64
+    run_dir = tmp_path / "runs" / "mono"
+    started = {"stage": "propose", "worker_id": "grok", "idempotency_key": key, "role": "proposer"}
+
+    def invocation(attempt: int) -> Invocation:
+        ts = "2026-08-23T10:00:00Z"
+        return Invocation(
+            invocation_id=invocation_id_for(key, attempt),
+            task_id="t_01",
+            worker_id="grok",
+            provider="xai",
+            transport=Transport.CLI,
+            model_requested="grok-4.6",
+            model_executed=None,
+            stage=Stage.PROPOSE,
+            repeat_index=0,
+            attempt=attempt,
+            idempotency_key=key,
+            argv=[],
+            env_names=[],
+            cwd="/s",
+            executable_sha256=None,
+            cli_version=None,
+            started_at=ts,
+            finished_at=ts,
+            duration_ms=None,
+            exit_code=None,
+            timed_out=False,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            status=WorkerStatus.FAILED,
+            error="interrupted",
+            usage=None,
+            cost_usd=None,
+            stdout_sha256=None,
+            stderr_sha256=None,
+        )
+
+    def sigint_closure(w: RunWriter, attempt: int, pgid: int) -> None:
+        w.append("stage.started", started)
+        w.append("invocation.spawned", {"idempotency_key": key, "pgid": pgid})
+        w.append("invocation.finished", invocation(attempt))
+        w.append(
+            "cost",
+            CostRecord(
+                invocation_id=invocation_id_for(key, attempt),
+                attempt=attempt,
+                cost_usd=0.5,
+                counted=True,
+                estimated=True,
+                cost_known=False,
+            ),
+        )
+        w.append("stage.interrupted", {**started, "attempt": attempt})
+
+    def resume(run_id: str) -> tuple[RunWriter, Prior]:
+        w = RunWriter(run_dir, Redactor(), run_id=run_id, resume=True).open()
+        return w, load_prior(LedgerView.from_path(w.events_path), w, per_call_usd=0.5)
+
+    w1 = RunWriter(run_dir, Redactor(), run_id="mono").open()
+    sigint_closure(w1, 1, 4242)  # first SIGINT: attempt 1 closed
+    w1.close()
+
+    w2, prior2 = resume("mono")
+    assert prior2.abandoned == [] and prior2.attempts == {key: 1}
+    sigint_closure(w2, 2, 4243)  # second SIGINT: attempt 2 closed
+    w2.close()
+
+    w3, prior3 = resume("mono")
+    assert prior3.abandoned == [] and prior3.attempts == {key: 2}
+    w3.append("stage.started", started)  # attempt 3 spawns and the harness dies
+    w3.append("invocation.spawned", {"idempotency_key": key, "pgid": 5150})
+    w3.close()
+
+    w4, prior4 = resume("mono")
+    assert [a["attempt"] for a in prior4.abandoned] == [3] and prior4.attempts == {key: 3}
+    w4.append("stage.started", started)  # attempt 4 spawns and the harness dies again
+    w4.append("invocation.spawned", {"idempotency_key": key, "pgid": 5151})
+    w4.close()
+
+    w5, prior5 = resume("mono")
+    # the SECOND crash is its own attempt, not a repeat of the first one
+    assert [a["attempt"] for a in prior5.abandoned] == [4] and prior5.attempts == {key: 4}
+    view = LedgerView.from_path(w5.events_path)
+    abandoned = view.payloads("invocation.abandoned")
+    assert [a["attempt"] for a in abandoned] == [3, 4]
+    assert [a["pgid"] for a in abandoned] == [5150, 5151]
+    numbers = sorted(
+        {int(p["attempt"]) for p in view.payloads("invocation.finished")}
+        | {int(p["attempt"]) for p in abandoned}
+    )
+    assert numbers == [1, 2, 3, 4]  # four DISTINCT attempts on one ledger
+    ids = [str(p["invocation_id"]) for p in view.payloads("cost")]
+    assert len(set(ids)) == len(ids)  # and no two attempts share an invocation id
+    w5.close()
 
 
 def test_sigint_closure_covers_only_its_own_attempt(tmp_path: Path) -> None:
