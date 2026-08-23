@@ -26,6 +26,7 @@ from eris.launch import (
     LaunchRefused,
     PopenFactory,
     WorkerCall,
+    invocation_id_for,
     make_private_dir,
     plan_call,
     run_worker,
@@ -193,7 +194,7 @@ def cmd_invoke(
         stderr_ref = writer.put_blob(result.stderr) if result.stderr else None
         output_ref = writer.put_blob(result.output_file) if result.output_file else None
         invocation = Invocation(
-            invocation_id=f"inv-{result.idempotency_key[:16]}",
+            invocation_id=invocation_id_for(result.idempotency_key, 1),
             task_id=args.task_id,
             worker_id=args.worker,
             provider=result.provider,

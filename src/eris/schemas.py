@@ -124,7 +124,9 @@ class Transport(StrEnum):
 class Stage(StrEnum):
     PROPOSE = "propose"
     CRITIQUE = "critique"
+    VERIFY = "verify"  # F6: mechanical verification of evidence requests
     ADJUDICATE = "adjudicate"
+    SUMMARIZE = "summarize"  # F6: the consensus arm's summarizer (judge worker, no tools)
 
 
 class WorkerStatus(StrEnum):

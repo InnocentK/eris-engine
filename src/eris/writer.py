@@ -103,6 +103,7 @@ class RunWriter:
         self._finalized = False
         self.torn_tail_truncated = False
         self.resumed_from_seq: int | None = None
+        self.corrupt_blobs: list[str] = []  # names that did not re-hash on resume (F5)
 
     # ------------------------------------------------------------------ paths
 
@@ -201,13 +202,31 @@ class RunWriter:
         self._seq = len(keep)
         self._prev_sha = sha256_hex(keep[-1].rstrip(b"\n")) if keep else None
         self.resumed_from_seq = self._seq
-        for blob_path in self.blobs_dir.glob("*"):
+        for blob_path in sorted(self.blobs_dir.glob("*")):
             if blob_path.name.startswith("."):
                 blob_path.unlink()  # abandoned temp file from a crashed put_blob
-            else:
-                self._blobs[blob_path.name] = BlobRef(
-                    blob_path.name, blob_path.stat().st_size, {}, blob_path
-                )
+                continue
+            # F5: index by CONTENT, never by name alone. A blob whose bytes do
+            # not hash to its name is corrupt (or planted): it is not indexed,
+            # so a later put_blob rewrites it, and it is reported so the
+            # harness treats any stage that referenced it as NOT finished.
+            if blob_path.is_symlink() or not blob_path.is_file():
+                self.corrupt_blobs.append(blob_path.name)
+                continue
+            data = blob_path.read_bytes()
+            if sha256_hex(data) != blob_path.name:
+                self.corrupt_blobs.append(blob_path.name)
+                continue
+            self._blobs[blob_path.name] = BlobRef(blob_path.name, len(data), {}, blob_path)
+
+    def blob_intact(self, sha256: str) -> bool:
+        """True iff a blob named ``sha256`` exists, is a regular file (not a
+        symlink) and its bytes hash to its name. Used by resume to decide
+        whether a ``stage.finished`` can be trusted (F5)."""
+        path = self.blobs_dir / sha256
+        if path.is_symlink() or not path.is_file():
+            return False
+        return sha256_hex(path.read_bytes()) == sha256
 
     @staticmethod
     def _describe(findings: list[Finding]) -> str:

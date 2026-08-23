@@ -301,3 +301,33 @@ def test_writer_error_hierarchy() -> None:
     assert issubclass(LedgerInvalid, WriterError)
     assert issubclass(RunExists, WriterError)
     assert issubclass(WriterClosed, WriterError)
+
+
+# --------------------------------------------------------------------------- F5: blobs re-hash on resume
+
+
+def test_resume_rehashes_blobs_and_refuses_a_tampered_or_symlinked_one(tmp_path: Path) -> None:
+    """Blobs are indexed by CONTENT on resume: a file whose bytes no longer
+    hash to its name, or a symlink planted under the blob name, is reported in
+    ``corrupt_blobs`` and NOT indexed (so a fresh put_blob rewrites it);
+    ``blob_intact`` answers the same question per referenced sha."""
+    w = make_writer(tmp_path).open()
+    good = w.put_blob(b"good bytes")
+    bad = w.put_blob(b"bad bytes")
+    linked = w.put_blob(b"linked bytes")
+    w.append("k", {})
+    w.close()
+    bad.path.write_bytes(b"TAMPERED")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(b"linked bytes")
+    linked.path.unlink()
+    linked.path.symlink_to(elsewhere)
+    r = make_writer(tmp_path, resume=True).open()
+    assert sorted(r.corrupt_blobs) == sorted([bad.sha256, linked.sha256])
+    assert r.blob_intact(good.sha256) and not r.blob_intact(bad.sha256)
+    assert not r.blob_intact(linked.sha256) and not r.blob_intact("0" * 64)
+    # the tampered blob is rewritten by a fresh put_blob of the same content
+    assert r.put_blob(b"bad bytes").sha256 == bad.sha256
+    assert bad.path.read_bytes() == b"bad bytes" and r.blob_intact(bad.sha256)
+    assert r.put_blob(b"good bytes").sha256 == good.sha256  # indexed, not rewritten
+    r.close()

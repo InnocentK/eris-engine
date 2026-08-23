@@ -1,0 +1,1 @@
+{"type":"error","message":"Internal error: {\n  \"message\": \"API error (status 403 Forbidden): permission-denied: Content violates usage guidelines. Failed check: SAFETY_CHECK_TYPE_BIO\",\n  \"http_status\": 403\n}"}

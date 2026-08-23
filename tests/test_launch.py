@@ -30,6 +30,7 @@ from eris.launch import (
     build_argv_grok,
     build_env,
     idempotency_key,
+    invocation_id_for,
     parse_agy,
     parse_claude,
     parse_codex,
@@ -1603,3 +1604,100 @@ def test_run_worker_codex_scratch_removed_even_on_spawn_failure(tmp_path: Path) 
     )
     assert res.status is WorkerStatus.FAILED
     assert [p for p in scratch.rglob("*") if p.is_file()] == []
+
+
+# --------------------------------------------------------------------------- M2b defect fixes
+
+
+def test_parse_claude_budget_tripped_fixture_keeps_usage_and_cost() -> None:
+    """F1 (T2 capture): the --max-budget-usd cap tripped with NO result key.
+    The envelope is an error, but the spend is real: cost_usd 0.129044 on a
+    $0.10 cap (the cap overshoots), usage retained, both model names kept,
+    and the message names the subtype and terminal_reason."""
+    env = parse_claude(fixture("claude", "2.1.239", "budget_tripped.json"))
+    assert env.is_error and env.text is None and env.structured is None
+    assert env.cost_usd == 0.129044
+    assert env.usage is not None and env.usage.output_tokens == 0
+    assert env.model_executed is None  # two models in modelUsage -> unknown, never guessed
+    assert set(env.models_used) == {"claude-haiku-4-5-20251001", "claude-fable-5"}
+    assert env.error == (
+        "claude: subtype='error_max_budget_usd' terminal_reason='budget_exhausted': "
+        "Reached maximum budget ($0.1)"
+    )
+
+
+def test_parse_claude_error_message_composition() -> None:
+    """`result` wins verbatim; otherwise subtype / terminal_reason / errors[]
+    compose the message; an envelope that says nothing is `is_error`."""
+    assert parse_claude(b'{"is_error":true,"result":"boom","subtype":"x"}').error == "boom"
+    assert parse_claude(b'{"is_error":true}').error == "is_error"
+    assert parse_claude(b'{"is_error":true,"subtype":"success"}').error == "is_error"
+    env = parse_claude(b'{"is_error":true,"subtype":"error_during_execution"}')
+    assert env.error == "claude: subtype='error_during_execution'"
+    env = parse_claude(b'{"is_error":true,"terminal_reason":"api_error","errors":["a","b",3]}')
+    assert env.error == "claude: terminal_reason='api_error': a; b"
+    assert parse_claude(b'{"is_error":true,"errors":["only"]}').error == "claude: only"
+    # no usage object -> usage None (never a zero-filled guess)
+    assert parse_claude(b'{"is_error":true}').usage is None
+    assert parse_claude(b'{"is_error":true,"total_cost_usd":0.5}').cost_usd == 0.5
+
+
+def test_parse_codex_401_fixture_is_auth_error_without_usage() -> None:
+    """E2 capture: ten reconnect errors, then `turn.failed` whose `error` is an
+    object. The message is the 401, there is no usage and no text."""
+    env = parse_codex(fixture("codex", "0.147.0", "auth_401.jsonl"))
+    assert env.is_error and env.parse_mode == "jsonl"
+    assert env.error is not None
+    assert env.error.startswith("codex: unexpected status 401 Unauthorized")
+    assert "{'message'" not in env.error  # the dict is unwrapped, not repr'd
+    assert env.usage is None and env.text is None and env.structured is None
+    assert env.cost_usd is None and env.model_executed is None
+
+
+def test_parse_grok_api_error_fixture_surfaces_message() -> None:
+    """E17 capture: {type: error, message: ...} with no text key -> the API's
+    message is the error (a 403 content-policy refusal), not 'no text'."""
+    env = parse_grok(fixture("grok", "1.0.5", "api_error_403.json"))
+    assert env.is_error and env.text is None and env.usage is None
+    assert env.error is not None and env.error.startswith("grok: Internal error")
+    assert "403 Forbidden" in env.error and "permission-denied" in env.error
+    # other shapes without text keep the generic message
+    assert parse_grok(b'{"type":"error"}').error == "grok: envelope has no text"
+    assert parse_grok(b'{"stopReason":"stop"}').error == "grok: envelope has no text"
+
+
+def test_run_worker_ok_with_warning_keeps_status_ok(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """F3: a completed run that flags something (grok `cancelled`) is OK with
+    a WARNING; `error` stays None (reserved for non-OK statuses)."""
+    policy = make_policy(tmp_path)
+    res = run_worker(
+        make_call(tmp_path, policy),
+        popen=fake_process(stdout=fixture("grok", "1.0.5", "plan.json")),
+        killpg=lambda *_: None,
+    )
+    assert res.status is WorkerStatus.OK and res.error is None
+    assert res.warning == "grok: stopReason='cancelled'"
+    assert res.cost_usd == 0.031262 and res.text is not None
+    ok = run_worker(
+        make_call(tmp_path, policy), popen=fake_process(stdout=grok_ok()), killpg=lambda *_: None
+    )
+    assert ok.status is WorkerStatus.OK and ok.warning is None and ok.error is None
+    failed = run_worker(
+        make_call(tmp_path, policy),
+        popen=fake_process(stdout=fixture("grok", "1.0.5", "api_error_403.json")),
+        killpg=lambda *_: None,
+    )
+    assert failed.status is WorkerStatus.FAILED and failed.warning is None
+    assert failed.error is not None and "403" in failed.error
+
+
+def test_invocation_id_is_unique_per_attempt() -> None:
+    """F2: the idempotency key excludes the attempt, the invocation id must not."""
+    key = "f" * 64
+    ids = {invocation_id_for(key, n) for n in (1, 2, 3)}
+    assert ids == {"inv-ffffffffffffffff-a1", "inv-ffffffffffffffff-a2", "inv-ffffffffffffffff-a3"}
+    assert invocation_id_for("a" * 64, 1) != invocation_id_for("b" * 64, 1)
+    with pytest.raises(ValueError):
+        invocation_id_for(key, 0)

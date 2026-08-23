@@ -654,23 +654,62 @@ def _json_object(stdout: bytes, cli: str) -> tuple[dict[str, Any] | None, Envelo
     return data, None
 
 
+def _claude_error_message(data: dict[str, Any], result: Any) -> str:
+    """``result`` verbatim when claude gave one (``Not logged in …``);
+    otherwise ``claude: subtype=… terminal_reason=…: <errors joined>`` so the
+    retry classifier can see ``error_max_budget_usd`` / ``budget_exhausted``;
+    bare ``is_error`` when the envelope says nothing else."""
+    if result is not None:
+        return str(result)
+    parts: list[str] = []
+    subtype = data.get("subtype")
+    if isinstance(subtype, str) and subtype != "success":
+        parts.append(f"subtype={subtype!r}")
+    reason = data.get("terminal_reason")
+    if isinstance(reason, str) and reason:
+        parts.append(f"terminal_reason={reason!r}")
+    errors = data.get("errors")
+    messages = [e for e in errors if isinstance(e, str)] if isinstance(errors, list) else []
+    if not parts and not messages:
+        return "is_error"
+    text = "claude: " + " ".join(parts)
+    if messages:
+        text += (": " if parts else "") + "; ".join(messages)
+    return text
+
+
 def parse_claude(stdout: bytes) -> Envelope:
     """claude 2.1.239 ``--output-format json``. ``is_error`` is checked BEFORE
-    the shape so an auth failure is reported as the error it is."""
+    the shape so an auth failure is reported as the error it is; usage, cost
+    and model names are retained on error (F1)."""
     data, bad = _json_object(stdout, "claude")
     if data is None:
         assert bad is not None
         return bad
     result = data.get("result")
+    usage_raw = _dict(data.get("usage"))
+    details = _dict(usage_raw.get("output_tokens_details"))
+    usage = Usage(
+        input_tokens=_int_or_none(usage_raw.get("input_tokens")),
+        output_tokens=_int_or_none(usage_raw.get("output_tokens")),
+        cached_input_tokens=_int_or_none(usage_raw.get("cache_read_input_tokens")),
+        reasoning_tokens=_int_or_none(details.get("thinking_tokens")),
+    )
+    model, names = _pick_model(data.get("modelUsage"))
     if data.get("is_error") is True:
+        # F1: an error envelope still carries usage and cost (T2: the
+        # --max-budget-usd cap tripped at $0.129 on a $0.10 cap - the spend is
+        # real and must be recorded). The message comes from `result` when
+        # present, else from subtype / terminal_reason / errors[].
         return Envelope(
             None,
-            None,
-            None,
-            None,
+            model,
+            usage if usage_raw else None,
+            _float_or_none(data.get("total_cost_usd")),
             True,
-            str(result) if result is not None else "is_error",
+            _claude_error_message(data, result),
             "json",
+            models_used=names,
             raw=data,
         )
     if data.get("type") != "result" or not isinstance(result, str):
@@ -684,15 +723,6 @@ def parse_claude(stdout: bytes) -> Envelope:
             "json",
             raw=data,
         )
-    usage_raw = _dict(data.get("usage"))
-    details = _dict(usage_raw.get("output_tokens_details"))
-    usage = Usage(
-        input_tokens=_int_or_none(usage_raw.get("input_tokens")),
-        output_tokens=_int_or_none(usage_raw.get("output_tokens")),
-        cached_input_tokens=_int_or_none(usage_raw.get("cache_read_input_tokens")),
-        reasoning_tokens=_int_or_none(details.get("thinking_tokens")),
-    )
-    model, names = _pick_model(data.get("modelUsage"))
     structured = data.get("structured_output")
     if structured is None:
         structured = _structured_from_text(result)
@@ -763,7 +793,12 @@ def parse_codex(stdout: bytes) -> Envelope:
                 reasoning_tokens=_int_or_none(u.get("reasoning_output_tokens")),
             )
         elif kind in ("error", "turn.failed"):
-            error = f"codex: {ev.get('message') or ev.get('error') or kind}"
+            # `turn.failed` carries an OBJECT {message: ...} (E2 401 capture);
+            # `error` events carry a string `message`.
+            detail = ev.get("message") or ev.get("error") or kind
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail
+            error = f"codex: {detail}"
     if not completed and error is None:
         error = "codex: no turn.completed event"
     return Envelope(
@@ -789,6 +824,10 @@ def parse_grok(stdout: bytes) -> Envelope:
         return bad
     text = data.get("text")
     if not isinstance(text, str):
+        # E17: an API refusal is {type: error, message: ...} with no text key.
+        message = data.get("message")
+        if data.get("type") == "error" and isinstance(message, str) and message:
+            return Envelope(None, None, None, None, True, f"grok: {message}", "json", raw=data)
         return Envelope(
             None, None, None, None, True, "grok: envelope has no text", "json", raw=data
         )
@@ -1068,6 +1107,10 @@ class WorkerResult:
     cleanup_error: str | None = None  # scratch removal failed: a raw file MAY remain on disk
     conversation_id: str | None = None  # agy session handle (brain dir derivable at read time)
     worker_reported_duration_ms: int | None = None  # the worker's own figure; duration_ms is ours
+    # F3 "OK with error": the worker completed (status OK) but flagged something
+    # (grok `stopReason: cancelled`, a claude non-success subtype). The message
+    # lives here, never in `error`, which is reserved for non-OK statuses.
+    warning: str | None = None
 
 
 def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -> WorkerResult:
@@ -1259,6 +1302,7 @@ def _execute(
     if envelope.structured is None and output_file:
         envelope.structured = _structured_from_text(output_file.decode("utf-8", errors="replace"))
     error: str | None
+    warning: str | None = None
     if spawned.timed_out:
         status = WorkerStatus.TIMEOUT
         error = f"timed out after {w.timeout_s}s (killed with signal {spawned.killed_with})"
@@ -1273,7 +1317,8 @@ def _execute(
         error = f"exit code {spawned.exit_code}"
     else:
         status = WorkerStatus.OK
-        error = envelope.error
+        error = None
+        warning = envelope.error  # F3: "OK with error" is a warning, not a failure
     return WorkerResult(
         worker_id=call.worker_id,
         provider=w.provider,
@@ -1304,4 +1349,13 @@ def _execute(
         output_file_size=output_size,
         conversation_id=envelope.conversation_id,
         worker_reported_duration_ms=envelope.worker_reported_duration_ms,
+        warning=warning,
     )
+
+
+def invocation_id_for(idempotency_key: str, attempt: int) -> str:
+    """F2: unique per ATTEMPT - ``inv-<key[:16]>-a<attempt>``. Two attempts of
+    the same call share the key (it excludes the attempt) but never an id."""
+    if attempt < 1:
+        raise ValueError(f"attempt must be >= 1 (got {attempt})")
+    return f"inv-{idempotency_key[:16]}-a{attempt}"

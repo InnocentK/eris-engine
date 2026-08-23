@@ -274,3 +274,12 @@ def test_old_schema_versions_are_rejected_on_parse() -> None:
             Task.model_validate_json(raw)
     with pytest.raises(ValidationError):
         Task.model_validate({**example_records()["task"].model_dump(), "schema_version": "9.9.9"})
+
+
+def test_stage_has_verify_and_summarize() -> None:
+    """F6: the harness stages include mechanical verification and the
+    consensus summarizer; the values are stable strings."""
+    from eris.schemas import Stage
+
+    assert [s.value for s in Stage] == ["propose", "critique", "verify", "adjudicate", "summarize"]
+    assert Stage("verify") is Stage.VERIFY and Stage("summarize") is Stage.SUMMARIZE

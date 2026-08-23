@@ -158,6 +158,7 @@ def test_invoke_full_path_is_hermetic_and_redacted(
     assert inv["status"] == "ok" and inv["idempotency_key"] == json.loads(lines[0])["payload"].get(
         "idempotency_key", inv["idempotency_key"]
     )
+    assert inv["invocation_id"] == f"inv-{inv['idempotency_key'][:16]}-a1"  # F2: per attempt
     assert inv["env_names"] == sorted(inv["env_names"]) and "XAI_API_KEY" in inv["env_names"]
     # the worker saw the secret VALUE; the ledger never does
     assert factory.instances[0].popen_kwargs["env"]["XAI_API_KEY"] == PLANTED
