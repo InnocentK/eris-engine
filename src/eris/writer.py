@@ -87,8 +87,10 @@ class RunWriter:
         resume: bool = False,
         fsync: FsyncFn = os.fsync,
         clock: Callable[[], str] = now_ts,
+        on_event: Callable[[Event], None] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
+        self._on_event = on_event  # observer (stderr progress stream); never a second writer
         self.run_id = run_id or self.run_dir.name
         self._redactor = redactor
         self._fsync = fsync
@@ -306,6 +308,8 @@ class RunWriter:
         self._fsync(fh.fileno())
         self._seq += 1
         self._prev_sha = sha256_hex(line)
+        if self._on_event is not None:
+            self._on_event(event)
         return event
 
     # ------------------------------------------------------------------ finalize

@@ -549,6 +549,11 @@ def spawn(
         timed_out = True
         killed_with = _kill_group(proc, killpg, grace_s)
         exit_code = proc.poll()
+    except KeyboardInterrupt:
+        # Ctrl-C in the harness: the worker group is killed through the same
+        # path as a timeout, then the interrupt propagates (no handler here).
+        _kill_group(proc, killpg, grace_s)
+        raise
     out.join(timeout=grace_s + 5)
     err.join(timeout=grace_s + 5)
     for stream in (proc.stdout, proc.stderr):

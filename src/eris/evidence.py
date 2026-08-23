@@ -107,7 +107,8 @@ class Excerpt(BaseModel):
 
 class TaskSpec(BaseModel):
     """``task.json``: what the harness (and the workers) may see. The answer
-    key (``key.json``) is a different file the harness never opens."""
+    key (``key.json``) is a different file: the harness opens it ONLY to
+    derive contamination-scan patterns (hashed); it never reaches a prompt."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

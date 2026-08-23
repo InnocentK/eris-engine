@@ -133,6 +133,27 @@ New modules (Phase 1; each requirement has a named test)
   read-only validated ledger view + cost totals (spent vs attributed, by
   stage), shared with the scorer.
 
+* `eval/run.py` (step G): `run` (one cell: task × repeat × arm;
+  `--resume <run_id>`), `campaign` (every cell of a corpus under
+  `runs/<campaign_id>/`, task-major → repeat → arms in the fixed order,
+  `single` expanded per panel worker, its own writer/lock, `--dry-run`
+  prints the order, `--resume` skips finalized cells and resumes unfinished
+  ones, per-campaign budget base from the cell ledgers), `campaign status`
+  (read-only, no writer, no lock). Per cell: `run.started` (prompt file
+  hashes, containment, snapshot sha), sanitized copies for
+  `sanitize_snapshot` workers (removed in `finally`), verify scratch,
+  scan patterns from the sibling `key.json` (opened for this only),
+  `scan.result` before finalize, cache stores after the scan, `ArmRun`,
+  manifest extras (status, contaminated, scan_incomplete, stopped, spent
+  known/reserved). STOP files `runs/STOP` / `runs/<campaign>/STOP`. SIGINT
+  handler installed ONLY by `run`/`campaign`: the launcher kills the worker
+  group on the existing path, `invocation.finished` (failed, `interrupted`,
+  cost not known), `run.interrupted`, `cell.interrupted`, exit 130, run dir
+  left resumable (`invocation.spawned` carries the pgid). Exit codes
+  0/2/3/4/5/6/7/130. Stderr: one JSON line per stage event
+  (`RunWriter(on_event=…)` observer). `launch.spawn` kills the group on
+  `KeyboardInterrupt` before re-raising (cleanup, not a handler).
+
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
   the message from subtype/terminal_reason/errors (T2 capture: the
