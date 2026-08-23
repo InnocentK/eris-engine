@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.1 - schema 0.1.4 + advisor-round fixes (2026-08-23)
+
+Schema `SCHEMA_VERSION` 0.1.3 → **0.1.4** (new golden dir
+`tests/fixtures/records/0.1.4/`, MANIFEST block pinned; 0.1.0–0.1.3 untouched)
+* `EvidenceItem.violated` — set when the post-command tree hash of the
+  pristine verification copy differs from its pre-command hash, i.e. a
+  verification command modified the tree it ran in.
+
+Advisor-round fixes (Codex, block conditions 1-15; each with a test)
+* Downstream stages consume the REDACTED persisted records, so a fresh call
+  and a cache replay hand the next model byte-identical bytes.
+* Judge/summarizer run in an empty private directory, never the snapshot.
+* Verification runs on a pristine COPY; the original's tree hash is asserted
+  unchanged; `pytest` commands carry `-p no:cacheprovider`.
+* Nothing but `RunWriter` output lives under `runs/`; scratch, sanitized and
+  verification copies live under the policy `scratch_dir`, swept at startup.
+* STOP is re-checked after the retry backoff; resume is idempotent and waits
+  for a killed group; the executed-request dedupe set survives resume.
+* Cache paths are realpath-contained; the scan runs last; corrupt cell
+  ledgers are charged pessimistically; `key.json` spans must be ordered;
+  the scorer follows no symlinked cell directories.
+* `os.killpg` absence is resolved at call time; SIGINT records a
+  `RetryAttempt`; writer errors are never swallowed.
+
+The version bump rides with the schema bump per the INVARIANTS rule (a
+serialization change bumps `eris.version` in the same change).
+
 ## 0.3.0 - Milestone 2b: end-to-end harness (2026-08-23)
 
 Schema `SCHEMA_VERSION` 0.1.2 → **0.1.3** (new golden dir
