@@ -487,22 +487,113 @@ def test_evidence_requests_run_on_the_original_snapshot(tmp_path: Path) -> None:
     assert popen.calls[0][1]["cwd"] == str(original.resolve())
 
 
+def test_verification_guard_trips_on_a_changed_copy_and_stops_verification(
+    tmp_path: Path,
+) -> None:
+    """Item 4: a command that changes the verification copy is recorded
+    (snapshot.violated, item.violated) and every later command is refused."""
+    from eris.evidence import SnapshotGuard
+    from eris.sanitize import PRISTINE_PROFILE, sanitize_snapshot, tree_sha256
+
+    original = make_snapshot(tmp_path)
+    before = tree_sha256(original)
+    copy = tmp_path / "scratch" / "pristine"
+    sanitize_snapshot(original, copy, profile=PRISTINE_PROFILE, worker_id="verify")
+
+    class WritingPopen(ScriptedPopen):
+        def __call__(self, args: Any, **kw: Any) -> FakeProcess:
+            proc = super().__call__(args, **kw)
+            if "ls-files" in [os.fsdecode(a) for a in args]:
+                Path(kw["cwd"], "PLANTED").write_text("changed")  # a command that writes
+            return proc
+
+    popen = WritingPopen()
+    env = make_env(tmp_path, copy, popen, make_policy(tmp_path))
+    env.guard = SnapshotGuard.over(copy)
+    w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
+    items = execute_evidence_requests(
+        [
+            EvidenceRequest(argv=["git", "status", "--porcelain"]),
+            EvidenceRequest(argv=["git", "ls-files"]),
+            EvidenceRequest(argv=["git", "rev-parse", "HEAD"]),
+        ],
+        source="P1",
+        env=env,
+        writer=w,
+        state=RequestState(),
+        task_id="t_01",
+        stop_check=lambda: False,
+    )
+    w.close()
+    assert [i.violated for i in items] == [False, True]
+    assert "VIOLATED" in items[1].summary and env.violated
+    ev = events(w)
+    kinds = [e["kind"] for e in ev]
+    assert "snapshot.violated" in kinds
+    violated = next(e["payload"] for e in ev if e["kind"] == "snapshot.violated")
+    assert violated["tree_sha256_before"] != violated["tree_sha256_after"]
+    refused = [e["payload"] for e in ev if e["kind"] == "verify.refused"]
+    assert len(refused) == 1 and "verification is stopped" in refused[0]["reason"]
+    assert len(popen.calls) == 2  # the third command never spawned
+    assert tree_sha256(original) == before  # the ORIGINAL is untouched
+    assert all(kw["cwd"] == str(copy.resolve()) for _a, kw in popen.calls)
+
+
+def test_pytest_commands_carry_no_cacheprovider(tmp_path: Path) -> None:
+    """Item 4: every pytest invocation gets `-p no:cacheprovider` appended
+    (and re-checked by the allowlist)."""
+    pytest_exe = tmp_path / "bin" / "pytest"
+    pytest_exe.parent.mkdir(exist_ok=True)
+    pytest_exe.write_bytes(b"#!/bin/sh\n")
+    base = make_policy(tmp_path)
+    policy = Policy.model_validate(
+        {
+            **base.model_dump(mode="json"),
+            "trusted": True,
+            "verify": {
+                **base.verify.model_dump(mode="json"),
+                "commands": {
+                    **{k: v.model_dump(mode="json") for k, v in base.verify.commands.items()},
+                    "pytest": {
+                        "executable": str(pytest_exe),
+                        "executable_sha256": hashlib.sha256(pytest_exe.read_bytes()).hexdigest(),
+                        "requires_trusted": True,
+                        "literal_flags": ["-q"],
+                        "value_flags": {"-p": "^no:[A-Za-z0-9_]+$"},
+                        "positional": ["path"],
+                        "timeout_s": 5,
+                    },
+                },
+            },
+        }
+    )
+    snapshot = make_snapshot(tmp_path)
+    popen = ScriptedPopen()
+    env = make_env(tmp_path, snapshot, popen, policy)
+    out = env.run(["pytest", "-q"])
+    assert out.argv[1:] == ["-q", "-p", "no:cacheprovider"]
+    assert popen.calls[0][0][1:] == ["-q", "-p", "no:cacheprovider"]
+    out = env.run(["pytest", "-p", "no:cacheprovider", "-q"])
+    assert out.argv.count("no:cacheprovider") == 1
+
+
 def test_verify_scratch_is_private_removed_and_cleanup_failure_is_a_run_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
-    with verify_scratch(w) as home:
-        assert home == w.run_dir / "scratch" / "verify" and home.is_dir()
+    with verify_scratch(w, tmp_path / "scratch") as home:
+        assert home == tmp_path / "scratch" / "verify" and home.is_dir()
         (home / "x").write_text("tmp")
     assert not home.exists()
     # a planted symlink is refused (make_private_dir semantics)
-    (w.run_dir / "scratch" / "verify").symlink_to(tmp_path)
+    (tmp_path / "scratch").mkdir(exist_ok=True)
+    (tmp_path / "scratch" / "verify").symlink_to(tmp_path / "elsewhere")
     from eris.launch import LaunchRefused
 
     with pytest.raises(LaunchRefused):
-        with verify_scratch(w):
+        with verify_scratch(w, tmp_path / "scratch"):
             pass
-    (w.run_dir / "scratch" / "verify").unlink()
+    (tmp_path / "scratch" / "verify").unlink()
     real = shutil.rmtree
 
     def broken(path: object, *a: object, **k: object) -> None:
@@ -510,7 +601,7 @@ def test_verify_scratch_is_private_removed_and_cleanup_failure_is_a_run_error(
 
     monkeypatch.setattr(shutil, "rmtree", broken)
     with pytest.raises(EvidenceCleanupError):
-        with verify_scratch(w):
+        with verify_scratch(w, tmp_path / "scratch"):
             pass
     monkeypatch.setattr(shutil, "rmtree", real)
     ev = events(w)

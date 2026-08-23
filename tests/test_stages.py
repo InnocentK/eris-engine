@@ -64,8 +64,13 @@ def worker(cli: str, **kw: Any) -> WorkerPolicy:
     base: dict[str, Any] = {
         "transport": "cli",
         "cli": cli,
-        "provider": {"grok": "xai", "claude": "anthropic", "codex": "openai"}[cli],
-        "model": {"grok": "grok-4.6", "claude": None, "codex": "gpt-5.4"}[cli],
+        "provider": {"grok": "xai", "claude": "anthropic", "codex": "openai", "agy": "google"}[cli],
+        "model": {
+            "grok": "grok-4.6",
+            "claude": None,
+            "codex": "gpt-5.4",
+            "agy": "gemini-3.1-pro-high",
+        }[cli],
         "executable": f"/x/{cli}",
         "executable_sha256": PIN,
         "timeout_s": 60,
@@ -246,7 +251,7 @@ class World:
             budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=50.0),
             stop_check=lambda: False,
             sleep=lambda _s: None,
-            cwd_for=lambda _w: self.snapshot,
+            cwd_for=lambda _w, _r: self.snapshot,
             scratch_dir=tmp_path / "runs" / "r1" / "scratch",
             home=str(tmp_path / "home"),
             path_env="/usr/bin:/bin",
@@ -888,7 +893,7 @@ def test_build_call_uses_role_tools_and_sanitized_cwd(tmp_path: Path) -> None:
     )
     copy = tmp_path / "copy"
     copy.mkdir()
-    w.ctx.cwd_for = lambda wid: copy if wid == "grok" else w.snapshot
+    w.ctx.cwd_for = lambda wid, _r: copy if wid == "grok" else w.snapshot
     from eris.stages import proposer_prompt
 
     prompt = proposer_prompt(w.ctx, w.pack)
@@ -899,4 +904,37 @@ def test_build_call_uses_role_tools_and_sanitized_cwd(tmp_path: Path) -> None:
         call.stage is Stage.PROPOSE
         and build_call(w.ctx, "grok", "critic", prompt).stage is Stage.CRITIQUE
     )
+    w.writer.close()
+
+
+@pytest.mark.parametrize("cli", ["claude", "codex", "agy", "grok"])
+def test_judge_cwd_is_an_empty_private_dir_per_cli(tmp_path: Path, cli: str) -> None:
+    """Item 2: the adjudicator/summarizer never has the snapshot as cwd or
+    workspace: cwd (and agy --add-dir / codex -C) is an EMPTY private dir."""
+    from eris.launch import plan_call
+
+    w = World(tmp_path, {("grok", "propose"): [GOOD_PROPOSAL]})
+    judge = worker(cli, tools=[])
+    w.ctx.policy = w.policy.model_copy(
+        update={
+            "vendors_allowed": ["xai", "anthropic", "openai", "google"],
+            "workers": {**w.policy.workers, "judge": judge},
+        }
+    )
+    empty = tmp_path / "judge-empty"
+    empty.mkdir()
+    w.ctx.cwd_for = lambda _w, role: empty if role in ("adjudicator", "summarizer") else w.snapshot
+    from eris.stages import proposer_prompt
+
+    prompt = proposer_prompt(w.ctx, w.pack)
+    for role in ("adjudicator", "summarizer"):
+        call = build_call(w.ctx, "judge", role, prompt)
+        plan = plan_call(call)
+        assert plan.cwd == empty.resolve() and list(empty.iterdir()) == []
+        assert str(w.snapshot) not in plan.argv
+        if cli == "agy":
+            assert plan.argv[plan.argv.index("--add-dir") + 1] == str(empty.resolve())
+        if cli == "codex":
+            assert plan.argv[plan.argv.index("-C") + 1] == str(empty.resolve())
+    assert build_call(w.ctx, "grok", "proposer", prompt).cwd == w.snapshot
     w.writer.close()

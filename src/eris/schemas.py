@@ -25,7 +25,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "0.1.3"
+SCHEMA_VERSION = "0.1.4"
 
 TS_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -382,6 +382,9 @@ class EvidenceItem(Record):
     exit_code: int | None = None
     summary: str = ""
     redaction_counts: dict[str, int] = Field(default_factory=dict)
+    # 0.1.4: the command changed the (pristine) verification copy of the
+    # snapshot: recorded, never silently accepted; verification then stops.
+    violated: bool = False
 
 
 class VerificationResult(Record):

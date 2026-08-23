@@ -49,6 +49,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eris.launch import KillPg, LaunchRefused, PopenFactory, make_private_dir
 from eris.policy import Policy, sha256_file
+from eris.sanitize import tree_sha256
 from eris.schemas import (
     EvidenceItem,
     EvidenceKind,
@@ -147,6 +148,7 @@ class PackItem:
     content: str
     truncated: bool
     blob: BlobRef
+    violated: bool = False
 
     def rendered(self) -> dict[str, Any]:
         return {
@@ -179,6 +181,7 @@ def _item(
     content: bytes,
     argv: Sequence[str] | None,
     exit_code: int | None,
+    violated: bool = False,
 ) -> PackItem:
     blob = writer.put_blob(content)  # redacted before anything is hashed or rendered
     redacted = blob.path.read_bytes().decode("utf-8", errors="replace")
@@ -205,6 +208,7 @@ def _item(
         content=text,
         truncated=truncated,
         blob=blob,
+        violated=violated,
     )
 
 
@@ -224,6 +228,7 @@ def _record(
         exit_code=item.exit_code,
         summary=item.label,
         redaction_counts=dict(item.blob.redaction_counts),
+        violated=item.violated,
     )
     # the record later stages consume is the REDACTED one the writer persisted
     return EvidenceItem.model_validate(writer.append("evidence.item", record).payload)
@@ -233,22 +238,65 @@ def _record(
 
 
 @dataclass
+class SnapshotGuard:
+    """Tree-hash tripwire over the PRISTINE verification copy: a command
+    that changes it is recorded (``snapshot.violated``, the item's
+    ``violated`` flag) and verification stops for the run."""
+
+    root: Path
+    baseline: str
+
+    @classmethod
+    def over(cls, root: Path) -> SnapshotGuard:
+        return cls(Path(root), tree_sha256(Path(root)))
+
+    def changed(self) -> str | None:
+        now = tree_sha256(self.root)
+        return None if now == self.baseline else now
+
+
+PYTEST_ISOLATION_FLAGS: tuple[str, ...] = ("-p", "no:cacheprovider")
+
+
+@dataclass
+class RunOutcome:
+    argv: list[str]
+    exit_code: int | None
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool
+    violated: bool = False
+    tree_after: str | None = None
+
+
+@dataclass
 class VerifyEnv:
-    """Everything a mechanical command needs; injectable for the hermetic suite."""
+    """Everything a mechanical command needs; injectable for the hermetic
+    suite. ``snapshot_root`` is the PRISTINE copy (never the original, never
+    a sanitized copy); ``guard`` trips when a command changes it."""
 
     policy: Policy
-    snapshot_root: Path  # the ORIGINAL snapshot, never a sanitized copy
+    snapshot_root: Path
     scratch_home: Path
     popen: PopenFactory
     killpg: KillPg
     hasher: Callable[[Path], str] = sha256_file
     clock: Callable[[], float] = time.monotonic
+    guard: SnapshotGuard | None = None
+    violated: bool = False
 
-    def run(self, argv: Sequence[str]) -> tuple[list[str], int | None, bytes, bytes, bool]:
-        """(executed argv, exit code, stdout, stderr, timed_out). Raises
-        PermissionError (refused), LaunchRefused or OSError."""
+    def run(self, argv: Sequence[str]) -> RunOutcome:
+        """Raises PermissionError (refused), LaunchRefused or OSError."""
+        if self.violated:
+            raise PermissionError(
+                "refusing to run: an earlier command changed the verification copy "
+                "(snapshot.violated); verification is stopped for this run"
+            )
+        argv = list(argv)
+        if argv and Path(argv[0]).name == "pytest" and "no:cacheprovider" not in argv:
+            argv.extend(PYTEST_ISOLATION_FLAGS)  # re-checked by run_allowlisted
         decision, result = run_allowlisted(
-            list(argv),
+            argv,
             self.policy,
             self.snapshot_root,
             self.scratch_home,
@@ -257,13 +305,20 @@ class VerifyEnv:
             clock=self.clock,
             hasher=self.hasher,
         )
-        return (
+        outcome = RunOutcome(
             list(decision.argv),
             result.exit_code,
             result.stdout,
             result.stderr,
             result.timed_out,
         )
+        if self.guard is not None:
+            changed = self.guard.changed()
+            if changed is not None:
+                self.violated = True
+                outcome.violated = True
+                outcome.tree_after = changed
+        return outcome
 
 
 def _refused(writer: RunWriter, argv: Sequence[str], reason: str, source: str) -> None:
@@ -272,12 +327,23 @@ def _refused(writer: RunWriter, argv: Sequence[str], reason: str, source: str) -
 
 def _run_recorded(
     env: VerifyEnv, writer: RunWriter, argv: Sequence[str], *, source: str
-) -> tuple[list[str], int | None, bytes, bytes, bool] | None:
+) -> RunOutcome | None:
     try:
-        return env.run(argv)
+        outcome = env.run(argv)
     except (PermissionError, LaunchRefused, OSError) as exc:
         _refused(writer, argv, f"{type(exc).__name__}: {exc}", source)
         return None
+    if outcome.violated:
+        writer.append(
+            "snapshot.violated",
+            {
+                "argv": outcome.argv,
+                "source": source,
+                "tree_sha256_before": env.guard.baseline if env.guard else None,
+                "tree_sha256_after": outcome.tree_after,
+            },
+        )
+    return outcome
 
 
 # --------------------------------------------------------------------------- pack
@@ -384,19 +450,21 @@ def build_evidence_pack(
         if ran is None:
             refused += 1
             continue
-        exec_argv, rc, stdout, stderr, timed_out = ran
-        executed.append(exec_argv)
-        if stderr:
-            writer.put_blob(stderr)
+        executed.append(ran.argv)
+        if ran.stderr:
+            writer.put_blob(ran.stderr)
         items.append(
             _item(
                 writer,
                 kind=kind,
                 origin=Origin.MECHANICALLY_OBSERVED,
-                label=f"{label}: {' '.join(argv)}" + (" (timed out)" if timed_out else ""),
-                content=stdout,
-                argv=exec_argv,
-                exit_code=rc,
+                label=f"{label}: {' '.join(argv)}"
+                + (" (timed out)" if ran.timed_out else "")
+                + (" (VIOLATED the verification copy)" if ran.violated else ""),
+                content=ran.stdout,
+                argv=ran.argv,
+                exit_code=ran.exit_code,
+                violated=ran.violated,
             )
         )
     for ex in task.excerpts:
@@ -488,6 +556,15 @@ def rebuild_pack(
 # --------------------------------------------------------------------------- requests
 
 
+def request_key(argv: Sequence[str]) -> str:
+    """Dedupe key of a request: canonical argv with the executable's basename
+    (so a recorded, resolved argv and a raw request compare equal)."""
+    argv = list(argv)
+    if argv:
+        argv[0] = Path(argv[0]).name
+    return canonical_bytes({"argv": argv}).decode("utf-8")
+
+
 @dataclass
 class RequestState:
     """Per-run state of the evidence-request loop (dedupe, caps, wall clock).
@@ -522,7 +599,7 @@ def execute_evidence_requests(
         if stop_check():
             writer.append("verify.stopped", {"argv": argv, "source": source})
             raise EvidenceStopped("STOP requested before an evidence request")
-        canon = canonical_bytes({"argv": argv}).decode("utf-8")
+        canon = request_key(argv)
         if canon in state.executed:
             writer.append(
                 "verify.duplicate",
@@ -544,21 +621,24 @@ def execute_evidence_requests(
         ran = _run_recorded(env, writer, argv, source=source)
         if ran is None:
             continue
-        exec_argv, rc, stdout, stderr, timed_out = ran
+        rc = ran.exit_code
         state.count += 1
-        if stderr:
-            writer.put_blob(stderr)
-        summary = f"{source}: exit {rc}" + (" (timed out)" if timed_out else "")
+        if ran.stderr:
+            writer.put_blob(ran.stderr)
+        summary = f"{source}: exit {rc}" + (" (timed out)" if ran.timed_out else "")
         if req.expect_exit_code is not None and rc != req.expect_exit_code:
             summary += f"; expected {req.expect_exit_code}"
+        if ran.violated:
+            summary += "; VIOLATED the verification copy"
         item = _item(
             writer,
             kind=EvidenceKind.TOOL_OUTPUT,
             origin=Origin.MECHANICALLY_OBSERVED,
             label=summary,
-            content=stdout,
-            argv=exec_argv,
+            content=ran.stdout,
+            argv=ran.argv,
             exit_code=rc,
+            violated=ran.violated,
         )
         record = _record(writer, item, task_id=task_id, phase=Phase.VERIFICATION, ts=ts())
         state.executed[canon] = record.evidence_id
@@ -570,11 +650,11 @@ def execute_evidence_requests(
 
 
 @contextmanager
-def verify_scratch(writer: RunWriter, name: str = "verify") -> Iterator[Path]:
-    """A private HOME/TMPDIR for mechanical commands under the run dir
-    (after the writer holds the lock); removed in ``finally``. A removal
+def verify_scratch(writer: RunWriter, scratch_root: Path, name: str = "verify") -> Iterator[Path]:
+    """A private HOME/TMPDIR for mechanical commands under the run's
+    SCRATCH root (never under ``runs/``); removed in ``finally``. A removal
     failure writes ``run.error`` and raises :class:`EvidenceCleanupError`."""
-    writer_dir = writer.run_dir / "scratch" / name
+    writer_dir = Path(scratch_root) / name
     make_private_dir(writer_dir)
     try:
         yield writer_dir

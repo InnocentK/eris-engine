@@ -265,14 +265,25 @@ def _is_under(child: Path, parent: Path) -> bool:
     return True
 
 
+PRISTINE_PROFILE = SanitizeProfile(frozenset(), frozenset())
+"""Strips nothing: a faithful private copy (hooks removed, escaping symlinks
+dropped) for mechanical verification, so a command that executes repository
+code can never touch the original."""
+
+
 @contextmanager
 def sanitized_copy(
-    original: Path, scratch_dir: Path, *, profile: SanitizeProfile, worker_id: str
+    original: Path,
+    scratch_dir: Path,
+    *,
+    profile: SanitizeProfile,
+    worker_id: str,
+    name: str | None = None,
 ) -> Iterator[tuple[Path, SnapshotSanitization]]:
     """``with sanitized_copy(...) as (copy_root, record):`` - the copy is a
     private dir under ``scratch_dir`` and is removed in ``finally``. A
     removal failure raises :class:`SanitizeCleanupError` (never swallowed)."""
-    dest = Path(scratch_dir) / f"sanitized-{worker_id}"
+    dest = Path(scratch_dir) / (name or f"sanitized-{worker_id}")
     record = sanitize_snapshot(original, dest, profile=profile, worker_id=worker_id)
     try:
         yield dest.resolve(), record

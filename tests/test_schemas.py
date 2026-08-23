@@ -191,13 +191,14 @@ def test_current_schema_version_has_a_manifest_entry() -> None:
 # sha256 of the canonical JSON of EVERY committed manifest block, including
 # the current version: committed = immutable. These pin the manifest entries
 # themselves so that editing a golden together with its manifest line is
-# still caught. The next serialization change goes to a NEW version (0.1.4)
+# still caught. The next serialization change goes to a NEW version (0.1.5)
 # with a new line here; an existing line is never edited.
 PINNED_MANIFEST_BLOCKS = {
     "0.1.0": "46df57acc986804a99037db9fb21e8070e4c7944a31cf21e88d90752fb3b5c0c",
     "0.1.1": "715e86bccfd674c7743c4e722bdd3f5081060002608a312cc0314b8a154c464e",
     "0.1.2": "290f7f1c9e253dec5d619ddd4dfa20c9a8acb17bc411f270509a521847c661da",
     "0.1.3": "62c1b88822f5868bbcb7235d576f72485d2c6bfda9597982061bc85cf733c880",
+    "0.1.4": "574df681841271fc80428b349a81d83fe28cf4af56ccfba7c76b4140a53ce1cf",
 }
 
 
@@ -213,7 +214,7 @@ def _assert_goldens_pinned(root: Path, manifest: dict[str, dict[str, str]]) -> N
 
 
 def test_committed_goldens_are_byte_identical_to_their_pinned_manifest() -> None:
-    """Every committed version (0.1.0, 0.1.1, 0.1.2 AND the current 0.1.3)
+    """Every committed version (0.1.0, 0.1.1, 0.1.3 AND the current 0.1.4)
     must never change: its manifest block hashes to the value pinned here,
     and every file on disk still hashes to its manifest line."""
     _assert_goldens_pinned(RECORDS_ROOT, _manifest())
@@ -366,6 +367,21 @@ def test_schema_0_1_3_new_records_are_golden_pinned_and_observed() -> None:
         RetryAttempt.model_validate({**ex["retry_attempt"].model_dump(), "decision": "maybe"})
     with pytest.raises(ValidationError):
         ArmRun.model_validate({**ex["arm_run"].model_dump(), "arm": "arm_9"})
+
+
+def test_schema_0_1_4_evidence_item_violated() -> None:
+    """0.1.4: ``EvidenceItem.violated`` (default False) marks a verification
+    command that changed the pristine copy; absent from the 0.1.3 golden."""
+    from eris.schemas import EvidenceItem
+
+    ev = example_records()["evidence"]
+    assert json.loads(canonical_bytes(ev))["violated"] is True
+    old = json.loads((RECORDS_ROOT / "0.1.3" / "evidence.json").read_bytes())
+    assert "violated" not in old
+    bare = EvidenceItem.model_validate(
+        {k: v for k, v in json.loads(canonical_bytes(ev)).items() if k != "violated"}
+    )
+    assert bare.violated is False
 
 
 def test_stage_has_verify_and_summarize() -> None:

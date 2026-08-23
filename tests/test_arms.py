@@ -94,7 +94,7 @@ class Fleet:
             budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=self.ceiling),
             stop_check=self.stop_check,
             sleep=lambda _s: None,
-            cwd_for=lambda _w: self.snapshot,
+            cwd_for=lambda _w, _r: self.snapshot,
             scratch_dir=run_dir / "scratch",
             home=str(self.tmp / "home"),
             path_env="/usr/bin:/bin",
@@ -113,7 +113,7 @@ class Fleet:
             view0 = LedgerView.from_path(ctx.writer.events_path)
             prior = load_prior(view0, ctx.writer, per_call_usd=0.5)
             kill_stale_groups(prior.stale_pgids, killpg=lambda *_: None, alive=lambda _p: False)
-            remove_stale_scratch(ctx.writer.run_dir)
+            remove_stale_scratch(self.tmp / "scratch-root")
         draft = run_arm(spec, ctx, env, prior=prior)
         patterns = build_patterns(snapshot_root=None, home=self.tmp / "home")
         scan = scan_and_record(ctx.writer, patterns)
@@ -478,8 +478,9 @@ def test_resume_replays_finished_stages_and_abandons_the_open_attempt(tmp_path: 
         if p["stage"] == "adjudicate"
     ][0]["idempotency_key"]
     ctx.writer.append("invocation.spawned", {"idempotency_key": judge_key, "pgid": 4242})
-    (ctx.writer.run_dir / "scratch" / "call-deadbeef").mkdir(parents=True)
-    (ctx.writer.run_dir / "scratch" / "call-deadbeef" / "last_message.json").write_text("{}")
+    scratch_root = tmp_path / "scratch-root"
+    (scratch_root / "call-deadbeef").mkdir(parents=True)
+    (scratch_root / "call-deadbeef" / "last_message.json").write_text("{}")
     ctx.writer.close()
     before = LedgerView.from_path(ctx.writer.events_path)
     assert len([c for c in fleet.spy.calls if c.stage is Stage.PROPOSE]) == 2
@@ -502,8 +503,8 @@ def test_resume_replays_finished_stages_and_abandons_the_open_attempt(tmp_path: 
         alive=lambda _p: True,
     )
     assert killed == [4242] and [k[0] for k in killed_with] == [4242, 4242]
-    assert remove_stale_scratch(ctx2.writer.run_dir) == ["call-deadbeef"]
-    assert not (ctx2.writer.run_dir / "scratch" / "call-deadbeef").exists()
+    assert remove_stale_scratch(scratch_root) == ["call-deadbeef"]
+    assert not (scratch_root / "call-deadbeef").exists()
     after = LedgerView.from_path(ctx2.writer.events_path)
     assert after.kinds()[len(before.events) :] == ["invocation.abandoned", "cost"]
     abandoned = after.last("invocation.abandoned")

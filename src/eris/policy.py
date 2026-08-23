@@ -212,6 +212,10 @@ class Policy(_Strict):
     trusted: bool = False
     runs_dir: str = "runs"
     cache_dir: str = "cache"  # M2b: worker-call cache; NEVER under runs/
+    # Every ephemeral file (worker scratch, sanitized copies, the pristine
+    # verification copy, verify HOME) lives under scratch_dir/<run_id>/ - never
+    # under runs/, where RunWriter is the only writer. Swept at startup.
+    scratch_dir: str = "cache/scratch"
     path_env: str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
     vendors_allowed: list[str] = Field(min_length=1)
     api_hosts_allowed: list[str] = Field(default_factory=list)
@@ -236,13 +240,18 @@ class Policy(_Strict):
                 raise ValueError(f"worker {name!r}: provider {w.provider!r} not in vendors_allowed")
             if w.transport is Transport.API and w.base_url is not None:
                 _check_api_url(name, w.base_url, self.api_hosts_allowed)
-        for label, value in (("runs_dir", self.runs_dir), ("cache_dir", self.cache_dir)):
+        for label, value in (
+            ("runs_dir", self.runs_dir),
+            ("cache_dir", self.cache_dir),
+            ("scratch_dir", self.scratch_dir),
+        ):
             if not value or "\x00" in value:
                 raise ValueError(f"{label} must be a non-empty path")
-        if Path(self.cache_dir).resolve() == Path(self.runs_dir).resolve() or _is_under(
-            Path(self.cache_dir), Path(self.runs_dir)
-        ):
-            raise ValueError("cache_dir must not be the runs dir or inside it")
+        for label, value in (("cache_dir", self.cache_dir), ("scratch_dir", self.scratch_dir)):
+            if Path(value).resolve() == Path(self.runs_dir).resolve() or _is_under(
+                Path(value), Path(self.runs_dir)
+            ):
+                raise ValueError(f"{label} must not be the runs dir or inside it")
         return self
 
 

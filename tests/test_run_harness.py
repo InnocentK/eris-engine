@@ -77,11 +77,19 @@ class Popen:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
         self.interrupt_on: str | None = None
         self.hang: set[str] = set()
+        self.crash_on: str | None = None
+        self.write_in_cwd: set[str] = set()
 
     def __call__(self, args: Any, **kw: Any) -> FakeProcess:
         argv = [os.fsdecode(a) for a in args]
         self.calls.append((argv, kw))
         name = Path(argv[0]).name
+        if name == self.crash_on:
+            raise RuntimeError("simulated harness crash")
+        if name in self.write_in_cwd:
+            Path(kw["cwd"], "WRITTEN_BY_" + name).write_text("x")
+        if name == "pytest":
+            return FakeProcess(argv, stdout=b"1 passed\n", returncode=0, popen_kwargs=kw)
         if name == "git":
             sub = argv[1] if len(argv) > 1 else ""
             out = {"rev-parse": b"f" * 40 + b"\n"}.get(sub, f"{sub} output\n".encode())
@@ -105,11 +113,13 @@ class InterruptingProcess(FakeProcess):
         return super().wait(timeout)
 
 
-def world(tmp_path: Path, *, sanitize_grok: bool = True, timeout_s: int = 5) -> dict[str, Path]:
+def world(
+    tmp_path: Path, *, sanitize_grok: bool = True, timeout_s: int = 5, trusted_pytest: bool = False
+) -> dict[str, Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True)
     exes: dict[str, Path] = {}
-    for name in ("grok", "claude", "git"):
+    for name in ("grok", "claude", "git", "pytest"):
         p = bin_dir / name
         p.write_bytes(f"#!/bin/sh\necho {name}\n".encode())
         p.chmod(0o755)
@@ -153,6 +163,8 @@ def world(tmp_path: Path, *, sanitize_grok: bool = True, timeout_s: int = 5) -> 
         "policy_version": "t",
         "runs_dir": str(tmp_path / "runs"),
         "cache_dir": str(tmp_path / "cache"),
+        "scratch_dir": str(tmp_path / "cache" / "scratch"),
+        "trusted": trusted_pytest,
         "path_env": "/usr/bin:/bin",
         "vendors_allowed": ["xai", "anthropic"],
         "credential_files": [],
@@ -191,7 +203,22 @@ def world(tmp_path: Path, *, sanitize_grok: bool = True, timeout_s: int = 5) -> 
                     "value_flags": {"-n": "^[0-9]{1,4}$"},
                     "positional": ["path", "^(HEAD(~[0-9]{1,3})?|[0-9a-f]{7,40})$"],
                     "timeout_s": 5,
-                }
+                },
+                **(
+                    {
+                        "pytest": {
+                            "executable": str(exes["pytest"]),
+                            "executable_sha256": sha["pytest"],
+                            "requires_trusted": True,
+                            "literal_flags": ["-q"],
+                            "value_flags": {"-p": "^no:[A-Za-z0-9_]+$"},
+                            "positional": ["path"],
+                            "timeout_s": 5,
+                        }
+                    }
+                    if trusted_pytest
+                    else {}
+                ),
             },
         },
         "budgets": {"per_run_usd": 5.0, "per_call_usd": 0.5},
@@ -278,8 +305,9 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
     assert grok_calls and all(
         kw["cwd"] != str(w["snapshot"]) and "sanitized-grok" in kw["cwd"] for kw in grok_calls
     )
-    assert git_calls and all(kw["cwd"] == str(w["snapshot"].resolve()) for kw in git_calls)
-    assert not (run_dir / "scratch" / "sanitized-grok").exists()  # removed in finally
+    pristine = str((tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify" / "pristine").resolve())
+    assert git_calls and all(kw["cwd"] == pristine for kw in git_calls)  # never the original
+    assert not (tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify").exists()  # removed
     # judge got no tools; the --tools "" flag is on its argv
     judge_calls = [argv for argv, _ in popen.calls if Path(argv[0]).name == "claude"]
     assert judge_calls and judge_calls[0][judge_calls[0].index("--tools") + 1] == ""
@@ -574,3 +602,137 @@ def test_campaign_resume_skips_finalized_cells_and_resumes_unfinished(tmp_path: 
         "claude"
     ]
     assert (w["runs"] / "c1" / "manifest.json").is_file()
+
+
+WRITER_FILES = {".lock", "events.jsonl", "manifest.json"}
+
+
+def writer_files_only(run_dir: Path) -> list[str]:
+    """Every path under a run dir that RunWriter did not write."""
+    bad: list[str] = []
+    for path in run_dir.rglob("*"):
+        rel = path.relative_to(run_dir)
+        if (
+            rel.parts[0] in WRITER_FILES
+            or rel.parts[:2] == ("blobs", "sha256")
+            or rel.parts == ("blobs",)
+        ):
+            continue
+        bad.append(rel.as_posix())
+    return bad
+
+
+def test_runs_dir_holds_only_writer_files_and_scratch_is_swept(tmp_path: Path) -> None:
+    """Item 5: after success, a STOP refusal and a crash, nothing but
+    RunWriter-written files exists under runs/<id>/; every ephemeral file
+    lives under scratch_dir/<id> and is removed; orphans are swept at
+    startup and logged; the judge ran in an EMPTY dir under scratch; the
+    original snapshot's tree hash is unchanged."""
+    from eris.sanitize import tree_sha256
+
+    w = world(tmp_path)
+    home = tmp_path / "home"
+    scratch_dir = tmp_path / "cache" / "scratch"
+    (scratch_dir / "orphan-run").mkdir(parents=True)
+    (scratch_dir / "orphan-run" / "leftover").write_text("x")
+    before = tree_sha256(w["snapshot"])
+    popen = Popen(outputs())
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        run_args(w, "indep_verify", run_id="ok"),
+        out=out,
+        err=err,
+        home=home,
+        popen=popen,
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_OK, out.getvalue()
+    assert not (scratch_dir / "orphan-run").exists()
+    swept = [json.loads(line) for line in err.getvalue().splitlines() if "scratch_swept" in line]
+    assert swept and swept[0]["removed"] == ["orphan-run"]
+    assert writer_files_only(w["runs"] / "ok") == []
+    assert not (scratch_dir / "ok").exists()
+    judge_cwd = [kw["cwd"] for a, kw in popen.calls if Path(a[0]).name == "claude"][0]
+    assert judge_cwd == str((scratch_dir / "ok" / "judge-empty").resolve())
+    git_cwd = {kw["cwd"] for a, kw in popen.calls if Path(a[0]).name == "git"}
+    assert git_cwd == {str((scratch_dir / "ok" / "pristine").resolve())}  # verification on the copy
+    assert str(w["snapshot"].resolve()) not in git_cwd
+    assert tree_sha256(w["snapshot"]) == before
+    started = events_of(w["runs"] / "ok").payloads("run.started")[0]
+    assert (
+        started["snapshot_tree_sha256"] == before
+        and "snapshot.pristine" in events_of(w["runs"] / "ok").kinds()
+    )
+    # STOP refusal
+    (w["runs"] / "STOP").write_text("")
+    rc = main(
+        run_args(w, "indep_verify", run_id="stopped"),
+        out=io.StringIO(),
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    (w["runs"] / "STOP").unlink()
+    assert (
+        rc == EXIT_STOP
+        and writer_files_only(w["runs"] / "stopped") == []
+        and not (scratch_dir / "stopped").exists()
+    )
+    # crash: an injected exception from the worker spawn propagates, scratch still removed
+    crashing = Popen(outputs())
+    crashing.crash_on = "grok"
+    with pytest.raises(RuntimeError, match="simulated"):
+        main(
+            run_args(w, "indep_verify", run_id="crashed", no_cache=""),
+            out=io.StringIO(),
+            err=io.StringIO(),
+            home=home,
+            popen=crashing,
+            killpg=lambda *_: None,
+        )
+    assert (
+        writer_files_only(w["runs"] / "crashed") == []
+        and not (w["runs"] / "crashed" / "manifest.json").exists()
+    )
+    assert not (scratch_dir / "crashed").exists()
+    assert tree_sha256(w["snapshot"]) == before
+
+
+def test_verification_violation_is_recorded_and_stops_verification(tmp_path: Path) -> None:
+    """Item 4 end to end: a trusted pytest battery command writes into its
+    cwd (the pristine copy) -> snapshot.violated, the item violated, the
+    next command refused, the original untouched, pytest carried
+    -p no:cacheprovider."""
+    from eris.sanitize import tree_sha256
+
+    w = world(tmp_path, trusted_pytest=True)
+    task = json.loads(w["task"].read_text())
+    w["task"].write_text(json.dumps({**task, "battery": [["pytest", "-q"], ["git", "ls-files"]]}))
+    before = tree_sha256(w["snapshot"])
+    popen = Popen(outputs())
+    popen.write_in_cwd.add("pytest")
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="viol", panel="grok"),
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=popen,
+        killpg=lambda *_: None,
+    )
+    assert rc in (EXIT_OK, EXIT_INCOMPLETE), out.getvalue()
+    view = events_of(w["runs"] / "viol")
+    assert "snapshot.violated" in view.kinds()
+    pytest_call = [a for a, _ in popen.calls if Path(a[0]).name == "pytest"][0]
+    assert pytest_call[1:] == ["-q", "-p", "no:cacheprovider"]
+    items = view.payloads("evidence.item")
+    assert any(i["violated"] for i in items) and all(
+        not i["violated"] for i in items if i["argv"] and i["argv"][-1] != "no:cacheprovider"
+    )
+    refused = [
+        p for p in view.payloads("verify.refused") if "verification is stopped" in p["reason"]
+    ]
+    assert refused and refused[0]["argv"] == ["git", "ls-files"]
+    assert tree_sha256(w["snapshot"]) == before
+    assert not (w["snapshot"] / "WRITTEN_BY_pytest").exists()

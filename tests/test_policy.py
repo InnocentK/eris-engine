@@ -475,3 +475,15 @@ def test_verify_caps_and_campaign_budget_are_strict(tmp_path: Path) -> None:
     budgets = {"per_run_usd": 1, "per_call_usd": 1, "per_campaign_usd": 0}
     with pytest.raises(PolicyError):
         load_policy(write(tmp_path, minimal_policy(budgets=budgets)))
+
+
+def test_scratch_dir_defaults_under_cache_and_never_under_runs(tmp_path: Path) -> None:
+    """Item 5: every ephemeral file lives under scratch_dir (default
+    cache/scratch), which may not be the runs dir or inside it."""
+    pol = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml")).policy
+    assert pol.scratch_dir == "cache/scratch"
+    for bad in ("runs", "runs/scratch"):
+        with pytest.raises(PolicyError, match="scratch_dir"):
+            load_policy(write(tmp_path, minimal_policy(runs_dir="runs", scratch_dir=bad)))
+    ok = load_policy(write(tmp_path, minimal_policy(runs_dir="runs", scratch_dir="tmp/s"))).policy
+    assert ok.scratch_dir == "tmp/s"

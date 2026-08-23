@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,7 +53,7 @@ from eris.arms import (
 )
 from eris.cache import Cache, CacheUnsupported
 from eris.doctor import run_doctor
-from eris.evidence import TaskSpec, VerifyEnv, verify_scratch
+from eris.evidence import SnapshotGuard, TaskSpec, VerifyEnv, verify_scratch
 from eris.launch import (
     KillPg,
     LaunchRefused,
@@ -69,7 +70,13 @@ from eris.ledger import LedgerCorrupt, LedgerView, cost_totals
 from eris.policy import LoadedPolicy, PolicyError, load_policy
 from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
 from eris.retry import BudgetLedger, stop_requested
-from eris.sanitize import SanitizeCleanupError, SanitizeProfile, sanitized_copy
+from eris.sanitize import (
+    PRISTINE_PROFILE,
+    SanitizeCleanupError,
+    SanitizeProfile,
+    sanitized_copy,
+    tree_sha256,
+)
 from eris.scan import PatternSet, build_patterns, scan_and_record
 from eris.schemas import (
     Arm,
@@ -256,11 +263,14 @@ def cmd_invoke(
     env_values = _read_env_values(Path(args.env_file))
     creds = load_credential_values(_credential_paths(loaded, home))  # raises if unparsable
     redactor = Redactor(list(env_values.values()) + creds.values)
-    scratch = run_dir / "scratch"  # path only; created AFTER the writer holds the lock
+    scratch_root = Path(loaded.policy.scratch_dir)
+    if _is_under(scratch_root, Path(args.runs_dir)):
+        raise LaunchRefused(f"scratch_dir {scratch_root} must not be under the runs dir")
+    sweep_scratch(scratch_root, sys.stderr)
+    scratch = scratch_root / run_id  # path only; created AFTER the writer holds the lock
     call = _build_call(loaded, args, env_values, home, scratch)
     plan_key = plan_call(call).idempotency_key if call.policy.executable else None
-    with RunWriter(run_dir, redactor, run_id=run_id) as writer:
-        make_private_dir(scratch)  # refuses a pre-existing entry or symlink
+    with RunWriter(run_dir, redactor, run_id=run_id) as writer, _scratch_root(scratch):
         (scratch / "tmp").mkdir()
         started = now_ts()
         writer.append(
@@ -415,10 +425,49 @@ class Harness:
     interrupted: bool = False
     sleep: Callable[[float], None] = time.sleep
     current_call: WorkerCall | None = None
+    swept: list[str] = field(default_factory=list)
 
     @property
     def policy(self) -> Any:
         return self.loaded.policy
+
+    @property
+    def scratch_dir(self) -> Path:
+        return Path(self.policy.scratch_dir)
+
+    def scratch_for(self, run_id: str) -> Path:
+        """``scratch_dir/<run_id>``: every ephemeral file of a run, never under runs/."""
+        root = self.scratch_dir
+        if _is_under(root, self.runs_dir):
+            raise LaunchRefused(f"scratch_dir {root} must not be under the runs dir")
+        return root / validate_run_id(run_id)
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def sweep_scratch(scratch_dir: Path, err: IO[str]) -> list[str]:
+    """At startup: remove every orphaned entry under ``scratch_dir`` (a
+    previous crash left it); log what was removed. Symlinks are unlinked,
+    never followed."""
+    removed: list[str] = []
+    if not scratch_dir.is_dir() or scratch_dir.is_symlink():
+        return removed
+    for entry in sorted(scratch_dir.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
+        removed.append(entry.name)
+    if removed:
+        line = {"status": "scratch_swept", "scratch_dir": str(scratch_dir), "removed": removed}
+        print(json.dumps(line), file=err, flush=True)
+    return removed
 
 
 def load_harness(
@@ -440,7 +489,7 @@ def load_harness(
             )
         except CacheUnsupported as exc:
             print(json.dumps({"status": "warning", "cache": str(exc)}), file=err)
-    return Harness(
+    h = Harness(
         loaded=loaded,
         redactor=Redactor(list(env_values.values()) + creds.values),
         secrets=env_values,
@@ -453,6 +502,10 @@ def load_harness(
         cache=cache,
         credential_warnings=list(creds.warnings),
     )
+    if _is_under(h.scratch_dir, runs_dir):
+        raise PolicyError(f"scratch_dir {h.scratch_dir} must not be under the runs dir")
+    h.swept = sweep_scratch(h.scratch_dir, err)
+    return h
 
 
 def load_task(task_file: Path) -> tuple[TaskSpec, Path]:
@@ -589,14 +642,16 @@ def run_cell(
         return CellOutcome(run_id, EXIT_RUN_ERROR, "locked", error=str(exc))
     prompts = load_prompt_files(h.prompts_dir)
     snapshot_sha = read_head_sha(snapshot)
+    original_tree = tree_sha256(snapshot)
     outcome = CellOutcome(run_id, EXIT_OK, "running")
+    scratch = h.scratch_for(run_id)
     try:
         prior: Prior | None = None
         if resume:
             view = LedgerView.from_path(writer.events_path)
             prior = load_prior(view, writer, per_call_usd=policy.budgets.per_call_usd)
             killed = kill_stale_groups(prior.stale_pgids, killpg=h.killpg)
-            removed = remove_stale_scratch(run_dir)
+            removed = remove_stale_scratch(scratch)
             writer.append(
                 "run.resumed",
                 {
@@ -609,10 +664,10 @@ def run_cell(
             base_known, base_reserved = _spent_from_view(view)
         else:
             base_known, base_reserved = 0.0, 0.0
-        scratch = run_dir / "scratch"
-        if not scratch.exists():
-            make_private_dir(scratch)  # after the lock; refuses a planted entry
-        (scratch / "tmp").mkdir(exist_ok=True)
+        make_private_dir(scratch)  # after the lock; refuses a planted entry; never under runs/
+        (scratch / "tmp").mkdir()
+        judge_dir = scratch / "judge-empty"  # the judge's cwd/workspace: EMPTY, never the snapshot
+        judge_dir.mkdir()
         budget = BudgetLedger(
             per_call_usd=policy.budgets.per_call_usd,
             run_ceiling_usd=policy.budgets.per_run_usd,
@@ -639,6 +694,8 @@ def run_cell(
                 "judge": spec.judge,
                 "snapshot": str(snapshot),
                 "snapshot_sha": snapshot_sha,
+                "snapshot_tree_sha256": original_tree,
+                "scratch_dir": str(scratch),
                 "prompt_files": {role: p.sha256 for role, p in sorted(prompts.items())},
                 "containment": policy.containment,
                 "campaign_id": campaign_id,
@@ -682,15 +739,20 @@ def run_cell(
             return h.interrupted or stop_requested(*stop_paths)
 
         with (
-            verify_scratch(writer) as scratch_home,
+            verify_scratch(writer, scratch) as scratch_home,
+            sanitized_copy(
+                snapshot, scratch, profile=PRISTINE_PROFILE, worker_id="verify", name="pristine"
+            ) as (pristine, pristine_record),
             _sanitized_copies(writer, spec, policy, snapshot, scratch, profile, sanitized),
         ):
+            writer.append("snapshot.pristine", pristine_record)
             env = VerifyEnv(
                 policy=policy,
-                snapshot_root=snapshot,  # verification ALWAYS on the original
+                snapshot_root=pristine,  # verification on a PRISTINE copy, never the original
                 scratch_home=scratch_home,
                 popen=h.popen,
                 killpg=h.killpg,
+                guard=SnapshotGuard.over(pristine),
             )
             ctx = StageContext(
                 writer=writer,
@@ -703,7 +765,11 @@ def run_cell(
                 budget=budget,
                 stop_check=stop_check,
                 sleep=h.sleep,
-                cwd_for=lambda w: sanitized.get(w, snapshot),
+                cwd_for=lambda w, role: (
+                    judge_dir
+                    if role in ("adjudicator", "summarizer")
+                    else sanitized.get(w, snapshot)
+                ),
                 scratch_dir=scratch,
                 home=str(h.home),
                 path_env=policy.path_env,
@@ -726,6 +792,14 @@ def run_cell(
             view = LedgerView.from_path(writer.events_path)
             record = finish_arm(
                 draft, ctx, view, contaminated=scan.contaminated, containment=policy.containment
+            )
+        if tree_sha256(snapshot) != original_tree:
+            writer.append(
+                "run.error",
+                {
+                    "kind": "snapshot_modified",
+                    "error": "the ORIGINAL snapshot changed during the run",
+                },
             )
         totals = cost_totals(LedgerView.from_path(writer.events_path))
         run_errors = [e for e in LedgerView.from_path(writer.events_path).payloads("run.error")]
@@ -766,7 +840,26 @@ def run_cell(
         outcome.exit_code, outcome.status, outcome.error = EXIT_RUN_ERROR, "run_error", str(exc)
         return outcome
     finally:
+        if scratch.exists() or scratch.is_symlink():
+            try:
+                shutil.rmtree(scratch)
+            except OSError as exc:
+                _safe_append(
+                    writer, "run.error", {"kind": "scratch_cleanup_failed", "error": str(exc)}
+                )
+                outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
         writer.close()
+
+
+@contextmanager
+def _scratch_root(scratch: Path) -> Iterator[Path]:
+    """Create the run's private scratch root (refusing a planted entry or
+    symlink) and remove it in ``finally`` whatever happens."""
+    make_private_dir(scratch)
+    try:
+        yield scratch
+    finally:
+        shutil.rmtree(scratch, ignore_errors=False)
 
 
 def _safe_append(writer: RunWriter, kind: str, payload: dict[str, Any]) -> None:

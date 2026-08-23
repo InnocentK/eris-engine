@@ -614,7 +614,7 @@ class StageContext:
     budget: BudgetLedger
     stop_check: Callable[[], bool]
     sleep: Callable[[float], None]
-    cwd_for: Callable[[str], Path]  # worker_id -> cwd (original or sanitized copy)
+    cwd_for: Callable[[str, str], Path]  # (worker_id, role) -> cwd; judge roles: an EMPTY dir
     scratch_dir: Path
     home: str
     path_env: str
@@ -688,7 +688,7 @@ def build_call(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPro
         worker_id=worker_id,
         policy=policy,
         prompt=prompt.text,
-        cwd=ctx.cwd_for(worker_id),
+        cwd=ctx.cwd_for(worker_id, role),
         task_id=ctx.task.task_id,
         stage=STAGE_OF_ROLE[role],
         repeat_index=ctx.repeat_index,

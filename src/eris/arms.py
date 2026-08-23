@@ -292,9 +292,10 @@ def kill_stale_groups(
     return killed
 
 
-def remove_stale_scratch(run_dir: Path) -> list[str]:
-    """Remove ``scratch/call-*`` left by a crashed call (after the pgid check)."""
-    scratch = Path(run_dir) / "scratch"
+def remove_stale_scratch(scratch_root: Path) -> list[str]:
+    """Remove ``call-*`` dirs left under the run's scratch root by a crashed
+    call (after the pgid check)."""
+    scratch = Path(scratch_root)
     removed: list[str] = []
     if not scratch.is_dir() or scratch.is_symlink():
         return removed

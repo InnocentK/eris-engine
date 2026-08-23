@@ -36,6 +36,7 @@ def setup_world(tmp_path: Path, *, pinned: bool = True) -> dict[str, Path]:
     policy = {
         "policy_version": "t",
         "runs_dir": str(tmp_path / "runs"),
+        "scratch_dir": str(tmp_path / "scratch"),
         "path_env": "/usr/bin:/bin",
         "vendors_allowed": ["xai"],
         "credential_files": [str(cred)],
@@ -272,15 +273,21 @@ def test_invoke_key_includes_snapshot_sha_from_git_head(
         )
 
 
-def test_invoke_creates_scratch_after_the_lock_and_refuses_planted_symlink(
+def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_symlink_is_swept(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
+    """Every ephemeral file lives under the policy scratch_dir (never under
+    runs/); an orphan planted there (a symlink to elsewhere) is unlinked at
+    startup - never followed - and the run proceeds; nothing is written
+    outside runs/ except under scratch_dir/<run_id>, which is removed."""
     w = setup_world(tmp_path)
     runs = tmp_path / "runs"
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    (runs / "r").mkdir(parents=True)
-    (runs / "r" / "scratch").symlink_to(elsewhere)
+    (elsewhere / "keep").write_text("x")
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir()
+    (scratch_dir / "r").symlink_to(elsewhere)
     factory = fake_process(stdout=b"{}")
     out = io.StringIO()
     rc = main(
@@ -288,11 +295,19 @@ def test_invoke_creates_scratch_after_the_lock_and_refuses_planted_symlink(
         out=out,
         home=tmp_path,
         popen=factory,
+        killpg=lambda *_: None,
     )
-    assert rc == 2 and "symlink" in json.loads(out.getvalue())["error"]
-    assert factory.instances == [] and list(elsewhere.iterdir()) == []
-    assert (runs / "r" / ".lock").exists()  # the writer had opened before scratch was touched
-    assert not (runs / "r" / "manifest.json").exists()
+    assert rc == 3, out.getvalue()  # the fake envelope is not a grok envelope: FAILED, not refused
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["keep"]  # never followed
+    assert not (scratch_dir / "r").exists() and not (scratch_dir / "r").is_symlink()
+    assert not (runs / "r" / "scratch").exists()
+    assert (runs / "r" / "manifest.json").exists()
+    extra = {p.relative_to(runs / "r").as_posix() for p in (runs / "r").rglob("*")}
+    assert all(
+        e in (".lock", "events.jsonl", "manifest.json", "blobs", "blobs/sha256")
+        or e.startswith("blobs/sha256/")
+        for e in extra
+    )
 
 
 def test_invoke_surfaces_cleanup_failure_as_run_error(

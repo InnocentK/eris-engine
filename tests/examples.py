@@ -182,6 +182,7 @@ def example_records() -> dict[str, Record]:
             exit_code=0,
             summary="412 passed",
             redaction_counts={"openai_key": 1},
+            violated=True,
         ),
         "verification": VerificationResult(
             verification_id="v_01",
