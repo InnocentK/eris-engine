@@ -469,6 +469,8 @@ def test_sigint_kills_records_and_resume_completes(tmp_path: Path) -> None:
         if a["invocation_id"] == interrupted[0]["invocation_id"]
     ]
     assert attempts and attempts[0]["decision"] == "stop" and "interrupted" in attempts[0]["reason"]
+    assert attempts[0]["error_class"] == "interrupted"  # its own class, never `unknown`
+    assert "stage.interrupted" in view.kinds()  # the attempt is CLOSED, not left open
     assert any(k == "invocation.spawned" for k in kinds)
     assert any(line for line in err.getvalue().splitlines() if '"run.interrupted"' in line)
     # resume: proposals replayed, judge re-run, cell completes
@@ -487,9 +489,18 @@ def test_sigint_kills_records_and_resume_completes(tmp_path: Path) -> None:
         "claude"
     ]
     view = events_of(run_dir)
-    assert "run.resumed" in view.kinds() and "invocation.abandoned" in view.kinds()
+    assert "run.resumed" in view.kinds()
+    # the SIGINT path already closed and costed that attempt: resume must NOT
+    # synthesize an abandoned attempt for it (that was a double count)
+    assert "invocation.abandoned" not in view.kinds()
     resumed = view.payloads("run.resumed")[0]
-    assert resumed["abandoned"] == 1
+    assert resumed["abandoned"] == 0
+    interrupted_costs = [
+        c
+        for c in view.payloads("cost")
+        if c["cost_known"] is False and c["invocation_id"].endswith("-a1")
+    ]
+    assert len(interrupted_costs) == 1  # costed exactly once, by the interrupt
     assert (run_dir / "manifest.json").is_file()
     assert [p["stage"] for p in view.payloads("stage.resumed")] == ["pack", "propose"]
 

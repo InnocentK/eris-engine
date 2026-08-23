@@ -25,7 +25,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "0.1.4"
+SCHEMA_VERSION = "0.1.5"
 
 TS_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -169,6 +169,10 @@ class ErrorClass(StrEnum):
     BUDGET_TRIPPED = "budget_tripped"
     AUTH_TERMINAL = "auth_terminal"
     POLICY_TERMINAL = "policy_terminal"
+    # 0.1.5: the operator interrupted the harness (SIGINT). The attempt was
+    # closed by the harness, not classified from worker output: it is its own
+    # terminal class, never `unknown`.
+    INTERRUPTED = "interrupted"
     UNKNOWN = "unknown"
 
 

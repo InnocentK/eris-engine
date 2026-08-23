@@ -165,9 +165,14 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
     # stage.started / stage.finished pairing by (stage, worker, key)
     open_stages: dict[tuple[str, str, str], dict[str, Any]] = {}
     spawned: dict[str, int] = {}
+    closed_by_sigint: set[tuple[str, str, str]] = set()
     for ev in view.events:
         p = ev.payload
-        if ev.kind == "stage.started":
+        if ev.kind == "stage.interrupted":
+            # SIGINT already recorded that attempt (invocation.finished + cost):
+            # the stage stays OPEN (it re-runs) but no abandoned attempt is invented
+            closed_by_sigint.add((str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"])))
+        elif ev.kind == "stage.started":
             open_stages[(str(p["stage"]), str(p["worker_id"]), str(p["idempotency_key"]))] = p
         elif ev.kind == "invocation.spawned":
             spawned[str(p.get("idempotency_key"))] = int(p["pgid"])
@@ -198,6 +203,8 @@ def load_prior(view: LedgerView, writer: RunWriter, *, per_call_usd: float) -> P
         }
         if pgid is not None:
             prior.stale_pgids.append(pgid)
+        if (stage, worker_id, idem) in closed_by_sigint:
+            continue  # closed by the SIGINT path; its cost is already on the ledger
         if (idem, attempt) in already:
             prior.abandoned.append(payload)  # a repeated resume: recorded once, never twice
             continue

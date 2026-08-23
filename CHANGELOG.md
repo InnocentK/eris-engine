@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2 - schema 0.1.5 + advisor re-check fixes (2026-08-23)
+
+Schema `SCHEMA_VERSION` 0.1.4 → **0.1.5** (new golden dir
+`tests/fixtures/records/0.1.5/`, MANIFEST block + pinned constant;
+0.1.0–0.1.4 untouched): `ErrorClass.INTERRUPTED` - the harness's own SIGINT
+class, terminal and never produced by the retry classifier (it used to be
+recorded as `unknown`).
+
+Advisor re-check (Codex at `871c7da`; conditions 1, 3, 6, 8, 11, 14 lifted).
+Fixed, each with a test (`docs/INVARIANTS.md` "Advisor re-check"):
+* SIGINT closes its attempt (`stage.interrupted`): resume no longer
+  synthesizes an abandoned attempt for it, so the cost is counted once.
+
 ## 0.3.1 - schema 0.1.4 + advisor-round fixes (2026-08-23)
 
 Schema `SCHEMA_VERSION` 0.1.3 → **0.1.4** (new golden dir

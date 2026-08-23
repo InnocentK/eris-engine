@@ -970,13 +970,25 @@ def _record_interrupt(h: Harness, writer: RunWriter, ctx: StageContext) -> None:
                 invocation_id=inv.invocation_id,
                 attempt=attempt,
                 status=WorkerStatus.FAILED,
-                error_class=ErrorClass.UNKNOWN,
+                error_class=ErrorClass.INTERRUPTED,
                 reason="interrupted (SIGINT): the group was killed; no retry",
                 weight=1,
                 budget_used_after=0,
                 backoff_s=0.0,
                 decision=RetryDecision.STOP,
             ),
+        )
+        # The attempt is CLOSED here (invocation.finished + cost + retry.attempt).
+        # `load_prior` reads this marker and does NOT synthesize an abandoned
+        # attempt for it on resume: the cost would otherwise be counted twice.
+        writer.append(
+            "stage.interrupted",
+            {
+                "stage": call.stage.value,
+                "worker_id": call.worker_id,
+                "idempotency_key": key,
+                "attempt": attempt,
+            },
         )
     writer.append(
         "run.interrupted", {"signal": "SIGINT", "worker_id": call.worker_id if call else None}

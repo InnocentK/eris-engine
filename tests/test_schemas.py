@@ -191,7 +191,7 @@ def test_current_schema_version_has_a_manifest_entry() -> None:
 # sha256 of the canonical JSON of EVERY committed manifest block, including
 # the current version: committed = immutable. These pin the manifest entries
 # themselves so that editing a golden together with its manifest line is
-# still caught. The next serialization change goes to a NEW version (0.1.5)
+# still caught. The next serialization change goes to a NEW version (0.1.6)
 # with a new line here; an existing line is never edited.
 PINNED_MANIFEST_BLOCKS = {
     "0.1.0": "46df57acc986804a99037db9fb21e8070e4c7944a31cf21e88d90752fb3b5c0c",
@@ -199,6 +199,7 @@ PINNED_MANIFEST_BLOCKS = {
     "0.1.2": "290f7f1c9e253dec5d619ddd4dfa20c9a8acb17bc411f270509a521847c661da",
     "0.1.3": "62c1b88822f5868bbcb7235d576f72485d2c6bfda9597982061bc85cf733c880",
     "0.1.4": "574df681841271fc80428b349a81d83fe28cf4af56ccfba7c76b4140a53ce1cf",
+    "0.1.5": "d3c1a8bb518d36ecd73a5dc7e7540afe39855ce6f3b761c297e07e584ecf00c4",
 }
 
 
@@ -214,7 +215,7 @@ def _assert_goldens_pinned(root: Path, manifest: dict[str, dict[str, str]]) -> N
 
 
 def test_committed_goldens_are_byte_identical_to_their_pinned_manifest() -> None:
-    """Every committed version (0.1.0, 0.1.1, 0.1.3 AND the current 0.1.4)
+    """Every committed version (0.1.0 to 0.1.4 AND the current 0.1.5)
     must never change: its manifest block hashes to the value pinned here,
     and every file on disk still hashes to its manifest line."""
     _assert_goldens_pinned(RECORDS_ROOT, _manifest())
@@ -382,6 +383,27 @@ def test_schema_0_1_4_evidence_item_violated() -> None:
         {k: v for k, v in json.loads(canonical_bytes(ev)).items() if k != "violated"}
     )
     assert bare.violated is False
+
+
+def test_schema_0_1_5_error_class_interrupted() -> None:
+    """0.1.5: ``ErrorClass.INTERRUPTED`` - the harness's own SIGINT class,
+    never ``unknown`` and never produced by the retry classifier."""
+    from eris.retry import PATTERNS, RETRYABLE
+    from eris.schemas import ErrorClass, RetryAttempt
+
+    assert ErrorClass("interrupted") is ErrorClass.INTERRUPTED
+    assert ErrorClass.INTERRUPTED not in RETRYABLE  # terminal
+    assert ErrorClass.INTERRUPTED not in {p.error_class for p in PATTERNS}
+    record = RetryAttempt.model_validate(
+        {
+            **example_records()["retry_attempt"].model_dump(mode="json"),
+            "error_class": "interrupted",
+            "decision": "stop",
+        }
+    )
+    assert record.error_class is ErrorClass.INTERRUPTED
+    old = json.loads((RECORDS_ROOT / "0.1.4" / "retry_attempt.json").read_bytes())
+    assert old["schema_version"] == "0.1.4"  # the bump is what makes 0.1.5 a new directory
 
 
 def test_stage_has_verify_and_summarize() -> None:

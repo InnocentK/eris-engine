@@ -116,6 +116,8 @@ _COMPILED: tuple[tuple[ErrorPattern, re.Pattern[str]], ...] = tuple(
 RETRYABLE: frozenset[ErrorClass] = frozenset(
     {ErrorClass.TIMEOUT, ErrorClass.TRANSIENT_IO, ErrorClass.MALFORMED_OUTPUT}
 )
+# INTERRUPTED is never produced by `classify`: only the harness's SIGINT path
+# records it, and it is terminal (the run is over; `--resume` continues it).
 WEIGHT: dict[ErrorClass, int] = {ErrorClass.TIMEOUT: 2}
 
 
