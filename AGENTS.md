@@ -96,8 +96,11 @@ never push without being asked) → stop and report.
 - **Workers read outside the snapshot.** E1 (2026-08-22): claude, codex and
   grok all read the parent and sibling directories of the snapshot; only agy
   refused (in-process permission check). Until the containment decision in
-  `docs/SECURITY.md` is made, Phase 0 may run plumbing and clean-control
-  tasks only — no defect-detection or ABSTAIN scoring.
+  `docs/SECURITY.md` is built (M2c container), Phase 0 may run plumbing,
+  `control` and `plan` tasks only; `eval/score.py` refuses to score
+  `revert`/`planted`/`insufficient` without `ArmRun.containment ==
+  "container"` (decision 2026-08-22: accept-and-scan; `eris.scan` marks
+  contaminated runs, it does not prevent reads).
 - **A missing worker is a recorded absence, never a substitution.** No
   fallback inside a panel — it collapses lineage diversity.
 - **Secrets only in `.env`**; never in YAML, never in the ledger, never printed
@@ -122,6 +125,7 @@ never push without being asked) → stop and report.
 | `src/eris/redact.py`, `writer.py` | The only path to disk |
 | `policies/default.yaml` | Declared workers, allowlists, budgets, vendors |
 | `docs/INVARIANTS.md` | Do-not-break rules with enforcing tests |
+| `eval/run.py`, `eval/score.py`, `eval/prompts/` | `run` / `campaign` / `campaign status` / scorer; the frozen stage prompts (M2b) |
 | `tests/conftest.py` | Hermeticity guards — read before writing a test |
 
 ## Related projects

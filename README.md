@@ -28,7 +28,12 @@ harness in this repository exists to run that experiment honestly:
 - `src/eris/verify.py` — allowlisted mechanical verification commands.
 - `src/eris/snapshot.py` — history-truncated corpus snapshots (no future
   commits reachable).
-- `eval/` — runner, scorer, and the pre-registered experiment design.
+- `src/eris/{evidence,stages,arms,retry,cache,sanitize,scan,ledger}.py` —
+  the M2b harness modules: evidence pack, stage contracts, arms, retry and
+  budget, call cache, snapshot sanitization, contamination scan, ledger view.
+- `eval/run.py` — `preflight`, `dry-run`, `invoke`, `run` (one cell),
+  `campaign` / `campaign status`; `eval/score.py` — the read-only scorer;
+  `eval/prompts/` — the frozen stage prompts.
 
 See `docs/PROTOCOL.md` for the protocol, `docs/EVAL-PLAN.md` for the
 experiment, `docs/SECURITY.md` for the threat model, and `AGENTS.md` for how
@@ -41,7 +46,14 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt && pip install -e .
 task ci            # ruff + mypy + pytest (fully hermetic; no CLIs, no network)
 eris doctor        # which declared workers are available (prints key NAMES only)
+eris policy pin    # pin executable hashes into policies/pins.yaml
+python eval/run.py run --task-file eval/corpus/<task>/task.json --arm indep_verify
+python eval/run.py campaign --campaign-id c1 --corpus eval/corpus --repeats 2 --dry-run
+python eval/score.py --campaign-dir runs/c1 --corpus eval/corpus
 ```
+
+Until a container-based containment exists (E1, `docs/SECURITY.md`) only
+`control` and `plan` tasks are scorable; the scorer refuses the others.
 
 Worker CLIs and API keys are declared in `policies/default.yaml`; secrets live
 only in `.env` (see `.env.example`).

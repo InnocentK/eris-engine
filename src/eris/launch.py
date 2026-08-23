@@ -438,6 +438,7 @@ class SpawnResult:
     timed_out: bool
     duration_ms: int
     killed_with: int | None = None
+    pgid: int | None = None  # == leader pid (start_new_session); resume kills a survivor
 
 
 class _Drain(threading.Thread):
@@ -473,13 +474,39 @@ class _Drain(threading.Thread):
         return b"".join(self.chunks)
 
 
-def _kill_group(proc: PopenLike, killpg: KillPg, grace_s: float) -> int:
+EPERM_SWEEP_RETRIES = 20
+EPERM_SWEEP_INTERVAL_S = 0.05
+
+
+def _sweep_sigkill(proc: PopenLike, killpg: KillPg, sleep: Callable[[float], None]) -> None:
+    """SIGKILL the whole group. macOS reports EPERM (not ESRCH) while a
+    member that already died is still an unreaped zombie (its parent, the
+    leader, is gone and launchd reaps it asynchronously): retry briefly.
+    EPERM that persists means a member we cannot signal - refuse loudly."""
+    for attempt in range(EPERM_SWEEP_RETRIES + 1):
+        try:
+            killpg(proc.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            if attempt == EPERM_SWEEP_RETRIES:
+                raise LaunchRefused(
+                    f"process group {proc.pid} could not be signalled ({exc}); a member may "
+                    "have survived the SIGKILL sweep"
+                ) from exc
+            sleep(EPERM_SWEEP_INTERVAL_S)
+
+
+def _kill_group(
+    proc: PopenLike, killpg: KillPg, grace_s: float, sleep: Callable[[float], None] = time.sleep
+) -> int:
     """SIGTERM the group, wait for the leader, then ALWAYS sweep the group
     with SIGKILL: members may ignore SIGTERM or outlive the leader. Returns
     the signal that ended the leader."""
     try:
         killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):  # EPERM: go straight to the sweep
         pass
     leader_gone = False
     try:
@@ -487,10 +514,7 @@ def _kill_group(proc: PopenLike, killpg: KillPg, grace_s: float) -> int:
         leader_gone = True
     except subprocess.TimeoutExpired:
         pass
-    try:
-        killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    _sweep_sigkill(proc, killpg, sleep)
     if leader_gone:
         return int(signal.SIGTERM)
     try:
@@ -513,6 +537,7 @@ def spawn(
     grace_s: float = 2.0,
     clock: Callable[[], float] = time.monotonic,
     exempt: Iterable[int] = (),
+    on_spawn: Callable[[int], None] | None = None,
 ) -> SpawnResult:
     assert_argv_safe(argv, exempt=exempt)
     assert_env_safe(env)
@@ -531,6 +556,10 @@ def spawn(
         shell=False,
         close_fds=True,
     )
+    if on_spawn is not None and isinstance(proc.pid, int) and proc.pid > 0:
+        on_spawn(
+            int(proc.pid)
+        )  # the harness records the pgid BEFORE waiting (resume kills survivors)
     out = _Drain(proc.stdout, max_stdout_bytes)
     err = _Drain(proc.stderr, max_stderr_bytes)
     out.start()
@@ -538,16 +567,26 @@ def spawn(
     timed_out = False
     killed_with: int | None = None
     try:
-        exit_code: int | None = proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        killed_with = _kill_group(proc, killpg, grace_s)
-        exit_code = proc.poll()
-    out.join(timeout=grace_s + 5)
-    err.join(timeout=grace_s + 5)
-    for stream in (proc.stdout, proc.stderr):
-        if stream is not None:
-            stream.close()
+        try:
+            exit_code: int | None = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            killed_with = _kill_group(proc, killpg, grace_s)
+            exit_code = proc.poll()
+        except KeyboardInterrupt:
+            # Ctrl-C in the harness: the worker group is killed through the same
+            # path as a timeout, then the interrupt propagates (no handler here).
+            _kill_group(proc, killpg, grace_s)
+            raise
+        out.join(timeout=grace_s + 5)
+        err.join(timeout=grace_s + 5)
+    finally:
+        # The pipes are closed on EVERY exit path. A refusal that escaped with
+        # them open used to leak fds whose finalizer (a ResourceWarning) then
+        # surfaced inside an unrelated test.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
     return SpawnResult(
         exit_code=exit_code,
         stdout=out.data,
@@ -557,6 +596,7 @@ def spawn(
         timed_out=timed_out,
         duration_ms=int((clock() - t0) * 1000),
         killed_with=killed_with,
+        pgid=int(proc.pid) if isinstance(proc.pid, int) and proc.pid > 0 else None,
     )
 
 
@@ -654,23 +694,62 @@ def _json_object(stdout: bytes, cli: str) -> tuple[dict[str, Any] | None, Envelo
     return data, None
 
 
+def _claude_error_message(data: dict[str, Any], result: Any) -> str:
+    """``result`` verbatim when claude gave one (``Not logged in …``);
+    otherwise ``claude: subtype=… terminal_reason=…: <errors joined>`` so the
+    retry classifier can see ``error_max_budget_usd`` / ``budget_exhausted``;
+    bare ``is_error`` when the envelope says nothing else."""
+    if result is not None:
+        return str(result)
+    parts: list[str] = []
+    subtype = data.get("subtype")
+    if isinstance(subtype, str) and subtype != "success":
+        parts.append(f"subtype={subtype!r}")
+    reason = data.get("terminal_reason")
+    if isinstance(reason, str) and reason:
+        parts.append(f"terminal_reason={reason!r}")
+    errors = data.get("errors")
+    messages = [e for e in errors if isinstance(e, str)] if isinstance(errors, list) else []
+    if not parts and not messages:
+        return "is_error"
+    text = "claude: " + " ".join(parts)
+    if messages:
+        text += (": " if parts else "") + "; ".join(messages)
+    return text
+
+
 def parse_claude(stdout: bytes) -> Envelope:
     """claude 2.1.239 ``--output-format json``. ``is_error`` is checked BEFORE
-    the shape so an auth failure is reported as the error it is."""
+    the shape so an auth failure is reported as the error it is; usage, cost
+    and model names are retained on error (F1)."""
     data, bad = _json_object(stdout, "claude")
     if data is None:
         assert bad is not None
         return bad
     result = data.get("result")
+    usage_raw = _dict(data.get("usage"))
+    details = _dict(usage_raw.get("output_tokens_details"))
+    usage = Usage(
+        input_tokens=_int_or_none(usage_raw.get("input_tokens")),
+        output_tokens=_int_or_none(usage_raw.get("output_tokens")),
+        cached_input_tokens=_int_or_none(usage_raw.get("cache_read_input_tokens")),
+        reasoning_tokens=_int_or_none(details.get("thinking_tokens")),
+    )
+    model, names = _pick_model(data.get("modelUsage"))
     if data.get("is_error") is True:
+        # F1: an error envelope still carries usage and cost (T2: the
+        # --max-budget-usd cap tripped at $0.129 on a $0.10 cap - the spend is
+        # real and must be recorded). The message comes from `result` when
+        # present, else from subtype / terminal_reason / errors[].
         return Envelope(
             None,
-            None,
-            None,
-            None,
+            model,
+            usage if usage_raw else None,
+            _float_or_none(data.get("total_cost_usd")),
             True,
-            str(result) if result is not None else "is_error",
+            _claude_error_message(data, result),
             "json",
+            models_used=names,
             raw=data,
         )
     if data.get("type") != "result" or not isinstance(result, str):
@@ -684,15 +763,6 @@ def parse_claude(stdout: bytes) -> Envelope:
             "json",
             raw=data,
         )
-    usage_raw = _dict(data.get("usage"))
-    details = _dict(usage_raw.get("output_tokens_details"))
-    usage = Usage(
-        input_tokens=_int_or_none(usage_raw.get("input_tokens")),
-        output_tokens=_int_or_none(usage_raw.get("output_tokens")),
-        cached_input_tokens=_int_or_none(usage_raw.get("cache_read_input_tokens")),
-        reasoning_tokens=_int_or_none(details.get("thinking_tokens")),
-    )
-    model, names = _pick_model(data.get("modelUsage"))
     structured = data.get("structured_output")
     if structured is None:
         structured = _structured_from_text(result)
@@ -763,7 +833,12 @@ def parse_codex(stdout: bytes) -> Envelope:
                 reasoning_tokens=_int_or_none(u.get("reasoning_output_tokens")),
             )
         elif kind in ("error", "turn.failed"):
-            error = f"codex: {ev.get('message') or ev.get('error') or kind}"
+            # `turn.failed` carries an OBJECT {message: ...} (E2 401 capture);
+            # `error` events carry a string `message`.
+            detail = ev.get("message") or ev.get("error") or kind
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail
+            error = f"codex: {detail}"
     if not completed and error is None:
         error = "codex: no turn.completed event"
     return Envelope(
@@ -789,6 +864,10 @@ def parse_grok(stdout: bytes) -> Envelope:
         return bad
     text = data.get("text")
     if not isinstance(text, str):
+        # E17: an API refusal is {type: error, message: ...} with no text key.
+        message = data.get("message")
+        if data.get("type") == "error" and isinstance(message, str) and message:
+            return Envelope(None, None, None, None, True, f"grok: {message}", "json", raw=data)
         return Envelope(
             None, None, None, None, True, "grok: envelope has no text", "json", raw=data
         )
@@ -904,15 +983,18 @@ class WorkerCall:
     snapshot_sha: str | None = None
 
 
-def idempotency_key(call: WorkerCall) -> str:
-    """Excludes the experimental arm (so arms share proposals); includes
-    repeat_index and the snapshot's base commit (a re-snapshotted task never
-    collides with the old one)."""
-    material = {
+def idempotency_material(call: WorkerCall) -> dict[str, Any]:
+    """The key's inputs. Excludes the experimental arm (so arms share
+    proposals) and the attempt; includes repeat_index, the snapshot's base
+    commit (a re-snapshotted task never collides with the old one) and, since
+    M2b, the pinned executable's sha256 (a cache entry produced by another
+    binary is never a hit)."""
+    return {
         "snapshot_sha": call.snapshot_sha,
         "worker_id": call.worker_id,
         "provider": call.policy.provider,
         "model": call.policy.model,
+        "executable_sha256": call.policy.executable_sha256,
         "stage": call.stage.value,
         "task_id": call.task_id,
         "prompt_sha256": sha256_hex(call.prompt.encode("utf-8")),
@@ -920,7 +1002,10 @@ def idempotency_key(call: WorkerCall) -> str:
         "repeat_index": call.repeat_index,
         "policy_sha256": call.policy_sha256,
     }
-    return sha256_hex(canonical_bytes(material))
+
+
+def idempotency_key(call: WorkerCall) -> str:
+    return sha256_hex(canonical_bytes(idempotency_material(call)))
 
 
 @dataclass
@@ -1068,6 +1153,11 @@ class WorkerResult:
     cleanup_error: str | None = None  # scratch removal failed: a raw file MAY remain on disk
     conversation_id: str | None = None  # agy session handle (brain dir derivable at read time)
     worker_reported_duration_ms: int | None = None  # the worker's own figure; duration_ms is ours
+    # F3 "OK with error": the worker completed (status OK) but flagged something
+    # (grok `stopReason: cancelled`, a claude non-success subtype). The message
+    # lives here, never in `error`, which is reserved for non-OK statuses.
+    warning: str | None = None
+    pgid: int | None = None  # process group of the spawned leader (None when nothing spawned)
 
 
 def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -> WorkerResult:
@@ -1096,6 +1186,16 @@ def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -
         timed_out=False,
         parse_mode="none",
     )
+
+
+def budget_tripped_result(call: WorkerCall, reason: str) -> WorkerResult:
+    """F4: the Eris budget pre-check refused to spawn. A recorded absence with
+    status BUDGET_TRIPPED; nothing ran, nothing was spent."""
+    try:
+        key = plan_call(call).idempotency_key
+    except LaunchRefused:
+        key = idempotency_key(call)
+    return _absent(call, WorkerStatus.BUDGET_TRIPPED, reason, key)
 
 
 def make_private_dir(path: Path) -> None:
@@ -1150,6 +1250,7 @@ def run_worker(
     killpg: KillPg = os.killpg,
     hasher: Callable[[Path], str] = sha256_file,
     clock: Callable[[], float] = time.monotonic,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> WorkerResult:
     """launch -> drain -> parse. Never raises; absence is a status."""
     try:
@@ -1176,7 +1277,9 @@ def run_worker(
     # goes through the cleanup in `finally` and carries its outcome.
     cleanup_error: str | None = None
     try:
-        result = _execute(call, plan, digest, popen=popen, killpg=killpg, clock=clock)
+        result = _execute(
+            call, plan, digest, popen=popen, killpg=killpg, clock=clock, on_spawn=on_spawn
+        )
     finally:
         # Never leave the unredacted `-o` file (or the schema) on disk; the
         # caller passes output_file through RunWriter.put_blob. A cleanup
@@ -1199,6 +1302,7 @@ def _execute(
     popen: PopenFactory,
     killpg: KillPg,
     clock: Callable[[], float],
+    on_spawn: Callable[[int], None] | None = None,
 ) -> WorkerResult:
     """spawn -> read `-o` -> parse -> WorkerResult. Never raises on worker
     misbehaviour; the caller attaches cleanup_error afterwards."""
@@ -1222,6 +1326,7 @@ def _execute(
             killpg=killpg,
             clock=clock,
             exempt=(plan.prompt_index,),
+            on_spawn=on_spawn,
         )
     except LaunchRefused as exc:
         return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
@@ -1259,6 +1364,7 @@ def _execute(
     if envelope.structured is None and output_file:
         envelope.structured = _structured_from_text(output_file.decode("utf-8", errors="replace"))
     error: str | None
+    warning: str | None = None
     if spawned.timed_out:
         status = WorkerStatus.TIMEOUT
         error = f"timed out after {w.timeout_s}s (killed with signal {spawned.killed_with})"
@@ -1273,7 +1379,8 @@ def _execute(
         error = f"exit code {spawned.exit_code}"
     else:
         status = WorkerStatus.OK
-        error = envelope.error
+        error = None
+        warning = envelope.error  # F3: "OK with error" is a warning, not a failure
     return WorkerResult(
         worker_id=call.worker_id,
         provider=w.provider,
@@ -1304,4 +1411,14 @@ def _execute(
         output_file_size=output_size,
         conversation_id=envelope.conversation_id,
         worker_reported_duration_ms=envelope.worker_reported_duration_ms,
+        warning=warning,
+        pgid=spawned.pgid,
     )
+
+
+def invocation_id_for(idempotency_key: str, attempt: int) -> str:
+    """F2: unique per ATTEMPT - ``inv-<key[:16]>-a<attempt>``. Two attempts of
+    the same call share the key (it excludes the attempt) but never an id."""
+    if attempt < 1:
+        raise ValueError(f"attempt must be >= 1 (got {attempt})")
+    return f"inv-{idempotency_key[:16]}-a{attempt}"

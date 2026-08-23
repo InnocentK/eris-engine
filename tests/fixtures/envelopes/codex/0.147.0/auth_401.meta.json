@@ -1,0 +1,12 @@
+{
+  "cli": "codex",
+  "version": "0.147.0",
+  "experiment": "E2",
+  "argv": ["env", "CODEX_HOME=<empty dir>", "codex", "exec", "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", "-C", "<snapshot>", "Reply with exactly the single word: ok"],
+  "argv_source": "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "E2: CODEX_HOME relocated to an empty directory -> no credentials. codex retries the websocket 5x, falls back to HTTPS, retries 5x more, then emits a final `error` event and `turn.failed` whose `error` is an OBJECT {message: ...} (not a string). No turn.completed, no usage, rc 1. 401 Unauthorized is an auth_terminal class: never retried by Eris. cf-ray / request ids are server-side correlation ids, not secrets; no user path appears."
+}

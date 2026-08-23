@@ -1,0 +1,1 @@
+{"claim_id":"c_01","evidence_refs":["e_01"],"location":{"line_end":171,"line_start":148,"path":"providers/claude.py"},"origin":"model_asserted","revised_at":"2026-08-21T10:05:00.250000Z","revision":2,"schema_version":"0.1.5","text":"Tests pass on the snapshot"}

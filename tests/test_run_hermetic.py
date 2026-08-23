@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -36,6 +38,7 @@ def setup_world(tmp_path: Path, *, pinned: bool = True) -> dict[str, Path]:
     policy = {
         "policy_version": "t",
         "runs_dir": str(tmp_path / "runs"),
+        "scratch_dir": str(tmp_path / "scratch"),
         "path_env": "/usr/bin:/bin",
         "vendors_allowed": ["xai"],
         "credential_files": [str(cred)],
@@ -158,6 +161,7 @@ def test_invoke_full_path_is_hermetic_and_redacted(
     assert inv["status"] == "ok" and inv["idempotency_key"] == json.loads(lines[0])["payload"].get(
         "idempotency_key", inv["idempotency_key"]
     )
+    assert inv["invocation_id"] == f"inv-{inv['idempotency_key'][:16]}-a1"  # F2: per attempt
     assert inv["env_names"] == sorted(inv["env_names"]) and "XAI_API_KEY" in inv["env_names"]
     # the worker saw the secret VALUE; the ledger never does
     assert factory.instances[0].popen_kwargs["env"]["XAI_API_KEY"] == PLANTED
@@ -271,15 +275,25 @@ def test_invoke_key_includes_snapshot_sha_from_git_head(
         )
 
 
-def test_invoke_creates_scratch_after_the_lock_and_refuses_planted_symlink(
+def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_entry_is_refused(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
+    """Every ephemeral file lives under the policy scratch_dir (never under
+    runs/). The sweep never touches the CURRENT run's path (it could belong to
+    a run starting concurrently), so a planted symlink there is REFUSED, never
+    followed and never deleted; an old orphan is swept."""
     w = setup_world(tmp_path)
     runs = tmp_path / "runs"
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    (runs / "r").mkdir(parents=True)
-    (runs / "r" / "scratch").symlink_to(elsewhere)
+    (elsewhere / "keep").write_text("x")
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir()
+    (scratch_dir / "r").symlink_to(elsewhere)
+    orphan = scratch_dir / "old-orphan"
+    orphan.mkdir()
+    old = time.time() - 86_400
+    os.utime(orphan, (old, old))
     factory = fake_process(stdout=b"{}")
     out = io.StringIO()
     rc = main(
@@ -287,11 +301,58 @@ def test_invoke_creates_scratch_after_the_lock_and_refuses_planted_symlink(
         out=out,
         home=tmp_path,
         popen=factory,
+        killpg=lambda *_: None,
     )
-    assert rc == 2 and "symlink" in json.loads(out.getvalue())["error"]
-    assert factory.instances == [] and list(elsewhere.iterdir()) == []
-    assert (runs / "r" / ".lock").exists()  # the writer had opened before scratch was touched
-    assert not (runs / "r" / "manifest.json").exists()
+    assert rc == 2 and "already exists (or is a symlink)" in json.loads(out.getvalue())["error"]
+    assert factory.instances == []  # nothing spawned into a planted workspace
+    assert (scratch_dir / "r").is_symlink()  # refused, not deleted, not followed
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["keep"]
+    assert not orphan.exists()  # the old orphan WAS swept
+    assert not (runs / "r" / "scratch").exists()
+    extra = {p.relative_to(runs / "r").as_posix() for p in (runs / "r").rglob("*")}
+    assert all(
+        e in (".lock", "events.jsonl", "manifest.json", "blobs", "blobs/sha256")
+        or e.startswith("blobs/sha256/")
+        for e in extra
+    )
+
+
+def test_invoke_reserves_the_scratch_before_the_writer_opens(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final item 2 (invoke path): the reservation is the mkdir, and it happens
+    BEFORE the writer opens. An entry appearing between the precheck and the
+    mkdir refuses with no run directory created and the entry left alone."""
+    import eval.run as run_module
+
+    w = setup_world(tmp_path)
+    runs = tmp_path / "runs"
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir()
+    real = run_module.make_private_dir
+    planted: list[Path] = []
+
+    def racing_make_private_dir(path: Path) -> None:
+        if not planted:
+            Path(path).mkdir(parents=True)
+            (Path(path) / "not-ours").write_text("planted")
+            planted.append(Path(path))
+        real(path)
+
+    monkeypatch.setattr(run_module, "make_private_dir", racing_make_private_dir)
+    factory = fake_process(stdout=b"{}")
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(runs), "--run-id", "raced"],
+        out=out,
+        home=tmp_path,
+        popen=factory,
+        killpg=lambda *_: None,
+    )
+    assert rc == 2 and "refusing" in json.loads(out.getvalue())["error"]
+    assert factory.instances == []  # nothing spawned
+    assert not (runs / "raced").exists()  # no ledger, no run dir
+    assert planted[0].is_dir() and (planted[0] / "not-ours").read_text() == "planted"
 
 
 def test_invoke_surfaces_cleanup_failure_as_run_error(

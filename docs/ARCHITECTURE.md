@@ -1,4 +1,4 @@
-# Architecture (Milestone 1)
+# Architecture (Milestone 1 → 2b)
 
 Python >= 3.12, `src/` layout, Pydantic v2, argparse, exact pins in
 `requirements.txt`. Security-critical code lives in `src/eris/` under mypy
@@ -30,7 +30,16 @@ snapshot.py (history-truncated clones)                       └── schemas.p
 | `snapshot.py` | `build_snapshot`, `verify_snapshot` over an injectable git runner | `SnapshotError` |
 | `doctor.py` | Preflight checks; prints names only | Never |
 | `cli.py` | `eris doctor`, `eris policy pin` | exit codes |
-| `eval/run.py` | `preflight`, `dry-run`, `invoke` (one worker, propose stage) | exit codes |
+| `retry.py` | Failure classes (table as data), backoff, retry weight budget, `BudgetLedger`, `run_with_retry` driver | never on worker behaviour; writer errors propagate |
+| `cache.py` | Write-once worker-call cache (`cache/`), hit rules, replay | `CacheMiss` values; `CacheUnsupported` without `O_NOFOLLOW` |
+| `sanitize.py` | Per-worker sanitized snapshot copy (strip list, symlink rules, no hooks) | `SanitizeError`, `SanitizeCleanupError` |
+| `scan.py` | Run-time contamination patterns; scan of blobs/events/pack/cache; `ScanResult` (hashes + counts) | never |
+| `evidence.py` | `TaskSpec`, evidence pack builder, evidence-request loop, `verify_scratch` | `EvidenceStopped`, `EvidenceCleanupError` |
+| `stages.py` | Frozen prompts + nonce envelope, wire models, id assignment, propose/critique/adjudicate/summarize runners, cache integration | never on worker behaviour |
+| `arms.py` | Arm table, sequential cell runner, STOP/budget boundaries, resume prior, stale groups | `ArmStopped` (internal), `ResumeRefused` |
+| `ledger.py` | Read-only validated ledger view, cost totals | `LedgerCorrupt` |
+| `eval/run.py` | `preflight`, `dry-run`, `invoke`, `run`, `campaign`, `campaign status`; the SIGINT handler | exit codes 0/2/3/4/5/6/130 |
+| `eval/score.py` | Read-only scorer (key.json, E1 gate, re-scan, metrics, paired deltas) | exit 7 on the gate |
 
 ## Data flow of `invoke`
 
@@ -61,12 +70,16 @@ state from it, `TMPDIR` points into the run directory. Per-CLI extras
 ## Storage layout
 
 ```
-runs/<run_id>/
+runs/<run_id>/                       one cell (task x repeat x arm) or one `invoke`
   .lock            flock'd by the writer
   events.jsonl     hash chain
   blobs/sha256/<hex>
   manifest.json    last
-  scratch/         codex schema/output files, TMPDIR
+  scratch/         codex call dirs, verify HOME, sanitized copies (all removed)
+runs/<campaign_id>/                  campaign ledger + one cell dir per cell
+runs/STOP, runs/<campaign_id>/STOP   stop files
+cache/entries|keys|blobs             write-once call cache (never under runs/)
+eval/corpus/<task>/{task.json,key.json,snapshot/}
 policies/default.yaml   committed
 policies/pins.yaml      machine-specific, gitignored
 ```
@@ -74,5 +87,6 @@ policies/pins.yaml      machine-specific, gitignored
 ## Not built (by design, until Phase 0 clears its rule)
 
 State machine, ledger package, adjudication loop, SQLite index, API workers
-(`httpx` is pinned but unused in M1), arms/critique/adjudicate orchestration,
-`eval/score.py`, containers.
+(`httpx` is pinned but unused), containers (the E1 containment, M2c), the
+corpus keys and pre-registration text (M2c), Windows fallbacks for
+`fcntl.flock`/`os.killpg`/`O_NOFOLLOW` (documented refusals today).

@@ -1,9 +1,39 @@
 # Phase 0 evaluation plan
 
-Status: pre-registration is Milestone 2 (`eval/README.md` with arms, metrics,
-per-category decision rule and a USD ceiling from a 3-task pilot). This file
-records what is already settled, what the flag experiments showed, and the
-open experiments that must run before any corpus run.
+Status: the harness is RUNNABLE as of 0.3.0 (`eval/run.py run|campaign`,
+`eval/score.py`); the pre-registration text (`eval/README.md` with the
+per-category decision rule and a USD ceiling from a 3-task pilot) and the
+corpus keys are Milestone 2c. This file records what is settled, what the
+experiments showed, and what must still run before any scored corpus run.
+
+## Runnable now (Milestone 2b)
+* `python eval/run.py run --task-file eval/corpus/<t>/task.json --arm <arm>`
+  runs one cell; `campaign --campaign-id <id> --corpus eval/corpus --repeats N`
+  runs every cell task-major → repeat → arms in the fixed order
+  (`single` per panel worker, `consensus`, `indep_verify`,
+  `indep_verify_iter`, `indep_verify_critique`); `campaign status` is
+  read-only; `--resume` continues; STOP files and SIGINT are honoured;
+  `python eval/score.py --campaign-dir runs/<id> --corpus eval/corpus`
+  scores. Exit codes 0/2/3/4/5/6/7/130 (`eval/run.py` docstring).
+* **Pre-registration notes (binding for the scorer):** arm 2 (`consensus`)
+  is scored on the RAW summarizer verdict (the enforced one is recorded
+  too); arms 3/3b/4 are paired only when their `propose_keys` are
+  identical (one policy per campaign - a policy edit changes every key);
+  categories `revert`/`planted`/`insufficient` are NOT scored without
+  `ArmRun.containment == "container"` (E1 decision, exit 7, no override).
+  **Caveat (testing critic, recorded):** `plan` keys are as readable to a
+  worker as the others; `plan` and `control` are scored without
+  containment by user decision, and their results carry the same E1 risk.
+* A campaign cell whose ledger is unreadable is reserved pessimistically
+  (every planned call of that arm, judge iterations included, at the worst
+  case the retry driver can reach), so a corruption can halt later cells on
+  the campaign budget. Intended fail-closed behaviour, resolvable by the
+  operator: inspect or remove the corrupt cell, or raise `per_campaign_usd`,
+  then `--resume`.
+* Until the E1 containment exists only `control`/`plan` and plumbing runs
+  are scorable; a BUDGET_TRIPPED cell is MISSING; contaminated or
+  `scan_incomplete` cells are excluded from quality metrics and counted in
+  cost.
 
 ## Settled (from `docs/history/PHASE0-PLAN-2026-08-21.md`)
 * Arms: single model x3 lineages; naive consensus; independent +
@@ -63,7 +93,9 @@ Google lineage is Antigravity `agy` 1.1.18.
 | E6 | Per-call cost for codex and agy | grok and claude report `total_cost_usd`; codex and agy emit token usage only. Decide a pricing table source or keep cost `None` with usage (current). | OPEN |
 | E10 | Redactor throughput on real worker output (currently ~3 MB/s synthetic) | Time `put_blob` on a captured 10 MB envelope. | NOT RUN |
 | E11 | agy rules/hook injection WITH a declared workspace (`--add-dir`) | CONFIRMED for `AGENTS.md` + `GEMINI.md` (A15: `MANGO KIWI`). Still to measure with `--add-dir`: `CLAUDE.md`, `.agents/rules/r.md`, and whether a `.agents/hooks.json` SessionStart hook fires (the hook question referenced from SECURITY.md lives here). Re-run after any change of the pinned `agy` binary. Mitigation: E16. | INJECTED (1.1.18); hooks UNKNOWN |
-| E16 | Per-worker snapshot sanitization for agy (strip `AGENTS.md`/`GEMINI.md`/`CLAUDE.md`/`.agents/` from the agy worktree copy, recorded in the manifest) — the mitigation for E11 | Milestone 2b. Until then agy proposals/critiques are exposed to repo-authored instructions (same class as grok) and must be treated as such in scoring. | NOT BUILT (M2b) |
+| E16 | Per-worker snapshot sanitization for agy (strip `AGENTS.md`/`GEMINI.md`/`CLAUDE.md`/`.agents/` from the agy worktree copy, recorded in the manifest) — the mitigation for E11 | BUILT in 0.3.0 (`eris.sanitize`; agy and grok `sanitize_snapshot: true`; `SnapshotSanitization` record; residual channels in `docs/SECURITY.md`). Whether `.agents/hooks.json` fires from a declared workspace is still E11. | BUILT (M2b) |
+| A17 | agy `--add-dir` symlink traversal: does a symlink INSIDE the declared workspace pointing outside it let agy read outside? | Live run 2026-08-22 (`scratchpad/exp2/out/A17_agy_symlink.stdout`): agy resolved `LINK_TO_OUTSIDE.txt -> ../outside` to its real path and DENIED the read (`permission check failed`). Confinement resolves symlinks; the sanitizer's symlink drop is defence in depth. | PASS |
+| E17 | grok injection reproducibility (E1's reply began `MANGO PINEAPPLE`) | Live run 2026-08-22 (`scratchpad/exp2/out/E17_grok_injection.stdout`, fixture `grok/1.0.5/api_error_403.json`): asked to quote any begin-reply instructions, grok replied `None`; a second prompt was refused by the API (403 `SAFETY_CHECK_TYPE_BIO`). Injection observed once, not reproduced; grok is sanitized anyway. | NOT REPRODUCED |
 | E12 | Eris env `PATH` (policy `path_env` lacks `~/.local/bin`): do agy/claude/codex spawn helpers by PATH? | `eval/run.py dry-run` per worker, then one live `invoke` each and inspect stderr / exit status. | NOT RUN |
 | E13 | Which file under `HOME` agy actually needs for auth (A8: relocated HOME → auth error, so HOME-rooted) | Bisect a relocated HOME containing only `~/.gemini/antigravity-cli/` vs only `~/.gemini/oauth_creds.json`. | UNKNOWN |
 | E14 | Per-worker read confinement on the host: codex restricted-read permission profile path set; claude `--settings` read-deny rules | Candidate per-worker mitigations, unverified; grok's documented strict sandbox already FAILED (E1b). | UNKNOWN |

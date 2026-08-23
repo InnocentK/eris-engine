@@ -1,0 +1,12 @@
+{
+  "cli": "claude",
+  "version": "2.1.239",
+  "experiment": "T2",
+  "argv": ["claude", "-p", "Reply with exactly the single word: ok", "--output-format", "json", "--no-session-persistence", "--safe-mode", "--max-budget-usd", "0.10"],
+  "argv_source": "argv as recorded in scratchpad/flagtest/claude_tests.sh (flag battery 1)",
+  "captured_at": "2026-08-22",
+  "captured_by": "synthesizer",
+  "redacted": false,
+  "redaction": null,
+  "note": "T2 re-run: the --max-budget-usd 0.10 cap tripped BEFORE any output: is_error true, subtype error_max_budget_usd, terminal_reason budget_exhausted, errors ['Reached maximum budget ($0.1)'], NO result key, total_cost_usd 0.129044 (the cap overshoots: the spend is recorded even though the cap was 0.10), modelUsage lists the haiku helper and the primary. The earlier T2 capture of the same argv (safemode.json) completed with cost 0.080129. Nothing to redact: no paths, no tokens."
+}

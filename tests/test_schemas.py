@@ -191,12 +191,15 @@ def test_current_schema_version_has_a_manifest_entry() -> None:
 # sha256 of the canonical JSON of EVERY committed manifest block, including
 # the current version: committed = immutable. These pin the manifest entries
 # themselves so that editing a golden together with its manifest line is
-# still caught. The next serialization change goes to a NEW version (0.1.3)
+# still caught. The next serialization change goes to a NEW version (0.1.6)
 # with a new line here; an existing line is never edited.
 PINNED_MANIFEST_BLOCKS = {
     "0.1.0": "46df57acc986804a99037db9fb21e8070e4c7944a31cf21e88d90752fb3b5c0c",
     "0.1.1": "715e86bccfd674c7743c4e722bdd3f5081060002608a312cc0314b8a154c464e",
     "0.1.2": "290f7f1c9e253dec5d619ddd4dfa20c9a8acb17bc411f270509a521847c661da",
+    "0.1.3": "62c1b88822f5868bbcb7235d576f72485d2c6bfda9597982061bc85cf733c880",
+    "0.1.4": "574df681841271fc80428b349a81d83fe28cf4af56ccfba7c76b4140a53ce1cf",
+    "0.1.5": "d3c1a8bb518d36ecd73a5dc7e7540afe39855ce6f3b761c297e07e584ecf00c4",
 }
 
 
@@ -212,9 +215,9 @@ def _assert_goldens_pinned(root: Path, manifest: dict[str, dict[str, str]]) -> N
 
 
 def test_committed_goldens_are_byte_identical_to_their_pinned_manifest() -> None:
-    """Every committed version (0.1.0, 0.1.1 AND the current 0.1.2) must
-    never change: its manifest block hashes to the value pinned here, and
-    every file on disk still hashes to its manifest line."""
+    """Every committed version (0.1.0 to 0.1.4 AND the current 0.1.5)
+    must never change: its manifest block hashes to the value pinned here,
+    and every file on disk still hashes to its manifest line."""
     _assert_goldens_pinned(RECORDS_ROOT, _manifest())
     assert SCHEMA_VERSION in PINNED_MANIFEST_BLOCKS  # the current version is pinned too
     assert set(PINNED_MANIFEST_BLOCKS) == set(_manifest())  # nothing committed is unpinned
@@ -223,8 +226,9 @@ def test_committed_goldens_are_byte_identical_to_their_pinned_manifest() -> None
 def test_editing_a_current_golden_or_its_manifest_line_fails_without_a_bump(
     tmp_path: Path,
 ) -> None:
-    """Simulated tamper on a copy: flipping a byte in a 0.1.2 golden fails; so
-    does 'fixing' its manifest line to match (the block hash is pinned)."""
+    """Simulated tamper on a copy: flipping a byte in a current-version golden
+    fails; so does 'fixing' its manifest line to match (the block hash is
+    pinned)."""
     import hashlib
     import shutil
 
@@ -243,8 +247,9 @@ def test_editing_a_current_golden_or_its_manifest_line_fails_without_a_bump(
 
 def test_invocation_0_1_2_fields() -> None:
     """0.1.2 added ``conversation_id`` and ``worker_reported_duration_ms``
-    (both optional, default None). The 0.1.2 golden exercises them; the 0.1.1
-    golden has no such keys (the serialization changed, hence the bump)."""
+    (both optional, default None). The current golden still exercises them;
+    the 0.1.1 golden has no such keys (the serialization changed, hence the
+    bump)."""
     inv = example_records()["invocation"]
     data = json.loads(canonical_bytes(inv))
     assert data["conversation_id"] == "ed889929-a04c-457f-91d1-194be848aa04"
@@ -274,3 +279,137 @@ def test_old_schema_versions_are_rejected_on_parse() -> None:
             Task.model_validate_json(raw)
     with pytest.raises(ValidationError):
         Task.model_validate({**example_records()["task"].model_dump(), "schema_version": "9.9.9"})
+
+
+def test_schema_0_1_3_field_additions() -> None:
+    """0.1.3: Invocation.{prompt_sha256, reused_from, pgid, warning},
+    CostRecord.{estimated, cost_known}, Proposal/Adjudication.evidence_requests,
+    EvidenceRequest.expect_exit_code - all optional with defaults, all
+    exercised by the current goldens and absent from the 0.1.2 ones."""
+    from eris.schemas import CostRecord, EvidenceRequest, Proposal
+
+    ex = example_records()
+    inv = json.loads(canonical_bytes(ex["invocation"]))
+    assert inv["prompt_sha256"] == "d" * 64 and inv["reused_from"] is None
+    assert inv["pgid"] == 424242 and inv["warning"] == "grok: stopReason='cancelled'"
+    cost = json.loads(canonical_bytes(ex["cost"]))
+    assert cost["estimated"] is False and cost["cost_known"] is True
+    prop = json.loads(canonical_bytes(ex["proposal"]))
+    assert prop["evidence_requests"][0]["expect_exit_code"] == 0
+    adj = json.loads(canonical_bytes(ex["adjudication"]))
+    assert adj["evidence_requests"][0]["argv"] == ["git", "status", "--porcelain"]
+    for name, keys in {
+        "invocation": ("prompt_sha256", "reused_from", "pgid", "warning"),
+        "cost": ("estimated", "cost_known"),
+        "proposal": ("evidence_requests",),
+        "adjudication": ("evidence_requests",),
+    }.items():
+        old = json.loads((RECORDS_ROOT / "0.1.2" / f"{name}.json").read_bytes())
+        assert not any(k in old for k in keys), (name, keys)
+    # defaults: every addition is optional
+    bare = Invocation.model_validate(
+        {
+            k: v
+            for k, v in inv.items()
+            if k not in ("prompt_sha256", "reused_from", "pgid", "warning")
+        }
+    )
+    assert bare.prompt_sha256 is None and bare.pgid is None and bare.warning is None
+    assert CostRecord(invocation_id="i", attempt=1).cost_known is True
+    assert (
+        Proposal.model_validate(
+            {k: v for k, v in prop.items() if k != "evidence_requests"}
+        ).evidence_requests
+        == []
+    )
+    assert EvidenceRequest(argv=["git"]).expect_exit_code is None
+    with pytest.raises(ValidationError):
+        Invocation.model_validate({**inv, "pgid": 0})
+    with pytest.raises(ValidationError):
+        Invocation.model_validate({**inv, "prompt_sha256": "xyz"})
+
+
+def test_schema_0_1_3_new_records_are_golden_pinned_and_observed() -> None:
+    """The five new records exist, are mechanically_observed by default, are
+    in RECORD_TYPES and have goldens (covered by the parametrized tests too)."""
+    from eris.schemas import ArmRun, EvidencePack, RetryAttempt, ScanResult, SnapshotSanitization
+
+    new = (EvidencePack, RetryAttempt, ScanResult, SnapshotSanitization, ArmRun)
+    assert all(t in RECORD_TYPES for t in new)
+    ex = example_records()
+    for name in (
+        "evidence_pack",
+        "retry_attempt",
+        "scan_result",
+        "snapshot_sanitization",
+        "arm_run",
+    ):
+        assert ex[name].origin is Origin.MECHANICALLY_OBSERVED
+        assert (GOLDEN_DIR / f"{name}.json").is_file()
+        assert not (RECORDS_ROOT / "0.1.2" / f"{name}.json").exists()
+    # ScanResult carries hashes and counts only: no free-text pattern field
+    assert set(ScanResult.model_fields) == {
+        "schema_version",
+        "origin",
+        "scan_id",
+        "run_id",
+        "patterns_sha256",
+        "pattern_count",
+        "patterns_dropped_nondistinctive",
+        "hits",
+        "contaminated",
+        "scan_incomplete",
+        "scanned_blobs",
+        "scanned_events",
+    }
+    with pytest.raises(ValidationError):
+        RetryAttempt.model_validate({**ex["retry_attempt"].model_dump(), "weight": 3})
+    with pytest.raises(ValidationError):
+        RetryAttempt.model_validate({**ex["retry_attempt"].model_dump(), "decision": "maybe"})
+    with pytest.raises(ValidationError):
+        ArmRun.model_validate({**ex["arm_run"].model_dump(), "arm": "arm_9"})
+
+
+def test_schema_0_1_4_evidence_item_violated() -> None:
+    """0.1.4: ``EvidenceItem.violated`` (default False) marks a verification
+    command that changed the pristine copy; absent from the 0.1.3 golden."""
+    from eris.schemas import EvidenceItem
+
+    ev = example_records()["evidence"]
+    assert json.loads(canonical_bytes(ev))["violated"] is True
+    old = json.loads((RECORDS_ROOT / "0.1.3" / "evidence.json").read_bytes())
+    assert "violated" not in old
+    bare = EvidenceItem.model_validate(
+        {k: v for k, v in json.loads(canonical_bytes(ev)).items() if k != "violated"}
+    )
+    assert bare.violated is False
+
+
+def test_schema_0_1_5_error_class_interrupted() -> None:
+    """0.1.5: ``ErrorClass.INTERRUPTED`` - the harness's own SIGINT class,
+    never ``unknown`` and never produced by the retry classifier."""
+    from eris.retry import PATTERNS, RETRYABLE
+    from eris.schemas import ErrorClass, RetryAttempt
+
+    assert ErrorClass("interrupted") is ErrorClass.INTERRUPTED
+    assert ErrorClass.INTERRUPTED not in RETRYABLE  # terminal
+    assert ErrorClass.INTERRUPTED not in {p.error_class for p in PATTERNS}
+    record = RetryAttempt.model_validate(
+        {
+            **example_records()["retry_attempt"].model_dump(mode="json"),
+            "error_class": "interrupted",
+            "decision": "stop",
+        }
+    )
+    assert record.error_class is ErrorClass.INTERRUPTED
+    old = json.loads((RECORDS_ROOT / "0.1.4" / "retry_attempt.json").read_bytes())
+    assert old["schema_version"] == "0.1.4"  # the bump is what makes 0.1.5 a new directory
+
+
+def test_stage_has_verify_and_summarize() -> None:
+    """F6: the harness stages include mechanical verification and the
+    consensus summarizer; the values are stable strings."""
+    from eris.schemas import Stage
+
+    assert [s.value for s in Stage] == ["propose", "critique", "verify", "adjudicate", "summarize"]
+    assert Stage("verify") is Stage.VERIFY and Stage("summarize") is Stage.SUMMARIZE

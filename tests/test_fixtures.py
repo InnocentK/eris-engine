@@ -22,9 +22,11 @@ _USER_PATH = re.compile(r"/(?:Users|home)/([^/\s\"'`)\]]+)")
 # its own name; any survivor of that form is a leak.
 _SCRATCH_PATH = re.compile(r"/private/tmp/claude-[^/\s\"']*/-Users-[^/\s\"']*")
 CAPTURED = "argv as recorded in scratchpad/exp2/run.sh (experiment battery 2)"
+CAPTURED_FLAGTEST = "argv as recorded in scratchpad/flagtest/claude_tests.sh (flag battery 1)"
 RECONSTRUCTED = (
     "reconstructed by the synthesizer from the experiment script; not mechanically captured"
 )
+ARGV_SOURCES = (CAPTURED, CAPTURED_FLAGTEST, RECONSTRUCTED)
 
 
 def _fixture_files() -> list[Path]:
@@ -94,7 +96,7 @@ def test_every_capture_has_a_meta_sidecar_with_argv(capture: str) -> None:
     # provenance is explicit: either the battery script recorded it, or the
     # sidecar says the argv was reconstructed and not mechanically captured
     if "argv_source" in meta:
-        assert meta["argv_source"] in (CAPTURED, RECONSTRUCTED), meta["argv_source"]
+        assert meta["argv_source"] in ARGV_SOURCES, meta["argv_source"]
     else:
         assert meta["captured_at"] == "2026-08-21"  # the M1 captures (claude/codex/grok)
 

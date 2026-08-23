@@ -30,6 +30,7 @@ from eris.launch import (
     build_argv_grok,
     build_env,
     idempotency_key,
+    invocation_id_for,
     parse_agy,
     parse_claude,
     parse_codex,
@@ -966,6 +967,14 @@ def test_idempotency_key_excludes_arm_includes_repeat(tmp_path: Path) -> None:
     assert idempotency_key(make_call(tmp_path, policy, snapshot_sha="a" * 40)) != idempotency_key(
         make_call(tmp_path, policy, snapshot_sha="b" * 40)
     )
+    # M2b: the pinned executable is key material (a cache entry from another binary never hits)
+    repinned = make_policy(tmp_path, executable_sha256="e" * 64)
+    assert idempotency_key(call) != idempotency_key(make_call(tmp_path, repinned))
+    from eris.launch import idempotency_material
+
+    material = idempotency_material(call)
+    assert material["executable_sha256"] == policy.executable_sha256
+    assert "attempt" not in material and "arm" not in material
 
 
 def test_plan_call_builds_argv_env_cwd_without_spawning(tmp_path: Path) -> None:
@@ -1603,3 +1612,197 @@ def test_run_worker_codex_scratch_removed_even_on_spawn_failure(tmp_path: Path) 
     )
     assert res.status is WorkerStatus.FAILED
     assert [p for p in scratch.rglob("*") if p.is_file()] == []
+
+
+# --------------------------------------------------------------------------- M2b defect fixes
+
+
+def test_parse_claude_budget_tripped_fixture_keeps_usage_and_cost() -> None:
+    """F1 (T2 capture): the --max-budget-usd cap tripped with NO result key.
+    The envelope is an error, but the spend is real: cost_usd 0.129044 on a
+    $0.10 cap (the cap overshoots), usage retained, both model names kept,
+    and the message names the subtype and terminal_reason."""
+    env = parse_claude(fixture("claude", "2.1.239", "budget_tripped.json"))
+    assert env.is_error and env.text is None and env.structured is None
+    assert env.cost_usd == 0.129044
+    assert env.usage is not None and env.usage.output_tokens == 0
+    assert env.model_executed is None  # two models in modelUsage -> unknown, never guessed
+    assert set(env.models_used) == {"claude-haiku-4-5-20251001", "claude-fable-5"}
+    assert env.error == (
+        "claude: subtype='error_max_budget_usd' terminal_reason='budget_exhausted': "
+        "Reached maximum budget ($0.1)"
+    )
+
+
+def test_parse_claude_error_message_composition() -> None:
+    """`result` wins verbatim; otherwise subtype / terminal_reason / errors[]
+    compose the message; an envelope that says nothing is `is_error`."""
+    assert parse_claude(b'{"is_error":true,"result":"boom","subtype":"x"}').error == "boom"
+    assert parse_claude(b'{"is_error":true}').error == "is_error"
+    assert parse_claude(b'{"is_error":true,"subtype":"success"}').error == "is_error"
+    env = parse_claude(b'{"is_error":true,"subtype":"error_during_execution"}')
+    assert env.error == "claude: subtype='error_during_execution'"
+    env = parse_claude(b'{"is_error":true,"terminal_reason":"api_error","errors":["a","b",3]}')
+    assert env.error == "claude: terminal_reason='api_error': a; b"
+    assert parse_claude(b'{"is_error":true,"errors":["only"]}').error == "claude: only"
+    # no usage object -> usage None (never a zero-filled guess)
+    assert parse_claude(b'{"is_error":true}').usage is None
+    assert parse_claude(b'{"is_error":true,"total_cost_usd":0.5}').cost_usd == 0.5
+
+
+def test_parse_codex_401_fixture_is_auth_error_without_usage() -> None:
+    """E2 capture: ten reconnect errors, then `turn.failed` whose `error` is an
+    object. The message is the 401, there is no usage and no text."""
+    env = parse_codex(fixture("codex", "0.147.0", "auth_401.jsonl"))
+    assert env.is_error and env.parse_mode == "jsonl"
+    assert env.error is not None
+    assert env.error.startswith("codex: unexpected status 401 Unauthorized")
+    assert "{'message'" not in env.error  # the dict is unwrapped, not repr'd
+    assert env.usage is None and env.text is None and env.structured is None
+    assert env.cost_usd is None and env.model_executed is None
+
+
+def test_parse_grok_api_error_fixture_surfaces_message() -> None:
+    """E17 capture: {type: error, message: ...} with no text key -> the API's
+    message is the error (a 403 content-policy refusal), not 'no text'."""
+    env = parse_grok(fixture("grok", "1.0.5", "api_error_403.json"))
+    assert env.is_error and env.text is None and env.usage is None
+    assert env.error is not None and env.error.startswith("grok: Internal error")
+    assert "403 Forbidden" in env.error and "permission-denied" in env.error
+    # other shapes without text keep the generic message
+    assert parse_grok(b'{"type":"error"}').error == "grok: envelope has no text"
+    assert parse_grok(b'{"stopReason":"stop"}').error == "grok: envelope has no text"
+
+
+def test_run_worker_ok_with_warning_keeps_status_ok(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """F3: a completed run that flags something (grok `cancelled`) is OK with
+    a WARNING; `error` stays None (reserved for non-OK statuses)."""
+    policy = make_policy(tmp_path)
+    res = run_worker(
+        make_call(tmp_path, policy),
+        popen=fake_process(stdout=fixture("grok", "1.0.5", "plan.json")),
+        killpg=lambda *_: None,
+    )
+    assert res.status is WorkerStatus.OK and res.error is None
+    assert res.warning == "grok: stopReason='cancelled'"
+    assert res.cost_usd == 0.031262 and res.text is not None
+    ok = run_worker(
+        make_call(tmp_path, policy), popen=fake_process(stdout=grok_ok()), killpg=lambda *_: None
+    )
+    assert ok.status is WorkerStatus.OK and ok.warning is None and ok.error is None
+    failed = run_worker(
+        make_call(tmp_path, policy),
+        popen=fake_process(stdout=fixture("grok", "1.0.5", "api_error_403.json")),
+        killpg=lambda *_: None,
+    )
+    assert failed.status is WorkerStatus.FAILED and failed.warning is None
+    assert failed.error is not None and "403" in failed.error
+
+
+def test_invocation_id_is_unique_per_attempt() -> None:
+    """F2: the idempotency key excludes the attempt, the invocation id must not."""
+    key = "f" * 64
+    ids = {invocation_id_for(key, n) for n in (1, 2, 3)}
+    assert ids == {"inv-ffffffffffffffff-a1", "inv-ffffffffffffffff-a2", "inv-ffffffffffffffff-a3"}
+    assert invocation_id_for("a" * 64, 1) != invocation_id_for("b" * 64, 1)
+    with pytest.raises(ValueError):
+        invocation_id_for(key, 0)
+
+
+# --------------------------------------------------------------------------- EPERM sweep
+
+
+def test_sigkill_sweep_retries_eperm_then_treats_gone_as_swept(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """macOS reports EPERM while a dead member is an unreaped zombie: the
+    sweep retries; ESRCH afterwards means the group is gone; the pipes are
+    closed on every path."""
+    factory = fake_process(hang=True)
+    signals: list[int] = []
+    eperm_left = {"n": 2}
+
+    def killpg(pgid: int, sig: int) -> None:
+        signals.append(sig)
+        if sig == signal.SIGTERM:
+            factory.instances[0].send_signal(sig)
+            return
+        if eperm_left["n"]:
+            eperm_left["n"] -= 1
+            raise PermissionError(1, "Operation not permitted")
+        raise ProcessLookupError
+
+    slept: list[float] = []
+    from eris import launch as launch_mod
+
+    original = launch_mod._kill_group
+
+    def patched(proc: Any, kp: Any, grace: float, sleep: Any = None) -> int:
+        return original(proc, kp, grace, slept.append)
+
+    launch_mod._kill_group = patched  # type: ignore[assignment]
+    try:
+        res = spawn(
+            ["/x/w"],
+            env={},
+            cwd=tmp_path,
+            timeout_s=0.05,
+            max_stdout_bytes=10,
+            max_stderr_bytes=10,
+            popen=factory,
+            killpg=killpg,
+            grace_s=0.1,
+        )
+    finally:
+        launch_mod._kill_group = original  # type: ignore[assignment]
+    assert res.timed_out and res.killed_with == signal.SIGTERM
+    assert signals == [signal.SIGTERM, signal.SIGKILL, signal.SIGKILL, signal.SIGKILL]
+    assert slept == [launch_mod.EPERM_SWEEP_INTERVAL_S] * 2
+    proc = factory.instances[0]
+    assert proc.stdout.closed and proc.stderr.closed
+
+
+def test_sigkill_sweep_persistent_eperm_is_a_refusal_and_closes_the_pipes(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    factory = fake_process(hang=True)
+
+    def killpg(pgid: int, sig: int) -> None:
+        if sig == signal.SIGTERM:
+            factory.instances[0].send_signal(sig)
+            return
+        raise PermissionError(1, "Operation not permitted")
+
+    from eris import launch as launch_mod
+
+    original = launch_mod._kill_group
+    launch_mod._kill_group = lambda proc, kp, grace, sleep=None: original(  # type: ignore[assignment]
+        proc, kp, grace, lambda _s: None
+    )
+    try:
+        with pytest.raises(LaunchRefused, match="could not be signalled"):
+            spawn(
+                ["/x/w"],
+                env={},
+                cwd=tmp_path,
+                timeout_s=0.05,
+                max_stdout_bytes=10,
+                max_stderr_bytes=10,
+                popen=factory,
+                killpg=killpg,
+                grace_s=0.1,
+            )
+    finally:
+        launch_mod._kill_group = original  # type: ignore[assignment]
+    proc = factory.instances[0]
+    assert proc.stdout.closed and proc.stderr.closed  # no fd leaks out of a refusal
+    # and through run_worker it is a REFUSED status, never an exception
+    res = run_worker(
+        make_call(tmp_path, make_policy(tmp_path, timeout_s=1)),
+        popen=fake_process(hang=True),
+        killpg=lambda *_: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted")),
+        clock=time.monotonic,
+    )
+    assert res.status is WorkerStatus.REFUSED and "could not be signalled" in str(res.error)

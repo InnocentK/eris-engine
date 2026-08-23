@@ -25,7 +25,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "0.1.2"
+SCHEMA_VERSION = "0.1.5"
 
 TS_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -124,7 +124,9 @@ class Transport(StrEnum):
 class Stage(StrEnum):
     PROPOSE = "propose"
     CRITIQUE = "critique"
+    VERIFY = "verify"  # F6: mechanical verification of evidence requests
     ADJUDICATE = "adjudicate"
+    SUMMARIZE = "summarize"  # F6: the consensus arm's summarizer (judge worker, no tools)
 
 
 class WorkerStatus(StrEnum):
@@ -154,6 +156,42 @@ class VerificationVerdict(StrEnum):
     SUPPORTED = "supported"
     REFUTED = "refuted"
     INCONCLUSIVE = "inconclusive"
+
+
+class ErrorClass(StrEnum):
+    """Retry classes (0.1.3, ``eris.retry``). Unknown is TERMINAL."""
+
+    OK = "ok"
+    OK_WITH_WARNING = "ok_with_warning"
+    TIMEOUT = "timeout"
+    TRANSIENT_IO = "transient_io"
+    MALFORMED_OUTPUT = "malformed_output"
+    BUDGET_TRIPPED = "budget_tripped"
+    AUTH_TERMINAL = "auth_terminal"
+    POLICY_TERMINAL = "policy_terminal"
+    # 0.1.5: the operator interrupted the harness (SIGINT). The attempt was
+    # closed by the harness, not classified from worker output: it is its own
+    # terminal class, never `unknown`.
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+class RetryDecision(StrEnum):
+    RETRY = "retry"
+    STOP = "stop"
+
+
+class Arm(StrEnum):
+    SINGLE = "single"
+    CONSENSUS = "consensus"
+    INDEP_VERIFY = "indep_verify"
+    INDEP_VERIFY_ITER = "indep_verify_iter"
+    INDEP_VERIFY_CRITIQUE = "indep_verify_critique"
+
+
+class ArmStatus(StrEnum):
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
 
 
 # --------------------------------------------------------------------------- base
@@ -255,6 +293,16 @@ class Invocation(Record):
     # by Eris and is never overwritten by the worker's figure.
     conversation_id: str | None = None
     worker_reported_duration_ms: int | None = Field(default=None, ge=0)
+    # 0.1.3: sha256 of the exact prompt text handed to the worker (asserted
+    # equal across a panel); the invocation this one was replayed from (cache
+    # hit: ``reused_from`` names the ORIGIN invocation, cost counted=False);
+    # the process group id of the spawned leader (resume kills a survivor);
+    # and the "OK with error" message (F3: status stays OK, ``error`` stays
+    # None; e.g. grok ``stopReason: cancelled``).
+    prompt_sha256: Sha256 | None = None
+    reused_from: RecordId | None = None
+    pgid: int | None = Field(default=None, ge=1)
+    warning: str | None = None
 
 
 class Claim(Record):
@@ -277,6 +325,18 @@ class Finding(BaseModel):
     claim_ids: list[RecordId] = Field(default_factory=list)
 
 
+class EvidenceRequest(BaseModel):
+    """A model-proposed command. It is a REQUEST: refused unless allowlisted.
+    ``expect_exit_code`` (0.1.3) is the model's stated expectation; Eris
+    records the observed exit code next to it, never in its place."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    argv: list[str] = Field(min_length=1)
+    rationale: str = ""
+    expect_exit_code: int | None = None
+
+
 class Proposal(Record):
     origin: Origin = Origin.MODEL_ASSERTED
     proposal_id: RecordId
@@ -288,15 +348,7 @@ class Proposal(Record):
     findings: list[Finding] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     rationale_sha256: Sha256 | None = None
-
-
-class EvidenceRequest(BaseModel):
-    """A model-proposed command. It is a REQUEST: refused unless allowlisted."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    argv: list[str] = Field(min_length=1)
-    rationale: str = ""
+    evidence_requests: list[EvidenceRequest] = Field(default_factory=list)  # 0.1.3
 
 
 class Challenge(Record):
@@ -334,6 +386,9 @@ class EvidenceItem(Record):
     exit_code: int | None = None
     summary: str = ""
     redaction_counts: dict[str, int] = Field(default_factory=dict)
+    # 0.1.4: the command changed the (pristine) verification copy of the
+    # snapshot: recorded, never silently accepted; verification then stops.
+    violated: bool = False
 
 
 class VerificationResult(Record):
@@ -390,6 +445,7 @@ class Adjudication(Record):
     rationale: str = ""
     downgrades: int = Field(default=0, ge=0)
     escalated_by_engine: bool = False
+    evidence_requests: list[EvidenceRequest] = Field(default_factory=list)  # 0.1.3
 
 
 class Approval(Record):
@@ -406,12 +462,135 @@ class Approval(Record):
 
 
 class CostRecord(Record):
+    """0.1.3: ``cost_known`` is False when the worker reported no cost (the
+    figure in ``cost_usd`` is then Eris's pessimistic ``per_call_usd``
+    reservation and ``estimated`` is True). Known and reserved spend are
+    reported separately; they are never blended."""
+
     origin: Origin = Origin.MECHANICALLY_OBSERVED
     invocation_id: RecordId
     attempt: int = Field(ge=1)
     cost_usd: float | None = Field(default=None, ge=0)
     usage: Usage | None = None
     counted: bool = True
+    estimated: bool = False
+    cost_known: bool = True
+
+
+# --------------------------------------------------------------------------- 0.1.3 records
+
+
+class EvidencePack(Record):
+    """The evidence every panel member receives, built ONCE per (task,
+    repeat) from the original snapshot. Ids are content-derived so the pack
+    is identical across arms; ``pack_sha256`` hashes the rendered pack, which
+    carries no timestamp or run id."""
+
+    origin: Origin = Origin.MECHANICALLY_OBSERVED
+    pack_id: RecordId
+    task_id: RecordId
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
+    item_ids: list[RecordId]
+    pack_sha256: Sha256
+    size_bytes: int = Field(ge=0)
+    git_argv: list[list[str]] = Field(default_factory=list)
+    created_at: Timestamp
+
+
+class RetryAttempt(Record):
+    """The DECISION after one attempt (``eris.retry``): why it was classified
+    as it was and whether another attempt follows. Not a copy of the
+    Invocation: that record carries the observation, this one the policy."""
+
+    origin: Origin = Origin.MECHANICALLY_OBSERVED
+    invocation_id: RecordId
+    attempt: int = Field(ge=1)
+    status: WorkerStatus
+    error_class: ErrorClass
+    reason: str
+    weight: int = Field(ge=1, le=2)
+    budget_used_after: int = Field(ge=0)
+    backoff_s: float = Field(ge=0)
+    decision: RetryDecision
+
+
+class ScanHit(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pattern_sha256: Sha256
+    where: str = Field(min_length=1)
+    count: int = Field(ge=1)
+
+
+class ScanResult(Record):
+    """Contamination tripwire (``eris.scan``): hashes and counts ONLY. The
+    pattern text (fix hunks, answer-key paths) never enters the ledger."""
+
+    origin: Origin = Origin.MECHANICALLY_OBSERVED
+    scan_id: RecordId
+    run_id: RecordId
+    patterns_sha256: Sha256
+    pattern_count: int = Field(ge=0)
+    patterns_dropped_nondistinctive: int = Field(ge=0)
+    hits: list[ScanHit] = Field(default_factory=list)
+    contaminated: bool
+    scan_incomplete: bool
+    scanned_blobs: int = Field(ge=0)
+    scanned_events: int = Field(ge=0)
+
+
+class StrippedEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    relpath: str = Field(min_length=1)
+    size: int = Field(ge=0)
+    sha256: Sha256
+
+
+class SnapshotSanitization(Record):
+    """What ``eris.sanitize`` removed from a worker's private copy of the
+    snapshot (instruction files agy/grok would otherwise load)."""
+
+    origin: Origin = Origin.MECHANICALLY_OBSERVED
+    worker_id: RecordId
+    profile_sha256: Sha256
+    original_root_sha256: Sha256
+    copy_tree_sha256: Sha256
+    stripped: list[StrippedEntry] = Field(default_factory=list)
+    dropped_symlinks: list[str] = Field(default_factory=list)
+
+
+class MissingCell(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: RecordId
+    stage: Stage
+    reason: str = Field(min_length=1)
+
+
+class ArmRun(Record):
+    """One experimental arm over one (task, repeat): the cell the scorer
+    reads. ``propose_keys`` lets the scorer pair arms that shared proposals;
+    ``containment`` names the mechanism (None = E1 accept-and-scan only)."""
+
+    origin: Origin = Origin.MECHANICALLY_OBSERVED
+    arm: Arm
+    task_id: RecordId
+    repeat_index: int = Field(ge=0)
+    category: TaskCategory
+    panel: list[RecordId]
+    critics: list[RecordId] = Field(default_factory=list)
+    judge: RecordId | None = None
+    steps: list[str] = Field(default_factory=list)
+    propose_keys: list[Sha256] = Field(default_factory=list)
+    status: ArmStatus
+    missing_cells: list[MissingCell] = Field(default_factory=list)
+    iterations: int = Field(default=0, ge=0)
+    contaminated: bool = False
+    containment: str | None = None
+    cost_spent_usd: float = Field(default=0.0, ge=0)
+    cost_attributed_usd: float = Field(default=0.0, ge=0)
+    final_adjudication_id: RecordId | None = None
 
 
 class Event(Record):
@@ -442,6 +621,11 @@ RECORD_TYPES: tuple[type[Record], ...] = (
     Approval,
     CostRecord,
     Event,
+    EvidencePack,
+    RetryAttempt,
+    ScanResult,
+    SnapshotSanitization,
+    ArmRun,
 )
 
 

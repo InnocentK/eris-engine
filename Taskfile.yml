@@ -39,7 +39,7 @@ tasks:
   coverage:
     desc: pytest with the coverage floor (src + eval)
     cmds:
-      - "{{.PY}} -m pytest --cov --cov-report=term-missing --cov-fail-under=80"
+      - "{{.PY}} -m pytest --cov --cov-report=term-missing --cov-fail-under=90"
 
   audit:
     desc: pip-audit against the exact pins (BLOCKING)

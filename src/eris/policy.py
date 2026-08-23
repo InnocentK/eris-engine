@@ -32,6 +32,26 @@ from eris.schemas import SHA256_PATTERN, Transport, now_ts
 
 UNPINNED = "UNPINNED"
 CliName = Literal["claude", "codex", "agy", "grok"]
+ROLE_NAMES: frozenset[str] = frozenset({"proposer", "critic", "adjudicator", "summarizer"})
+# Sanitization minimum (security R3.1): these names/dirs are stripped from a
+# worker's private snapshot copy at ANY depth, case-insensitively, whatever
+# the policy says (a policy may only ADD entries). Entries containing "/"
+# match a relative path suffix (".github/copilot-instructions.md").
+SANITIZE_MIN_NAMES: frozenset[str] = frozenset(
+    {"AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "GEMINI.md", "GROK.md"}
+)
+SANITIZE_MIN_DIRS: frozenset[str] = frozenset(
+    {
+        ".agents",
+        ".claude",
+        ".codex",
+        ".gemini",
+        ".grok",
+        ".antigravity",
+        ".cursor",
+        ".github/copilot-instructions.md",
+    }
+)
 # Lineage guard: Antigravity's `agy` also serves Claude and GPT-OSS model ids
 # (`agy models`, 2026-08-22). An agy worker must pin a Google model or the
 # Google lineage of a panel could silently collapse into another vendor's.
@@ -68,6 +88,12 @@ class WorkerPolicy(_Strict):
     tools: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     env_allow: list[str] = Field(default_factory=list)
+    # M2b: run proposer/critic roles on a private, sanitized copy of the
+    # snapshot (instruction files stripped; see eris.sanitize). Verification
+    # ALWAYS runs on the original. Per-role tool lists (the judge/summarizer
+    # get none) override `tools` for that role.
+    sanitize_snapshot: bool = False
+    role_tools: dict[str, list[str]] = Field(default_factory=dict)
     # api transport
     base_url: str | None = None
     api_key_env: str | None = None
@@ -95,7 +121,14 @@ class WorkerPolicy(_Strict):
         for name in (*self.env_allow, *self.env):
             if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
                 raise ValueError(f"env name {name!r} must be UPPER_SNAKE")
+        for role in self.role_tools:
+            if role not in ROLE_NAMES:
+                raise ValueError(f"role_tools key {role!r} is not one of {sorted(ROLE_NAMES)}")
         return self
+
+    def tools_for_role(self, role: str) -> list[str]:
+        """The tool list for ``role`` (``role_tools`` overrides ``tools``)."""
+        return list(self.role_tools.get(role, self.tools))
 
     @property
     def pinned(self) -> bool:
@@ -132,17 +165,61 @@ class VerifyCommand(_Strict):
 class VerifyPolicy(_Strict):
     commands: dict[str, VerifyCommand] = Field(default_factory=dict)
     max_output_bytes: int = Field(default=2_000_000, gt=0)
+    # M2b evidence-request loop caps (per run): model-proposed commands
+    # executed, and the wall-clock budget for all of them together.
+    max_requests_per_run: int = Field(default=12, strict=True, ge=0, le=1000)
+    max_wall_s: int = Field(default=1800, strict=True, ge=1, le=86_400)
 
 
 class Budgets(_Strict):
     per_run_usd: float = Field(gt=0)
     per_call_usd: float = Field(gt=0)
+    per_campaign_usd: float | None = Field(default=None, gt=0)
+
+
+class SanitizePolicy(_Strict):
+    """Extra names/dirs to strip from sanitized snapshot copies. The R3.1
+    minimum (``SANITIZE_MIN_NAMES``/``SANITIZE_MIN_DIRS``) always applies."""
+
+    strip_names: list[str] = Field(default_factory=list)
+    strip_dirs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _entries_are_names(self) -> SanitizePolicy:
+        for entry in (*self.strip_names, *self.strip_dirs):
+            if not entry or entry in (".", "..") or entry.startswith("/") or "\x00" in entry:
+                raise ValueError(f"sanitize entry {entry!r} must be a relative name")
+        return self
+
+    @property
+    def effective_names(self) -> frozenset[str]:
+        return SANITIZE_MIN_NAMES | frozenset(self.strip_names)
+
+    @property
+    def effective_dirs(self) -> frozenset[str]:
+        return SANITIZE_MIN_DIRS | frozenset(self.strip_dirs)
+
+
+class ScanPolicy(_Strict):
+    """Extra contamination-scan strings (``eris.scan``); the key-derived
+    patterns (source path, fix hunks) never live in a policy file."""
+
+    patterns_from_policy: list[str] = Field(default_factory=list)
 
 
 class Policy(_Strict):
     policy_version: str = Field(min_length=1)
     trusted: bool = False
     runs_dir: str = "runs"
+    cache_dir: str = "cache"  # M2b: worker-call cache; NEVER under runs/
+    # Every ephemeral file (worker scratch, sanitized copies, the pristine
+    # verification copy, verify HOME) lives under scratch_dir/<run_id>/ - never
+    # under runs/, where RunWriter is the only writer. Swept at startup.
+    scratch_dir: str = "cache/scratch"
+    # Hard retention bound for scratch: an entry older than this is swept even
+    # when its liveness cannot be disproved, so scratch cannot grow without
+    # bound on a platform where the lock probe is unavailable (7 days).
+    scratch_retention_s: int = Field(default=604_800, strict=True, ge=3600, le=31_536_000)
     path_env: str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
     vendors_allowed: list[str] = Field(min_length=1)
     api_hosts_allowed: list[str] = Field(default_factory=list)
@@ -150,6 +227,13 @@ class Policy(_Strict):
     workers: dict[str, WorkerPolicy]
     verify: VerifyPolicy = Field(default_factory=VerifyPolicy)
     budgets: Budgets
+    sanitize: SanitizePolicy = Field(default_factory=SanitizePolicy)
+    scan: ScanPolicy = Field(default_factory=ScanPolicy)
+    # M2b: the containment mechanism the operator DECLARES for worker reads.
+    # None = E1 accept-and-scan only (defect/ABSTAIN categories are not
+    # scored); "container" is recorded on every ArmRun and is what the scorer
+    # gates on. A declaration, not a verification, until M2c builds it.
+    containment: Literal["container"] | None = None
 
     @model_validator(mode="after")
     def _cross_checks(self) -> Policy:
@@ -160,7 +244,27 @@ class Policy(_Strict):
                 raise ValueError(f"worker {name!r}: provider {w.provider!r} not in vendors_allowed")
             if w.transport is Transport.API and w.base_url is not None:
                 _check_api_url(name, w.base_url, self.api_hosts_allowed)
+        for label, value in (
+            ("runs_dir", self.runs_dir),
+            ("cache_dir", self.cache_dir),
+            ("scratch_dir", self.scratch_dir),
+        ):
+            if not value or "\x00" in value:
+                raise ValueError(f"{label} must be a non-empty path")
+        for label, value in (("cache_dir", self.cache_dir), ("scratch_dir", self.scratch_dir)):
+            if Path(value).resolve() == Path(self.runs_dir).resolve() or _is_under(
+                Path(value), Path(self.runs_dir)
+            ):
+                raise ValueError(f"{label} must not be the runs dir or inside it")
         return self
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _check_api_url(name: str, url: str, hosts: list[str]) -> None:
