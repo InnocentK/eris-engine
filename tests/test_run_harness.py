@@ -903,7 +903,11 @@ def test_campaign_budget_counts_corrupt_cells_pessimistically_and_not_the_curren
     ]
     budget = started["campaign_budget"]
     assert budget["corrupt_cells"] == ["t_01-r0-single-grok"]
-    assert budget["reserved_usd"] == pytest.approx(0.5 * 1)  # single: one planned call x per_call
+    # one planned call, reserved at the worst case the driver can reach (retries included)
+    from eris.retry import worst_case_call_reservation
+
+    assert budget["reserved_usd"] == pytest.approx(worst_case_call_reservation(0.5))
+    assert budget["reserved_usd"] == pytest.approx(2.0)  # 4 x per_call
     assert budget["known_usd"] == 0.0  # the resumed cell's own spend is NOT in the base
     assert "t_01-r0-indep_verify" not in budget["counted_cells"]
 

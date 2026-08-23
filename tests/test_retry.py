@@ -283,8 +283,8 @@ def test_budget_ledger_campaign_ceiling() -> None:
 # --------------------------------------------------------------------------- driver
 
 
-def _writer(tmp_path: Path) -> RunWriter:
-    return RunWriter(tmp_path / "runs" / "r1", Redactor(), run_id="r1").open()
+def _writer(tmp_path: Path, run_id: str = "r1") -> RunWriter:
+    return RunWriter(tmp_path / "runs" / run_id, Redactor(), run_id=run_id).open()
 
 
 def _events(w: RunWriter) -> list[dict[str, Any]]:
@@ -606,3 +606,57 @@ def test_stop_during_the_backoff_sleep_cancels_the_retry_spawn(tmp_path: Path) -
     assert kinds[-2:] == ["retry.scheduled", "retry.cancelled"]
     assert "STOP" in _events(w)[-1]["payload"]["reason"]
     w.close()
+
+
+def test_worst_case_call_reservation_matches_what_the_driver_can_reserve(tmp_path: Path) -> None:
+    """cond 12: the pessimistic per-call reservation used for corrupt cell
+    ledgers is exactly what the driver can actually reserve when no cost is
+    ever reported - for a timeout chain (2 attempts x 2) and for a transient
+    chain (4 attempts x 1) alike."""
+    from eris.retry import worst_case_call_reservation
+
+    per_call = 0.5
+    assert worst_case_call_reservation(per_call) == pytest.approx(4 * per_call)
+
+    # a call that only ever times out: weight 2 each, budget 3 -> 2 attempts, 2x each
+    w = _writer(tmp_path, "timeouts")
+    runner, call = _runner(tmp_path, [None, None, None, None])
+    budget = BudgetLedger(per_call_usd=per_call, run_ceiling_usd=1000.0)
+    out = run_with_retry(
+        call,
+        writer=w,
+        budget=budget,
+        stop_check=lambda: False,
+        sleep=lambda _s: None,
+        runner=runner,
+    )
+    w.close()
+    assert len(out.attempts) == 2 and budget.spent_known_usd == 0.0
+    assert budget.reserved_usd == pytest.approx(worst_case_call_reservation(per_call))
+
+    # a call that only fails transiently: weight 1 each, budget 3 -> 4 attempts, 1x each
+    w2 = _writer(tmp_path, "transient")
+    spawn_failed = _absent_like(
+        WorkerStatus.FAILED, "spawn failed: denied", idempotency_key="d" * 64
+    )
+    runner2 = WorkerRunnerSpy([])
+    runner2.__call__ = None  # type: ignore[method-assign]
+
+    class TransientSpy(WorkerRunnerSpy):
+        def __call__(self, call: WorkerCall) -> WorkerResult:
+            self.calls.append(call)
+            return spawn_failed
+
+    runner2 = TransientSpy([])
+    budget2 = BudgetLedger(per_call_usd=per_call, run_ceiling_usd=1000.0)
+    out2 = run_with_retry(
+        call,
+        writer=w2,
+        budget=budget2,
+        stop_check=lambda: False,
+        sleep=lambda _s: None,
+        runner=runner2,
+    )
+    w2.close()
+    assert len(out2.attempts) == 4 and budget2.spent_known_usd == 0.0
+    assert budget2.reserved_usd == pytest.approx(worst_case_call_reservation(per_call))

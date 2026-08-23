@@ -296,8 +296,8 @@ def test_tampered_entry_symlinked_files_and_bad_blobs_are_refused(
     w.entry_path().unlink()
     w.entry_path().symlink_to(elsewhere)
     miss = w.lookup()
-    assert isinstance(miss, CacheMiss) and (
-        "not a regular file" in miss.reason or "outside the cache root" in miss.reason
+    assert isinstance(miss, CacheMiss) and any(
+        r in miss.reason for r in ("not a regular file", "outside the cache root", "is a symlink")
     )
     w.entry_path().unlink()
     w.entry_path().write_bytes(entry_bytes)
@@ -307,8 +307,8 @@ def test_tampered_entry_symlinked_files_and_bad_blobs_are_refused(
     (tmp_path / "ptr").write_bytes(pointer)
     w.key_path().symlink_to(tmp_path / "ptr")
     miss = w.lookup()
-    assert isinstance(miss, CacheMiss) and (
-        "not a regular file" in miss.reason or "outside the cache root" in miss.reason
+    assert isinstance(miss, CacheMiss) and any(
+        r in miss.reason for r in ("not a regular file", "outside the cache root", "is a symlink")
     )
     w.key_path().unlink()
     w.key_path().write_bytes(pointer)
@@ -327,8 +327,8 @@ def test_tampered_entry_symlinked_files_and_bad_blobs_are_refused(
     (tmp_path / "blob").write_bytes(good)
     blob.symlink_to(tmp_path / "blob")
     miss = w.lookup()
-    assert isinstance(miss, CacheMiss) and (
-        "not a regular file" in miss.reason or "outside the cache root" in miss.reason
+    assert isinstance(miss, CacheMiss) and any(
+        r in miss.reason for r in ("not a regular file", "outside the cache root", "is a symlink")
     )
     blob.unlink()
     blob.write_bytes(good)
@@ -471,3 +471,39 @@ def test_ancestor_symlink_out_of_the_cache_root_is_refused(
     w.cache.blobs_dir.symlink_to(outside_blobs)
     miss = w.lookup()
     assert isinstance(miss, CacheMiss) and "outside the cache root" in miss.reason
+
+
+def test_a_final_component_symlink_inside_the_cache_is_still_refused(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """cond 9: a key/entry/blob that IS a symlink is refused even when its
+    target sits inside the cache root - an alias is never followed."""
+    w = World(tmp_path, fake_process)
+    assert isinstance(w.lookup(), CacheHit)
+    # the key file becomes a symlink to a copy of itself INSIDE the cache
+    twin = w.cache.keys_dir / "twin"
+    twin.write_bytes(w.key_path().read_bytes())
+    w.key_path().unlink()
+    w.key_path().symlink_to(twin)
+    miss = w.lookup()
+    assert isinstance(miss, CacheMiss) and "is a symlink" in miss.reason
+    w.key_path().unlink()
+    w.key_path().write_bytes(twin.read_bytes())
+    assert isinstance(w.lookup(), CacheHit)
+    # the same for the entry file
+    entry_twin = w.cache.entries_dir / "entry-twin"
+    entry_twin.write_bytes(w.entry_path().read_bytes())
+    w.entry_path().unlink()
+    w.entry_path().symlink_to(entry_twin)
+    miss = w.lookup()
+    assert isinstance(miss, CacheMiss) and "is a symlink" in miss.reason
+    w.entry_path().unlink()
+    w.entry_path().write_bytes(entry_twin.read_bytes())
+    # and for a blob
+    blob = w.cache.blobs_dir / w.blobs["stdout"].sha256
+    blob_twin = w.cache.blobs_dir / "blob-twin"
+    blob_twin.write_bytes(blob.read_bytes())
+    blob.unlink()
+    blob.symlink_to(blob_twin)
+    miss = w.lookup()
+    assert isinstance(miss, CacheMiss) and "is a symlink" in miss.reason

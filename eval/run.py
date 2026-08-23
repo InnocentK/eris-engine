@@ -71,7 +71,7 @@ from eris.launch import (
 from eris.ledger import LedgerCorrupt, LedgerView, cost_totals
 from eris.policy import LoadedPolicy, PolicyError, load_policy
 from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
-from eris.retry import BudgetLedger, stop_requested
+from eris.retry import BudgetLedger, stop_requested, worst_case_call_reservation
 from eris.sanitize import (
     VERIFICATION_PROFILE,
     SanitizeCleanupError,
@@ -1379,8 +1379,9 @@ class CampaignSpend:
 
 
 def planned_calls(spec: CellSpec) -> int:
-    """Worker calls a cell makes at most once each (panel + critics + judge);
-    the pessimistic reservation for a cell whose ledger cannot be read."""
+    """Logical worker calls a cell makes (panel + critics + judge). Each may
+    RETRY, so a reservation multiplies this by
+    :func:`~eris.retry.worst_case_call_reservation`."""
     return (
         len(spec.panel)
         + (len(spec.critics) if "critique" in ARM_STEPS[spec.arm] else 0)
@@ -1411,8 +1412,10 @@ def _campaign_spent(
         try:
             totals = cost_totals(LedgerView.from_path(events))
         except LedgerCorrupt:
+            # unreadable: reserve the worst case - every planned call retrying
+            # to exhaustion (timeouts reserve 2x per attempt)
             corrupt.append(spec.run_id)
-            reserved += per_call_usd * planned_calls(spec)
+            reserved += planned_calls(spec) * worst_case_call_reservation(per_call_usd)
             continue
         counted.append(spec.run_id)
         known += totals.known_usd

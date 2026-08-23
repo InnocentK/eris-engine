@@ -972,3 +972,25 @@ def test_each_judge_call_gets_a_fresh_workspace_per_iteration(tmp_path: Path) ->
     assert list(judge_calls[1].cwd.iterdir()) == []  # the new workspace is empty
     assert w.ctx.judge_iteration == 1
     w.writer.close()
+
+
+def test_claim_revised_at_is_the_invocations_finished_at(tmp_path: Path) -> None:
+    """Deliberate (advisor note): a claim's `revised_at` is the INVOCATION's
+    `finished_at`, not the wall clock - that is what makes a fresh record and
+    a cache-replayed one byte-identical."""
+    w = World(tmp_path, {("grok", "propose"): [GOOD_PROPOSAL]}, cache=True)
+    out, prop = run_propose(w.ctx, "grok", w.pack)
+    assert prop is not None and out.invocation is not None
+    assert out.invocation.finished_at is not None
+    assert {c.revised_at for c in prop.claims} == {out.invocation.finished_at}
+    store_pending_cache(w.ctx, {})
+    fresh = canonical_bytes(prop)
+    w.writer.close()
+    (tmp_path / "b").mkdir()
+    w2 = World(tmp_path / "b", {("grok", "propose"): [GOOD_PROPOSAL]}, cache=True)
+    w2.ctx.cache = Cache(tmp_path / "cache", runs_dir=tmp_path / "runs")
+    out2, prop2 = run_propose(w2.ctx, "grok", w2.pack)
+    assert out2.reused and prop2 is not None
+    assert prop2.claims[0].revised_at == out.invocation.finished_at
+    assert canonical_bytes(prop2) == fresh
+    w2.writer.close()

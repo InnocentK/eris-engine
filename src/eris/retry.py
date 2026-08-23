@@ -276,6 +276,20 @@ class BudgetLedger:
 # --------------------------------------------------------------------------- retry weight budget
 
 
+def worst_case_call_reservation(per_call_usd: float) -> float:
+    """The most a SINGLE call can reserve when its cost is never reported:
+    attempts x the per-attempt reservation factor, maximised over the retry
+    classes. Derived from the real constants so it tracks any change to them
+    (weight 1: ``1 + RETRY_WEIGHT_MAX`` attempts at 1x; timeout weight 2:
+    ``1 + RETRY_WEIGHT_MAX // 2`` attempts at ``TIMEOUT_RESERVATION_FACTOR``).
+    Used to reserve pessimistically for a cell whose ledger cannot be read."""
+    worst = 0.0
+    for weight, factor in ((1, 1), (2, TIMEOUT_RESERVATION_FACTOR)):
+        attempts = 1 + RETRY_WEIGHT_MAX // weight
+        worst = max(worst, attempts * factor * per_call_usd)
+    return worst
+
+
 @dataclass
 class RetryState:
     weight_used: int = 0

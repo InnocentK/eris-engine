@@ -231,17 +231,24 @@ class Cache:
         return self.root / "blobs" / "sha256"
 
     def _inside(self, path: Path, *, miss: bool) -> Path:
-        """The realpath of ``path`` must lie under the cache root's realpath:
-        an ancestor symlink (``keys`` -> elsewhere) is refused even though
-        the final component is opened ``O_NOFOLLOW``."""
-        root = self.root.resolve()
-        real = path.resolve()
-        try:
-            real.relative_to(root)
-        except ValueError:
-            reason = f"{path} resolves outside the cache root {root} (ancestor symlink?)"
+        """``path`` must be a real entry inside the cache root: it may not BE a
+        symlink (whatever it points at - a link to another entry inside the
+        cache is still an alias we never follow), and its resolved location
+        must lie under the cache root's realpath (an ancestor symlink such as
+        ``keys`` -> elsewhere is refused). The path is returned UNRESOLVED so
+        the caller's ``lstat`` + ``O_NOFOLLOW`` still apply to it."""
+
+        def refuse(reason: str) -> None:
             raise (CacheMissError(reason) if miss else CacheError(reason)) from None
-        return real
+
+        if path.is_symlink():  # lstat BEFORE resolve: never followed
+            refuse(f"{path} is a symlink; refusing to follow it")
+        root = self.root.resolve()
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            refuse(f"{path} resolves outside the cache root {root} (ancestor symlink?)")
+        return path
 
     def _ensure_dirs(self) -> None:
         for d in (self.entries_dir, self.keys_dir, self.blobs_dir):

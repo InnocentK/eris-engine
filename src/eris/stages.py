@@ -870,6 +870,9 @@ def run_propose(
     proposal: Proposal | None = None
     if out.ok and out.invocation is not None:
         assert out.parsed is not None
+        # `revised_at` is the INVOCATION's finished_at (replayed verbatim on a
+        # cache hit), never the wall clock: that is what makes a fresh record and
+        # a replayed one byte-identical.
         proposal = convert(
             out.parsed, out.invocation.invocation_id, out.invocation.finished_at or ctx.ts()
         )

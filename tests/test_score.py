@@ -144,7 +144,8 @@ def test_score_imports_nothing_that_executes() -> None:
         "eris.scan",
         "eris.schemas",
     }, names
-    forbidden = {
+    # eval/score.py itself may not even import os/shutil (no os.system, no rmtree)
+    direct_forbidden = {
         "subprocess",
         "socket",
         "httpx",
@@ -154,19 +155,41 @@ def test_score_imports_nothing_that_executes() -> None:
         "eris.launch",
         "eris.verify",
     }
-    assert not (names & forbidden)
+    assert not (names & direct_forbidden), names & direct_forbidden
+    # transitively, only the modules that can EXECUTE something are forbidden
+    # (eris.scan walks the tree with os.walk, the writer fsyncs with os - fine)
+    forbidden = {"subprocess", "socket", "httpx", "asyncio", "eris.launch", "eris.verify"}
     body = SCORE_PY.read_text().replace(ast.get_docstring(tree) or "", "")
     assert "os.system" not in body and "os.popen" not in body and "Popen" not in body
-    # the transitive closure of the scorer's eris imports never reaches the launcher/verifier
-    import importlib
+    # TRANSITIVE closure: follow every first-party import to its file and keep
+    # walking, so an executing import two hops away is caught as well
+    import importlib.util
 
-    for mod in ("eris.ledger", "eris.scan", "eris.schemas"):
-        module = importlib.import_module(mod)
-        src = Path(module.__file__ or "").read_text()
-        imports = {
-            n.module for n in ast.walk(ast.parse(src)) if isinstance(n, ast.ImportFrom) and n.module
-        } | {a.name for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Import) for a in n.names}
-        assert not ({"eris.launch", "eris.verify", "subprocess", "socket", "httpx"} & imports), mod
+    def module_imports(path: Path) -> set[str]:
+        tree_ = ast.parse(path.read_text())
+        out: set[str] = set()
+        for node in ast.walk(tree_):
+            if isinstance(node, ast.Import):
+                out.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                out.add(node.module)
+        return out
+
+    seen: set[str] = set()
+    frontier = {n for n in names if n.startswith("eris.")}
+    reachable: set[str] = set(names)
+    while frontier:
+        mod = frontier.pop()
+        if mod in seen:
+            continue
+        seen.add(mod)
+        spec = importlib.util.find_spec(mod)
+        assert spec is not None and spec.origin, mod
+        found = module_imports(Path(spec.origin))
+        reachable |= found
+        frontier |= {n for n in found if n.startswith("eris.") and n not in seen}
+    assert not (reachable & forbidden), sorted(reachable & forbidden)
+    assert seen >= {"eris.ledger", "eris.scan", "eris.schemas", "eris.validate"}, seen
 
 
 def test_scorer_opens_nothing_outside_runs_and_corpus(
@@ -603,5 +626,28 @@ def test_key_line_order_and_symlinked_cell_dirs(tmp_path: Path) -> None:
 
     shutil.copytree(cdir / "t_01-r0-single-grok", elsewhere)
     (cdir / "linked-cell").symlink_to(elsewhere)
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert [c["run_id"] for c in summary["cells"]] == ["t_01-r0-single-grok"]
+
+
+def test_symlinked_cell_dirs_and_manifests_are_never_followed(tmp_path: Path) -> None:
+    """cond 13: discovery is lstat-first - a symlinked cell dir (even one
+    pointing at a valid finalized run) and a symlinked manifest are skipped."""
+    from eval.score import cell_dirs
+
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    real = cdir / "t_01-r0-single-grok"
+    outside = tmp_path / "outside-cell"
+    import shutil
+
+    shutil.copytree(real, outside)
+    (cdir / "linked-cell").symlink_to(outside)
+    faked = cdir / "faked-cell"
+    faked.mkdir()
+    (faked / "manifest.json").symlink_to(real / "manifest.json")
+    found = [p.name for p in cell_dirs(cdir)]
+    assert found == ["t_01-r0-single-grok"]
     summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
     assert [c["run_id"] for c in summary["cells"]] == ["t_01-r0-single-grok"]

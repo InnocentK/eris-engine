@@ -569,13 +569,20 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
 
 
 def cell_dirs(campaign_dir: Path) -> list[Path]:
-    """Finalized cell dirs; a symlinked entry is never followed (a link could
-    point a scorer at a run dir outside the campaign)."""
-    return sorted(
-        p
-        for p in Path(campaign_dir).iterdir()
-        if p.is_dir() and not p.is_symlink() and (p / "manifest.json").is_file()
-    )
+    """Finalized cell dirs. A symlinked entry is skipped BEFORE it is stat'ed
+    through (lstat first): a link could point the scorer at a run dir outside
+    the campaign. The manifest itself must be a real file too."""
+    out: list[Path] = []
+    for entry in sorted(Path(campaign_dir).iterdir()):
+        if entry.is_symlink():  # lstat-first: never followed
+            continue
+        if not entry.is_dir():
+            continue
+        manifest = entry / "manifest.json"
+        if manifest.is_symlink() or not manifest.is_file():
+            continue
+        out.append(entry)
+    return out
 
 
 def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str, Any]:
