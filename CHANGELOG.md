@@ -87,6 +87,31 @@ New modules (Phase 1; each requirement has a named test)
   private HOME under the run dir, removed in `finally`, cleanup failure =
   `run.error` + `EvidenceCleanupError`. `derive_nonce` per plan §C.
 
+* `eris.stages` (Phase 2, step C): frozen prompt files
+  `eval/prompts/{proposer,critic,adjudicator,summarizer}.md` (ROLE/RULES;
+  sha256 recorded per run); Eris appends a DATA section — ONE canonical JSON
+  document between deterministic nonce delimiters (`derive_nonce`; a nonce
+  inside the data → `[NONCE]` + `envelope.nonce_collision`) — and an OUTPUT
+  SCHEMA section (`wire_schema`: `$defs` inlined, `additionalProperties`
+  false, all keys required). Prompt > 256 KiB → `LaunchRefused` (never
+  spilled). Wire models `ProposalOut` / `CritiqueOut` / `AdjudicationOut`
+  (`extra=forbid`): model-supplied ids / `origin` / engine fields are
+  `malformed_output` (retried with the identical prompt, cap 2, then
+  `worker.absent`); `Record.model_validate(model_json)` is never called; Eris
+  assigns ids (`clm-<key[:12]>-<i>`, `fnd-…`, `<key[:12]>-p<k>-c<n>`,
+  `dis-…`). Critics see proposals + evidence only (one prompt hash across
+  critics, lens `framing`); judge/summarizer are text-only (`role_tools`,
+  `tools: []`) and receive evidence blocks (16 KiB head+tail), `P1..Pn`
+  (`proposal.labels`), `C1..`, verification items — executable basenames
+  only, never host paths or other stages' instructions. After the judge:
+  `enforce_rulings` → `adjudication.raw`, `adjudication.enforced`,
+  `validate.findings`. Cache hits replay through `replay_hit`; fresh OK
+  calls are stored after the run's scan with their `scan_hits`.
+  `run_with_retry` gained `output_check` (the wire-model parse).
+  `default.yaml`: dedicated `judge` worker (claude, `tools: []`, timeout
+  300; judge TIMEOUT terminal) and `containment: null` (declared, gated by
+  the scorer). Evidence-id material now uses the executable basename.
+
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
   the message from subtype/terminal_reason/errors (T2 capture: the

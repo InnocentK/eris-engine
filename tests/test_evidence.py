@@ -277,7 +277,7 @@ def test_pack_is_redacted_before_hashing(tmp_path: Path) -> None:
             hashlib.sha256(
                 json.dumps(
                     {
-                        'argv': log_item.argv,
+                        'argv': ['git', *(log_item.argv or [])[1:]],
                         'content_sha256': log_item.blob.sha256,
                         'exit_code': 0,
                         'kind': 'repo_fact',

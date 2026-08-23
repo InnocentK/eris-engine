@@ -221,6 +221,11 @@ class Policy(_Strict):
     budgets: Budgets
     sanitize: SanitizePolicy = Field(default_factory=SanitizePolicy)
     scan: ScanPolicy = Field(default_factory=ScanPolicy)
+    # M2b: the containment mechanism the operator DECLARES for worker reads.
+    # None = E1 accept-and-scan only (defect/ABSTAIN categories are not
+    # scored); "container" is recorded on every ArmRun and is what the scorer
+    # gates on. A declaration, not a verification, until M2c builds it.
+    containment: Literal["container"] | None = None
 
     @model_validator(mode="after")
     def _cross_checks(self) -> Policy:

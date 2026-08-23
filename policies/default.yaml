@@ -45,6 +45,20 @@ workers:
     env:
       DISABLE_AUTOUPDATER: "1"
       DISABLE_TELEMETRY: "1"
+  judge:                          # dedicated adjudicator/summarizer: text only, NO tools
+    transport: cli
+    cli: claude
+    provider: anthropic
+    model: null
+    executable_sha256: UNPINNED
+    timeout_s: 300                # a judge TIMEOUT is terminal (E8 hang is deterministic)
+    max_stdout_bytes: 10000000
+    max_stderr_bytes: 1000000
+    max_budget_usd: 1.0
+    tools: []
+    env:
+      DISABLE_AUTOUPDATER: "1"
+      DISABLE_TELEMETRY: "1"
   codex:
     transport: cli
     cli: codex
@@ -130,6 +144,10 @@ verify:
         "-m": "^[A-Za-z0-9_ ]{1,60}$"
         "--maxfail": "^[0-9]{1,3}$"
       positional: ["path"]
+
+# Containment of worker READS (E1): null = accept-and-scan only; "container"
+# once M2c provides one. The scorer refuses defect/ABSTAIN categories without it.
+containment: null
 
 budgets:
   per_run_usd: 20.0

@@ -352,10 +352,13 @@ def run_with_retry(
     sleep: Callable[[float], None],
     runner: WorkerRunner = run_worker,
     clock: Callable[[], str] = now_ts,
+    output_check: Callable[[WorkerResult], str | None] | None = None,
 ) -> RetryOutcome:
     """Drive attempts of ONE call until success, a terminal class, the retry
     weight budget, STOP, or the money pre-check ends it. Never raises on
-    worker behaviour; writer errors propagate."""
+    worker behaviour; writer errors propagate. ``output_check`` (the stage's
+    wire-model parse) turns an OK result into ``malformed_output`` when it
+    returns a rejection reason: retried with the IDENTICAL prompt, cap 2."""
     state = RetryState()
     attempts: list[AttemptRecord] = []
     schema_requested = call.schema is not None
@@ -398,6 +401,13 @@ def run_with_retry(
         result = runner(call)
         finished = clock()
         cls = classify(result, schema_requested=schema_requested, stage=call.stage)
+        if output_check is not None and cls.error_class in (
+            ErrorClass.OK,
+            ErrorClass.OK_WITH_WARNING,
+        ):
+            rejection = output_check(result)
+            if rejection is not None:
+                cls = _cls(ErrorClass.MALFORMED_OUTPUT, rejection)
         facts = budget.record(result.cost_usd, timed_out=result.timed_out)
         why_not = state.may_retry(cls)
         stopped = False

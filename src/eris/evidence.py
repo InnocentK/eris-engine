@@ -182,11 +182,15 @@ def _item(
     blob = writer.put_blob(content)  # redacted before anything is hashed or rendered
     redacted = blob.path.read_bytes().decode("utf-8", errors="replace")
     text, truncated = _cap(redacted)
+    # id material: the executable's BASENAME (the resolved host path is a
+    # fact for the record, not for the id - the same command on two hosts
+    # must yield the same evidence id)
+    id_argv = [Path(argv[0]).name, *argv[1:]] if argv else None
     material = {
         "kind": kind.value,
         "origin": origin.value,
         "label": label,
-        "argv": list(argv) if argv is not None else None,
+        "argv": id_argv,
         "exit_code": exit_code,
         "content_sha256": blob.sha256,
     }

@@ -54,7 +54,7 @@ def test_repo_default_policy_loads_and_is_untrusted_and_unpinned() -> None:
     loaded = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml"))
     pol = loaded.policy
     assert pol.trusted is False
-    assert set(pol.workers) == {"claude", "codex", "grok", "agy", "openai-api"}
+    assert set(pol.workers) == {"claude", "judge", "codex", "grok", "agy", "openai-api"}
     assert all(not w.pinned for w in pol.workers.values())
     assert loaded.sha256 == hashlib.sha256(REPO_POLICY.read_bytes()).hexdigest()
     assert loaded.pins_sha256 is None
