@@ -39,9 +39,22 @@ or ABSTAIN result obtained before containment is not evidence.
    restricted-read profile path set is unknown; claude's is policy-only;
    agy's is policy-only.
 
-**Until (1) or (2) exists, Phase 0 may run plumbing and clean-control tasks
-only — NO defect-detection or ABSTAIN scoring.** This is a user decision; the
-engineering recommendation is option 1.
+**DECISION (user, 2026-08-22): option 4 — accept and scan, plumbing and
+clean-control runs only.** Rationale: Eris is to be deployed across Debian
+LXC, macOS (Apple silicon and older Intel), CachyOS and Windows 11, so a
+per-host privileged-user recipe (option 1) is the wrong shape, and Docker
+(option 2) is a large lift for what E1 needs now. Consequences that code and
+docs must keep honoring:
+
+* `eval/score.py` (M2b) must refuse to score defect-detection or ABSTAIN
+  arms unless the run manifest records a containment mechanism; plumbing and
+  clean-control arms score normally.
+* The envelope/ledger scan for the Athena path, `athena-assistant`, answer-key
+  strings and fix-hunk lines is an M2b deliverable; a hit marks the run
+  `contaminated` (detects, never prevents).
+* The eventual portable containment is container-based (Docker/Podman on
+  Linux, macOS, Windows; a Debian LXC is itself a container but does not
+  confine the workers' reads *within* it). Per-OS user tricks are out.
 
 ## Boundaries that code enforces
 

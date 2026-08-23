@@ -102,6 +102,12 @@ never push without being asked) → stop and report.
   fallback inside a panel — it collapses lineage diversity.
 - **Secrets only in `.env`**; never in YAML, never in the ledger, never printed
   by `eris doctor` (names only).
+- **Portability is a requirement, not a wish.** Eris will run on Debian LXC,
+  macOS (Apple silicon and older Intel), CachyOS and Windows 11. Never bake
+  in a mechanism that exists on one OS only (macOS seatbelt, a dedicated
+  POSIX user, GNU `timeout`, `fcntl.flock` without a Windows fallback) as the
+  sole control; label OS-specific code and give it a portable fallback or a
+  documented refusal.
 - Read `docs/INVARIANTS.md` before editing a subsystem; each rule names its test.
 
 ## Files to read first
