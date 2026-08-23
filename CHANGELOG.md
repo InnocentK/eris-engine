@@ -70,6 +70,22 @@ New modules (Phase 1; each requirement has a named test)
   entries; `scan_incomplete` on truncated stdout or empty-stdout TIMEOUT;
   `scan.result` carries `ScanResult` (pattern hashes + counts only);
   re-scanning over the scan event adds no hits.
+* `eris.evidence`: `TaskSpec` (task.json, strict), the evidence pack built
+  once per (task, repeat) on the ORIGINAL snapshot — question
+  (`document_quote`/`human_entered`), plan text, `git show` diff, repo
+  facts (`git rev-parse HEAD`, `status --porcelain`, `ls-files`, `log
+  --oneline -n 20`), the task battery and confined, capped file excerpts —
+  every byte through `put_blob` before it is hashed; content-derived ids
+  `ev-<sha[:16]>` identical across runs; the rendered pack carries no
+  timestamp or run id; `pack_sha256` = the pack blob; refusals are
+  `verify.refused`/`evidence.refused` events and the pack still builds
+  (`pack.incomplete`). `execute_evidence_requests`: `run_allowlisted` on the
+  original, refusals as events (challenge stays UNVERIFIED), dedupe by
+  canonical argv (`verify.duplicate`), `max_requests_per_run` /
+  `max_wall_s` caps, STOP before every command (`EvidenceStopped`),
+  `expect_exit_code` recorded next to the observed code. `verify_scratch`:
+  private HOME under the run dir, removed in `finally`, cleanup failure =
+  `run.error` + `EvidenceCleanupError`. `derive_nonce` per plan §C.
 
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
