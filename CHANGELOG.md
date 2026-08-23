@@ -45,6 +45,18 @@ New modules (Phase 1; each requirement has a named test)
   `invocation.reused`. No `O_NOFOLLOW` (Windows) → `CacheUnsupported`
   (documented refusal). `executable_sha256` joined the idempotency key
   material (`idempotency_material`).
+* `eris.sanitize`: per-worker snapshot copy with instruction files
+  stripped (agy A15 / grok E1). Strip list = policy `sanitize` on top of
+  the enforced minimum, matched by name at any depth, case-insensitively,
+  slash entries as path suffixes; a match strips a file, a directory (every
+  file recorded) or a symlink (`AGENTS.md` as a symlink, `.agents` as a
+  file). Files get new inodes (no hardlinks); symlinks are kept only when
+  relative, inside the tree and not into a stripped entry, else dropped and
+  recorded; `.git` copied without `hooks`; no `.git` is fine; fifos refused.
+  `SnapshotSanitization` records profile / original / copy tree hashes.
+  `sanitized_copy()` context manager: private dir under the run scratch,
+  removed in `finally`, cleanup failure raised (`SanitizeCleanupError`).
+  Tests pin the original's tree hash + inodes and agy's `--add-dir` == copy.
 
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
