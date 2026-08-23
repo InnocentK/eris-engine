@@ -272,9 +272,9 @@ sanitized anyway (cheap) and the result is recorded honestly.
 
 ### Contamination scan (`src/eris/scan.py`) - tripwire, detect only
 Every run is scanned twice - once to decide the `ArmRun` and the cache
-entries' `scan_hits`, and a FINAL time as the last event before finalize
-(after `arm.finished` and the cache-store events, which carry hashes and
-keys only) - and re-scanned read-only by the scorer: every blob, every event payload, the rendered pack and any reused
+entries' `scan_hits`, and a FINAL time as the genuinely last event before
+finalize (after `arm.finished`, the cache-store events, the snapshot check
+and the scratch removal, so nothing can append behind it) - and re-scanned read-only by the scorer: every blob, every event payload, the rendered pack and any reused
 cache entry. Patterns are derived at RUN TIME - the source repository's
 path (`key.json.source_repo`) and `Path.home()`-rooted vendor memory stores
 (`~/.claude/projects`, `~/.codex/sessions`,
@@ -308,19 +308,25 @@ executable pin, key + prompt match, same campaign (unless
 `--reuse-across-campaigns`), status ok, `scan_hits == 0` (a contaminated
 entry is never reused), a known model, the current schema version, the
 entry hash == name and every blob re-hashing; every file is `lstat`-checked
-and opened `O_NOFOLLOW`, and every key/entry/blob must RESOLVE under the
-cache root's realpath (an ancestor symlink is refused); any failure is a
-reasoned miss and a fresh call.
+and opened `O_NOFOLLOW`; a key, entry or blob that IS a symlink is refused
+whatever it points at (an alias inside the cache root is still an alias),
+and every path must RESOLVE under the cache root's realpath (an ancestor
+symlink is refused); any failure is a reasoned miss and a fresh call.
 A replay whose blob changes under the reusing run's redactor (a secret
 learned later) is refused. Without `O_NOFOLLOW` (Windows) the cache refuses
 to construct (documented; M2c adds a portable fallback).
 
-### Verification runs on a PRISTINE copy (advisor round, item 4)
+### Verification runs on a private VERIFICATION copy (advisor round, item 4)
 A trusted `pytest` executes repository code and could modify it. Every
-verification command therefore runs in a fresh pristine copy of the
-original (`sanitize.PRISTINE_PROFILE`: nothing stripped, hooks removed,
-escaping symlinks dropped) under the run's scratch root - never in the
-original and never in a sanitized copy. `evidence.SnapshotGuard` compares
+verification command therefore runs in a fresh copy of the original
+(`sanitize.VERIFICATION_PROFILE`) under the run's scratch root - never in
+the original and never in a sanitized copy. That profile strips NOTHING
+(verification must see the repository as it is, instruction files included)
+and differs from a raw `cp -a` in exactly two documented ways: `.git/hooks`
+is not copied (our allowlist runs `git`, so a repository hook would fire on
+the first invocation), and a symlink that is absolute, dangling or resolves
+outside the tree is dropped and recorded. File set, bytes, modes, kept
+symlink targets and `.git` itself are identical. `evidence.SnapshotGuard` compares
 the copy's tree hash after every command: a change is recorded
 (`snapshot.violated`, `EvidenceItem.violated`, the item's summary) and
 verification stops for the run; the original's tree hash is recorded in
@@ -329,15 +335,23 @@ snapshot_modified`). pytest always carries `-p no:cacheprovider`.
 
 ### The judge never sees the snapshot (item 2)
 The adjudicator/summarizer cwd - and agy's `--add-dir`, codex's `-C` - is an
-EMPTY private directory under the scratch root. Its only input is the
-prompt.
+EMPTY private directory under the scratch root, allocated PER CALL
+(`judge-<role>-<iteration>`), so an iterating judge never sees what its own
+previous iteration left behind. Emptiness is re-checked immediately before
+every spawn, not only when the call is planned: a non-empty workspace means
+containment failed and the call is refused. Its only input is the prompt.
 
 ### Ephemeral files never live under `runs/` (item 5)
 `RunWriter` is the only writer under `runs/`. Worker scratch, sanitized
 copies, the pristine verification copy and the verify HOME live under the
 policy `scratch_dir` (default `cache/scratch/<run_id>/`, refused under
 `runs/`), are removed in `finally` on success, refusal and crash, and
-orphans are swept at startup (symlinks unlinked, never followed; logged).
+orphans are swept at startup. The sweep is conservative: an entry is removed
+only when it is provably not in use - not the current run's, not one whose
+run directory is unfinished while its writer lock is held (a platform where
+liveness cannot be disproved counts as HELD), and not one modified within
+the last hour - and both what was removed and what was kept, with reasons,
+are logged. A planted entry at a live run's path is refused, never deleted.
 
 ### Records downstream are the redacted ones (item 1)
 Every record a later stage consumes is re-parsed from the redacted payload

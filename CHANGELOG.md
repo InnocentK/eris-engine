@@ -10,8 +10,30 @@ recorded as `unknown`).
 
 Advisor re-check (Codex at `871c7da`; conditions 1, 3, 6, 8, 11, 14 lifted).
 Fixed, each with a test (`docs/INVARIANTS.md` "Advisor re-check"):
-* SIGINT closes its attempt (`stage.interrupted`): resume no longer
-  synthesizes an abandoned attempt for it, so the cost is counted once.
+* (cond 2) a FRESH empty judge workspace per call (`judge-<role>-<iteration>`),
+  emptiness re-checked immediately before every spawn;
+* (cond 4) `PRISTINE_PROFILE` → `VERIFICATION_PROFILE`: it strips nothing and
+  differs from a raw copy only by `.git/hooks` and dropped
+  absolute/dangling/escaping symlinks, both documented and asserted (file set,
+  bytes, modes, kept symlink targets); the event is `snapshot.verification_copy`;
+* (cond 5) the scratch sweep removes only provably orphaned entries (not the
+  current run's, no held writer lock, older than an hour) and logs removed AND
+  kept with reasons;
+* (cond 7) SIGINT closes its attempt (`stage.interrupted`): resume no longer
+  synthesizes an abandoned attempt for it, so the cost is counted once;
+* (cond 9) a key/entry/blob that IS a symlink is refused whatever it points at
+  (lstat before resolve; the path is returned unresolved);
+* (cond 10) the final `scan.result` is genuinely last: the snapshot check and
+  the scratch removal append before it, and a sealed ledger reports a late
+  failure on stderr rather than swallowing it;
+* (cond 12) a corrupt cell ledger reserves `planned_calls x
+  worst_case_call_reservation(per_call)` - retries included, derived from the
+  retry constants;
+* (cond 13) lstat-first cell discovery (symlinked cell dir or manifest
+  skipped) and a TRANSITIVE AST guard over the scorer's first-party imports.
+
+`Claim.revised_at` = the Invocation's `finished_at` is deliberate: it is what
+makes a fresh record and a cache-replayed one byte-identical (tested).
 
 ## 0.3.1 - schema 0.1.4 + advisor-round fixes (2026-08-23)
 

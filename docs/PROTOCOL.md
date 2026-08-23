@@ -78,7 +78,8 @@ across arms. The rendered pack carries no timestamp or run id.
 `P1..Pn` and never each other (all critic prompts share one hash); every
 critic carries the `framing` lens. **Adjudicator / summarizer** (the
 dedicated `judge` worker: text only, `tools: []`, timeout 300 s, a TIMEOUT is
-terminal; cwd and workspace = an EMPTY private dir, never the snapshot) see
+terminal; cwd and workspace = an EMPTY private dir per call, never the
+snapshot) see
 evidence blocks (16 KiB head+tail cap), `P1..Pn` (label → worker in
 `proposal.labels`), `C1..` (arm 4 only) and verification items -
 never raw repository files, rationale blobs, another stage's instruction
@@ -87,9 +88,9 @@ the judge: `adjudication.raw` → `enforce_rulings` → `adjudication.enforced`
 → `validate.findings`.
 
 **Evidence requests** come only from structured output. Each is re-checked
-by `check_command` inside `run_allowlisted` in a PRISTINE copy of the
-original snapshot (a command that changes the copy is `snapshot.violated`
-and stops verification);
+by `check_command` inside `run_allowlisted` in a private VERIFICATION copy
+of the original snapshot (a command that changes the copy is
+`snapshot.violated` and stops verification);
 refusals are `verify.refused` events (the challenge stays UNVERIFIED);
 duplicates by canonical argv are `verify.duplicate`; `verify.max_requests_per_run`
 (12) and `verify.max_wall_s` cap a run; STOP is checked before every command.
