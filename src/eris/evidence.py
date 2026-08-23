@@ -446,6 +446,44 @@ def build_evidence_pack(
     return PackBuild(pack, items, records, rendered, blob, refused, executed)
 
 
+def rebuild_pack(
+    pack: EvidencePack,
+    records: Sequence[EvidenceItem],
+    *,
+    blob_bytes: Callable[[str], bytes],
+    blobs_dir: Path,
+) -> PackBuild:
+    """Resume: rebuild the in-memory pack from its ledger records and the
+    (verified) blobs. Item order follows ``pack.item_ids``."""
+    by_id = {r.evidence_id: r for r in records}
+    items: list[PackItem] = []
+    for evidence_id in pack.item_ids:
+        r = by_id[evidence_id]
+        content = blob_bytes(r.content_sha256)
+        text, truncated = _cap(content.decode("utf-8", errors="replace"))
+        items.append(
+            PackItem(
+                evidence_id=r.evidence_id,
+                kind=r.kind,
+                origin=r.origin,
+                label=r.summary,
+                argv=list(r.argv) if r.argv is not None else None,
+                exit_code=r.exit_code,
+                content=text,
+                truncated=truncated,
+                blob=BlobRef(
+                    r.content_sha256,
+                    r.size_bytes,
+                    dict(r.redaction_counts),
+                    blobs_dir / r.content_sha256,
+                ),
+            )
+        )
+    rendered = blob_bytes(pack.pack_sha256)
+    blob = BlobRef(pack.pack_sha256, pack.size_bytes, {}, blobs_dir / pack.pack_sha256)
+    return PackBuild(pack, items, list(records), rendered, blob, 0, list(pack.git_argv))
+
+
 # --------------------------------------------------------------------------- requests
 
 

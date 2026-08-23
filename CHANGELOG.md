@@ -112,6 +112,27 @@ New modules (Phase 1; each requirement has a named test)
   300; judge TIMEOUT terminal) and `containment: null` (declared, gated by
   the scorer). Evidence-id material now uses the executable basename.
 
+* `eris.arms` (step E): the arm table as data (`single`, `consensus`,
+  `indep_verify`, `indep_verify_iter`, `indep_verify_critique`; fixed
+  order) and ONE sequential runner. Propose calls are shared across arms
+  (paired ablation: one set of propose spawns for 3/3b/4, `invocation.reused`
+  in 3b/4, equal blob hashes, different adjudicator prompt hashes, arm 3's
+  judge never sees critiques; no `Invocation` carries an arm; `single`
+  reuses the panel proposal). STOP is checked before every step and before
+  every worker call (the first attempt of the next cell never spawns); a
+  budget trip marks the cell missing and skips the remaining stages
+  (`stage.skipped{reason: budget}`). `adjudicate_iter`: the judge's own
+  requests are executed and the judge re-run (cap 3; no new proposals or
+  critiques). Consensus records `adjudication.raw` and `.enforced` from the
+  summarizer. Resume: `load_prior` replays finished stages whose blobs
+  re-hash (a tampered blob re-runs that worker), writes
+  `invocation.abandoned` + a pessimistic cost for an open attempt, returns
+  the pgids from `invocation.spawned` (new launcher `on_spawn` hook);
+  `kill_stale_groups` (SIGTERM then SIGKILL; refused with a documented
+  message without `os.killpg`), `remove_stale_scratch`. `eris.ledger`:
+  read-only validated ledger view + cost totals (spent vs attributed, by
+  stage), shared with the scorer.
+
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes
   the message from subtype/terminal_reason/errors (T2 capture: the

@@ -514,6 +514,7 @@ def spawn(
     grace_s: float = 2.0,
     clock: Callable[[], float] = time.monotonic,
     exempt: Iterable[int] = (),
+    on_spawn: Callable[[int], None] | None = None,
 ) -> SpawnResult:
     assert_argv_safe(argv, exempt=exempt)
     assert_env_safe(env)
@@ -532,6 +533,10 @@ def spawn(
         shell=False,
         close_fds=True,
     )
+    if on_spawn is not None and isinstance(proc.pid, int) and proc.pid > 0:
+        on_spawn(
+            int(proc.pid)
+        )  # the harness records the pgid BEFORE waiting (resume kills survivors)
     out = _Drain(proc.stdout, max_stdout_bytes)
     err = _Drain(proc.stderr, max_stderr_bytes)
     out.start()
@@ -1212,6 +1217,7 @@ def run_worker(
     killpg: KillPg = os.killpg,
     hasher: Callable[[Path], str] = sha256_file,
     clock: Callable[[], float] = time.monotonic,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> WorkerResult:
     """launch -> drain -> parse. Never raises; absence is a status."""
     try:
@@ -1238,7 +1244,9 @@ def run_worker(
     # goes through the cleanup in `finally` and carries its outcome.
     cleanup_error: str | None = None
     try:
-        result = _execute(call, plan, digest, popen=popen, killpg=killpg, clock=clock)
+        result = _execute(
+            call, plan, digest, popen=popen, killpg=killpg, clock=clock, on_spawn=on_spawn
+        )
     finally:
         # Never leave the unredacted `-o` file (or the schema) on disk; the
         # caller passes output_file through RunWriter.put_blob. A cleanup
@@ -1261,6 +1269,7 @@ def _execute(
     popen: PopenFactory,
     killpg: KillPg,
     clock: Callable[[], float],
+    on_spawn: Callable[[int], None] | None = None,
 ) -> WorkerResult:
     """spawn -> read `-o` -> parse -> WorkerResult. Never raises on worker
     misbehaviour; the caller attaches cleanup_error afterwards."""
@@ -1284,6 +1293,7 @@ def _execute(
             killpg=killpg,
             clock=clock,
             exempt=(plan.prompt_index,),
+            on_spawn=on_spawn,
         )
     except LaunchRefused as exc:
         return _absent(call, WorkerStatus.REFUSED, str(exc), plan.idempotency_key)
