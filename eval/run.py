@@ -25,6 +25,7 @@ exits 130. The run dir is left unfinalized so ``--resume`` can continue it.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -72,7 +73,7 @@ from eris.policy import LoadedPolicy, PolicyError, load_policy
 from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
 from eris.retry import BudgetLedger, stop_requested
 from eris.sanitize import (
-    PRISTINE_PROFILE,
+    VERIFICATION_PROFILE,
     SanitizeCleanupError,
     SanitizeProfile,
     sanitized_copy,
@@ -270,7 +271,7 @@ def cmd_invoke(
     scratch_root = Path(loaded.policy.scratch_dir)
     if _is_under(scratch_root, Path(args.runs_dir)):
         raise LaunchRefused(f"scratch_dir {scratch_root} must not be under the runs dir")
-    sweep_scratch(scratch_root, sys.stderr)
+    sweep_scratch(scratch_root, sys.stderr, runs_dir=Path(args.runs_dir), exclude=[run_id])
     scratch = scratch_root / run_id  # path only; created AFTER the writer holds the lock
     call = _build_call(loaded, args, env_values, home, scratch)
     plan_key = plan_call(call).idempotency_key if call.policy.executable else None
@@ -455,21 +456,101 @@ def _is_under(child: Path, parent: Path) -> bool:
     return True
 
 
-def sweep_scratch(scratch_dir: Path, err: IO[str]) -> list[str]:
-    """At startup: remove every orphaned entry under ``scratch_dir`` (a
-    previous crash left it); log what was removed. Symlinks are unlinked,
-    never followed."""
+SWEEP_MIN_AGE_S = 3600.0
+"""A scratch entry younger than this is never swept: it may belong to a run
+that is starting concurrently but has not taken its lock yet."""
+
+
+def _find_run_dir(runs_dir: Path, name: str) -> Path | None:
+    """``runs/<name>`` or ``runs/<campaign>/<name>`` (cells live one level in)."""
+    direct = runs_dir / name
+    if (direct / "events.jsonl").is_file() or (direct / "manifest.json").is_file():
+        return direct
+    if not runs_dir.is_dir():
+        return None
+    for campaign in sorted(p for p in runs_dir.iterdir() if p.is_dir() and not p.is_symlink()):
+        cell = campaign / name
+        if (cell / "events.jsonl").is_file() or (cell / "manifest.json").is_file():
+            return cell
+    return None
+
+
+def _lock_is_held(lock_path: Path) -> bool:
+    """True when another process holds the run's writer lock. Fail SAFE: any
+    situation in which liveness cannot be disproved (no ``fcntl.flock`` on this
+    platform, an unreadable lock file) counts as HELD, so the scratch of a
+    possibly live run is never swept. M2c adds a portable liveness probe."""
+    if not lock_path.is_file():
+        return False
+    if not hasattr(fcntl, "flock"):  # documented: cannot disprove liveness here
+        return True
+    try:
+        fh = open(lock_path, "ab")
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+def sweep_scratch(
+    scratch_dir: Path,
+    err: IO[str],
+    *,
+    runs_dir: Path,
+    exclude: Sequence[str] = (),
+    min_age_s: float = SWEEP_MIN_AGE_S,
+    now: Callable[[], float] = time.time,
+) -> list[str]:
+    """Remove ORPHANED entries under ``scratch_dir`` and log what went. An
+    entry is swept only when it is provably not in use: it is not this run's,
+    its run directory (if any) is finalized or its writer lock is free, and it
+    has not been touched within ``min_age_s``. Symlinks are unlinked, never
+    followed. A concurrent run's scratch is left alone."""
     removed: list[str] = []
+    skipped: dict[str, str] = {}
     if not scratch_dir.is_dir() or scratch_dir.is_symlink():
         return removed
+    excluded = set(exclude)
     for entry in sorted(scratch_dir.iterdir()):
+        reason: str | None = None
+        if entry.name in excluded:
+            reason = "current run"
+        else:
+            run_dir = _find_run_dir(runs_dir, entry.name)
+            if (
+                run_dir is not None
+                and not (run_dir / "manifest.json").is_file()
+                and _lock_is_held(run_dir / ".lock")
+            ):
+                reason = "run is live (writer lock held)"
+            else:
+                try:
+                    age = now() - entry.lstat().st_mtime
+                except OSError:
+                    age = 0.0
+                if age < min_age_s:
+                    reason = f"modified {age:.0f}s ago (< {min_age_s:.0f}s)"
+        if reason is not None:
+            skipped[entry.name] = reason
+            continue
         if entry.is_symlink() or not entry.is_dir():
             entry.unlink()
         else:
             shutil.rmtree(entry)
         removed.append(entry.name)
-    if removed:
-        line = {"status": "scratch_swept", "scratch_dir": str(scratch_dir), "removed": removed}
+    if removed or skipped:
+        line = {
+            "status": "scratch_swept",
+            "scratch_dir": str(scratch_dir),
+            "removed": removed,
+            "kept": skipped,
+        }
         print(json.dumps(line), file=err, flush=True)
     return removed
 
@@ -508,7 +589,7 @@ def load_harness(
     )
     if _is_under(h.scratch_dir, runs_dir):
         raise PolicyError(f"scratch_dir {h.scratch_dir} must not be under the runs dir")
-    h.swept = sweep_scratch(h.scratch_dir, err)
+    h.swept = sweep_scratch(h.scratch_dir, err, runs_dir=runs_dir)
     return h
 
 
@@ -670,8 +751,15 @@ def run_cell(
             base_known, base_reserved = 0.0, 0.0
         make_private_dir(scratch)  # after the lock; refuses a planted entry; never under runs/
         (scratch / "tmp").mkdir()
-        judge_dir = scratch / "judge-empty"  # the judge's cwd/workspace: EMPTY, never the snapshot
-        judge_dir.mkdir()
+
+        def judge_workspace(role: str, iteration: int) -> Path:
+            # a FRESH empty dir per judge CALL: iteration N+1 never sees what
+            # iteration N left behind (and never the snapshot)
+            path = scratch / f"judge-{role}-{iteration}"
+            if not path.exists():
+                make_private_dir(path)
+            return path
+
         budget = BudgetLedger(
             per_call_usd=policy.budgets.per_call_usd,
             run_ceiling_usd=policy.budgets.per_run_usd,
@@ -733,11 +821,17 @@ def run_cell(
                     },
                 )
 
+            assert_judge_workspace_empty(call)  # checked HERE, not only at planning
             # current_call stays set if the call is interrupted: the SIGINT
             # recorder needs it after the exception has unwound to run_cell
             result = run_worker(call, popen=h.popen, killpg=h.killpg, on_spawn=spawned)
             h.current_call = None
             return result
+
+        def cwd_for(worker_id: str, role: str, iteration: int) -> Path:
+            if role in JUDGE_ROLES:
+                return judge_workspace(role, iteration)
+            return sanitized.get(worker_id, snapshot)
 
         def stop_check() -> bool:
             return h.interrupted or stop_requested(*stop_paths)
@@ -745,18 +839,22 @@ def run_cell(
         with (
             verify_scratch(writer, scratch) as scratch_home,
             sanitized_copy(
-                snapshot, scratch, profile=PRISTINE_PROFILE, worker_id="verify", name="pristine"
-            ) as (pristine, pristine_record),
+                snapshot,
+                scratch,
+                profile=VERIFICATION_PROFILE,
+                worker_id="verify",
+                name="verify-copy",
+            ) as (verify_copy, verify_copy_record),
             _sanitized_copies(writer, spec, policy, snapshot, scratch, profile, sanitized),
         ):
-            writer.append("snapshot.pristine", pristine_record)
+            writer.append("snapshot.verification_copy", verify_copy_record)
             env = VerifyEnv(
                 policy=policy,
-                snapshot_root=pristine,  # verification on a PRISTINE copy, never the original
+                snapshot_root=verify_copy,  # a private copy, never the original
                 scratch_home=scratch_home,
                 popen=h.popen,
                 killpg=h.killpg,
-                guard=SnapshotGuard.over(pristine),
+                guard=SnapshotGuard.over(verify_copy),
             )
             ctx = StageContext(
                 writer=writer,
@@ -769,11 +867,7 @@ def run_cell(
                 budget=budget,
                 stop_check=stop_check,
                 sleep=h.sleep,
-                cwd_for=lambda w, role: (
-                    judge_dir
-                    if role in ("adjudicator", "summarizer")
-                    else sanitized.get(w, snapshot)
-                ),
+                cwd_for=cwd_for,
                 scratch_dir=scratch,
                 home=str(h.home),
                 path_env=policy.path_env,
@@ -798,11 +892,9 @@ def run_cell(
                 draft, ctx, view, contaminated=first.contaminated, containment=policy.containment
             )
             store_pending_cache(ctx, hits)  # cache.* events carry hashes and keys only
-        # the FINAL scan is the last event before finalize: it covers arm.finished and
-        # the cache-store events too; the scorer reads the last scan.result
-        scan = scan_and_record(writer, patterns)
-        scan_contaminated = first.contaminated or scan.contaminated
-        scan_incomplete = first.scan_incomplete or scan.scan_incomplete
+        # EVERYTHING that can still append goes before the final scan, so that
+        # scan.result is genuinely the last line of the ledger: the snapshot
+        # check and the scratch removal are done here, not in the finally.
         if tree_sha256(snapshot) != original_tree:
             writer.append(
                 "run.error",
@@ -811,6 +903,14 @@ def run_cell(
                     "error": "the ORIGINAL snapshot changed during the run",
                 },
             )
+        cleanup_error = _remove_scratch(scratch)
+        if cleanup_error is not None:
+            writer.append("run.error", {"kind": "scratch_cleanup_failed", "error": cleanup_error})
+        # the FINAL scan is the LAST event: it covers arm.finished, the
+        # cache-store events and any run.error above; the scorer reads it
+        scan = scan_and_record(writer, patterns)
+        scan_contaminated = first.contaminated or scan.contaminated
+        scan_incomplete = first.scan_incomplete or scan.scan_incomplete
         totals = cost_totals(LedgerView.from_path(writer.events_path))
         run_errors = [e for e in LedgerView.from_path(writer.events_path).payloads("run.error")]
         writer.finalize(
@@ -851,17 +951,54 @@ def run_cell(
         return outcome
     finally:
         try:
-            if scratch.exists() or scratch.is_symlink():
-                try:
-                    shutil.rmtree(scratch)
-                except OSError as exc:
-                    # recorded loudly: a writer failure here propagates (ledger contract)
-                    writer.append(
-                        "run.error", {"kind": "scratch_cleanup_failed", "error": str(exc)}
+            # exceptional paths only: the happy path removed the scratch above
+            error = _remove_scratch(scratch)
+            if error is not None:
+                outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
+                if writer.closed:
+                    # the ledger is sealed: say it loudly instead of swallowing it
+                    print(
+                        json.dumps({"status": "error", "scratch_cleanup_failed": error}),
+                        file=h.err,
+                        flush=True,
                     )
-                    outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
+                else:
+                    # a writer failure here propagates (ledger contract)
+                    writer.append("run.error", {"kind": "scratch_cleanup_failed", "error": error})
         finally:
             writer.close()  # always: no fd outlives the cell, whatever propagated
+
+
+JUDGE_ROLES: frozenset[str] = frozenset({"adjudicator", "summarizer"})
+JUDGE_STAGES: frozenset[Stage] = frozenset({Stage.ADJUDICATE, Stage.SUMMARIZE})
+
+
+def assert_judge_workspace_empty(call: WorkerCall) -> None:
+    """Immediately before a judge spawn: its cwd must still be an EMPTY
+    directory. A non-empty workspace means containment failed (a previous
+    iteration's files, or something planted); refuse loudly."""
+    if call.stage not in JUDGE_STAGES:
+        return
+    cwd = Path(call.cwd)
+    if cwd.is_symlink() or not cwd.is_dir():
+        raise LaunchRefused(f"judge workspace {cwd} is not a directory; refusing to spawn")
+    entries = sorted(p.name for p in cwd.iterdir())
+    if entries:
+        raise LaunchRefused(
+            f"judge workspace {cwd} is not empty ({entries[:5]}); refusing to spawn"
+        )
+
+
+def _remove_scratch(scratch: Path) -> str | None:
+    """Remove the run's scratch root. Returns the failure text, never raises."""
+    try:
+        if scratch.is_symlink():
+            scratch.unlink()
+        elif scratch.exists():
+            shutil.rmtree(scratch)
+    except OSError as exc:
+        return f"{scratch}: {exc}"
+    return None
 
 
 @contextmanager

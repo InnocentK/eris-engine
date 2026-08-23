@@ -265,10 +265,22 @@ def _is_under(child: Path, parent: Path) -> bool:
     return True
 
 
-PRISTINE_PROFILE = SanitizeProfile(frozenset(), frozenset())
-"""Strips nothing: a faithful private copy (hooks removed, escaping symlinks
-dropped) for mechanical verification, so a command that executes repository
-code can never touch the original."""
+VERIFICATION_PROFILE = SanitizeProfile(frozenset(), frozenset())
+"""The profile used for the copy mechanical verification runs in, so a command
+that executes repository code (a trusted ``pytest``) can never touch the
+original. It strips NO instruction files - verification must see the repository
+as it is - and differs from a raw ``cp -a`` in exactly two ways, both inherited
+from :func:`sanitize_snapshot` and both deliberate:
+
+1. ``.git/hooks`` is not copied. Our allowlist runs ``git``, and a repository
+   hook would execute on the first ``git`` invocation.
+2. A symlink that is absolute, dangling, or resolves outside the tree is
+   dropped and recorded in ``dropped_symlinks``; links that stay inside are
+   copied with their target string intact.
+
+Everything else - the file set, the bytes, the modes, `.git` itself - is
+identical to the original (``test_sanitize.py::test_verification_copy_
+matches_the_original_except_hooks_and_escaping_links``)."""
 
 
 @contextmanager

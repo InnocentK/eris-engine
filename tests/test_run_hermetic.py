@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -273,13 +275,13 @@ def test_invoke_key_includes_snapshot_sha_from_git_head(
         )
 
 
-def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_symlink_is_swept(
+def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_entry_is_refused(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
     """Every ephemeral file lives under the policy scratch_dir (never under
-    runs/); an orphan planted there (a symlink to elsewhere) is unlinked at
-    startup - never followed - and the run proceeds; nothing is written
-    outside runs/ except under scratch_dir/<run_id>, which is removed."""
+    runs/). The sweep never touches the CURRENT run's path (it could belong to
+    a run starting concurrently), so a planted symlink there is REFUSED, never
+    followed and never deleted; an old orphan is swept."""
     w = setup_world(tmp_path)
     runs = tmp_path / "runs"
     elsewhere = tmp_path / "elsewhere"
@@ -288,6 +290,10 @@ def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_symlink_is_swept(
     scratch_dir = tmp_path / "scratch"
     scratch_dir.mkdir()
     (scratch_dir / "r").symlink_to(elsewhere)
+    orphan = scratch_dir / "old-orphan"
+    orphan.mkdir()
+    old = time.time() - 86_400
+    os.utime(orphan, (old, old))
     factory = fake_process(stdout=b"{}")
     out = io.StringIO()
     rc = main(
@@ -297,11 +303,12 @@ def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_symlink_is_swept(
         popen=factory,
         killpg=lambda *_: None,
     )
-    assert rc == 3, out.getvalue()  # the fake envelope is not a grok envelope: FAILED, not refused
-    assert sorted(p.name for p in elsewhere.iterdir()) == ["keep"]  # never followed
-    assert not (scratch_dir / "r").exists() and not (scratch_dir / "r").is_symlink()
+    assert rc == 2 and "already exists (or is a symlink)" in json.loads(out.getvalue())["error"]
+    assert factory.instances == []  # nothing spawned into a planted workspace
+    assert (scratch_dir / "r").is_symlink()  # refused, not deleted, not followed
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["keep"]
+    assert not orphan.exists()  # the old orphan WAS swept
     assert not (runs / "r" / "scratch").exists()
-    assert (runs / "r" / "manifest.json").exists()
     extra = {p.relative_to(runs / "r").as_posix() for p in (runs / "r").rglob("*")}
     assert all(
         e in (".lock", "events.jsonl", "manifest.json", "blobs", "blobs/sha256")

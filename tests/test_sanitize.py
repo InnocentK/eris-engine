@@ -255,3 +255,53 @@ def test_tree_sha256_is_order_independent_and_sees_symlink_targets(tmp_path: Pat
     (a / "f").write_text("2")
     h3 = tree_sha256(a)
     assert h3 != h1 and tree_sha256(a, skip=lambda r: r.name == "l") != h3
+
+
+def test_verification_copy_matches_the_original_except_hooks_and_escaping_links(
+    tmp_path: Path,
+) -> None:
+    """cond 4: the verification copy is NOT a sanitized copy - it keeps every
+    instruction file - and differs from a raw copy only by `.git/hooks` and
+    dropped escaping/dangling symlinks. File set, bytes, modes and the targets
+    of kept symlinks are identical."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = build_original(tmp_path)
+    (original / "secretive.sh").write_text("#!/bin/sh\necho hi\n")
+    (original / "secretive.sh").chmod(0o700)
+    (original / "src" / "app.py").chmod(0o644)
+    (original / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+    (original / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 1\n")
+    (original / ".git" / "hooks" / "pre-commit").chmod(0o755)
+    before_hash, before_inodes = tree_sha256(original), inodes(original)
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    rec = sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    assert rec.stripped == []  # nothing is stripped: AGENTS.md & co are still there
+    assert (copy / "AGENTS.md").read_bytes() == (original / "AGENTS.md").read_bytes()
+    assert (copy / ".git" / "HEAD").is_file() and not (copy / ".git" / "hooks").exists()
+    dropped = set(rec.dropped_symlinks)
+    assert dropped == {"link-escape", "link-absolute", "link-dangling"}
+    assert "link-to-stripped" not in dropped  # nothing is stripped, so this link stays
+
+    def rel_entries(root: Path) -> dict[str, tuple[str, str]]:
+        out: dict[str, tuple[str, str]] = {}
+        for path in root.rglob("*"):
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                out[rel] = ("link", os.readlink(path))
+            elif path.is_file():
+                out[rel] = ("file", f"{oct(path.stat().st_mode)}:{sha256_hex(path.read_bytes())}")
+            else:
+                out[rel] = ("dir", "")
+        return out
+
+    original_entries = rel_entries(original)
+    expected = {
+        rel: v
+        for rel, v in original_entries.items()
+        if not rel.startswith(".git/hooks") and rel not in dropped
+    }
+    assert rel_entries(copy) == expected  # identical modulo the two documented exceptions
+    assert tree_sha256(original) == before_hash and inodes(original) == before_inodes

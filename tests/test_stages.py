@@ -251,7 +251,7 @@ class World:
             budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=50.0),
             stop_check=lambda: False,
             sleep=lambda _s: None,
-            cwd_for=lambda _w, _r: self.snapshot,
+            cwd_for=lambda _w, _r, _i: self.snapshot,
             scratch_dir=tmp_path / "runs" / "r1" / "scratch",
             home=str(tmp_path / "home"),
             path_env="/usr/bin:/bin",
@@ -893,7 +893,7 @@ def test_build_call_uses_role_tools_and_sanitized_cwd(tmp_path: Path) -> None:
     )
     copy = tmp_path / "copy"
     copy.mkdir()
-    w.ctx.cwd_for = lambda wid, _r: copy if wid == "grok" else w.snapshot
+    w.ctx.cwd_for = lambda wid, _r, _i: copy if wid == "grok" else w.snapshot
     from eris.stages import proposer_prompt
 
     prompt = proposer_prompt(w.ctx, w.pack)
@@ -923,7 +923,9 @@ def test_judge_cwd_is_an_empty_private_dir_per_cli(tmp_path: Path, cli: str) -> 
     )
     empty = tmp_path / "judge-empty"
     empty.mkdir()
-    w.ctx.cwd_for = lambda _w, role: empty if role in ("adjudicator", "summarizer") else w.snapshot
+    w.ctx.cwd_for = lambda _w, role, _i: (
+        empty if role in ("adjudicator", "summarizer") else w.snapshot
+    )
     from eris.stages import proposer_prompt
 
     prompt = proposer_prompt(w.ctx, w.pack)
@@ -937,4 +939,36 @@ def test_judge_cwd_is_an_empty_private_dir_per_cli(tmp_path: Path, cli: str) -> 
         if cli == "codex":
             assert plan.argv[plan.argv.index("-C") + 1] == str(empty.resolve())
     assert build_call(w.ctx, "grok", "proposer", prompt).cwd == w.snapshot
+    w.writer.close()
+
+
+def test_each_judge_call_gets_a_fresh_workspace_per_iteration(tmp_path: Path) -> None:
+    """cond 2: the judge's cwd carries the iteration index, so iteration N+1
+    can never see what iteration N left behind."""
+    w = World(tmp_path, {("grok", "propose"): [GOOD_PROPOSAL]})
+    made: list[Path] = []
+
+    def cwd_for(worker_id: str, role: str, iteration: int) -> Path:
+        if role in ("adjudicator", "summarizer"):
+            path = tmp_path / f"judge-{role}-{iteration}"
+            path.mkdir(exist_ok=True)
+            made.append(path)
+            return path
+        return w.snapshot
+
+    w.ctx.cwd_for = cwd_for
+    _, prop = run_propose(w.ctx, "grok", w.pack)
+    assert prop is not None
+    claim_ids = [c.claim_id for c in prop.claims]
+    w.spy.answers[("judge", "adjudicate")] = [good_adjudication(claim_ids, [])]
+    run_adjudicate(w.ctx, "judge", w.pack, [prop], [], [], evidence_index(w.pack, []), iteration=0)
+    (made[-1] / "left-behind.txt").write_text("iteration 0 residue")
+    run_adjudicate(w.ctx, "judge", w.pack, [prop], [], [], evidence_index(w.pack, []), iteration=1)
+    judge_calls = [c for c in w.spy.calls if c.stage is Stage.ADJUDICATE]
+    assert len(judge_calls) == 2
+    assert judge_calls[0].cwd != judge_calls[1].cwd
+    assert judge_calls[0].cwd.name.endswith("-0") and judge_calls[1].cwd.name.endswith("-1")
+    assert (judge_calls[0].cwd / "left-behind.txt").exists()
+    assert list(judge_calls[1].cwd.iterdir()) == []  # the new workspace is empty
+    assert w.ctx.judge_iteration == 1
     w.writer.close()

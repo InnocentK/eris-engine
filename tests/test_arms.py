@@ -95,7 +95,7 @@ class Fleet:
             budget=BudgetLedger(per_call_usd=0.5, run_ceiling_usd=self.ceiling),
             stop_check=self.stop_check,
             sleep=lambda _s: None,
-            cwd_for=lambda _w, _r: self.snapshot,
+            cwd_for=lambda _w, _r, _i: self.snapshot,
             scratch_dir=run_dir / "scratch",
             home=str(self.tmp / "home"),
             path_env="/usr/bin:/bin",

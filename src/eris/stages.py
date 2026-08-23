@@ -614,12 +614,15 @@ class StageContext:
     budget: BudgetLedger
     stop_check: Callable[[], bool]
     sleep: Callable[[float], None]
-    cwd_for: Callable[[str, str], Path]  # (worker_id, role) -> cwd; judge roles: an EMPTY dir
+    # (worker_id, role, judge iteration) -> cwd. Judge roles get a FRESH empty
+    # dir per call: iteration N+1 must not see what iteration N left behind.
+    cwd_for: Callable[[str, str, int], Path]
     scratch_dir: Path
     home: str
     path_env: str
     secrets: Mapping[str, str] = field(default_factory=dict)
     runner: WorkerRunner = run_worker
+    judge_iteration: int = 0  # set by run_adjudicate; part of the judge's cwd
     cache: Cache | None = None
     campaign_id: str | None = None
     ts: Callable[[], str] = now_ts
@@ -688,7 +691,7 @@ def build_call(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPro
         worker_id=worker_id,
         policy=policy,
         prompt=prompt.text,
-        cwd=ctx.cwd_for(worker_id, role),
+        cwd=ctx.cwd_for(worker_id, role, ctx.judge_iteration),
         task_id=ctx.task.task_id,
         stage=STAGE_OF_ROLE[role],
         repeat_index=ctx.repeat_index,
@@ -995,6 +998,8 @@ def run_adjudicate(
     """Judge (or summarizer) call + ``enforce_rulings``. Events:
     ``proposal.labels``, ``adjudication.raw``, ``adjudication.enforced``,
     ``validate.findings``."""
+    ctx.judge_iteration = iteration  # a fresh, empty workspace for THIS judge call
+    ctx.judge_iteration = iteration  # a fresh, empty workspace for THIS judge call
     labels = labels_for(proposals)
     ctx.writer.append(
         "proposal.labels",

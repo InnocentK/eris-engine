@@ -9,6 +9,7 @@ import io
 import json
 import os
 import signal
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from eval.run import (
 )
 
 from eris.ledger import LedgerView
+from eris.schemas import Stage
 from tests.conftest import FakeProcess
 from tests.test_stages import GOOD_PROPOSAL
 
@@ -86,6 +88,9 @@ class Popen:
         self.hang: set[str] = set()
         self.crash_on: str | None = None
         self.write_in_cwd: set[str] = set()
+        self.write_in_snapshot: set[str] = set()
+        self.snapshot: Path | None = None
+        self.cwd_contents: list[tuple[str, str, list[str]]] = []
 
     def __call__(self, args: Any, **kw: Any) -> FakeProcess:
         argv = [os.fsdecode(a) for a in args]
@@ -95,6 +100,9 @@ class Popen:
             raise RuntimeError("simulated harness crash")
         if name in self.write_in_cwd:
             Path(kw["cwd"], "WRITTEN_BY_" + name).write_text("x")
+        if name in self.write_in_snapshot and self.snapshot is not None:
+            (self.snapshot / f"TOUCHED_BY_{name}").write_text("x")
+        self.cwd_contents.append((argv[0], kw["cwd"], sorted(os.listdir(kw["cwd"]))))
         if name == "pytest":
             return FakeProcess(argv, stdout=b"1 passed\n", returncode=0, popen_kwargs=kw)
         if name == "git":
@@ -317,8 +325,10 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
     assert grok_calls and all(
         kw["cwd"] != str(w["snapshot"]) and "sanitized-grok" in kw["cwd"] for kw in grok_calls
     )
-    pristine = str((tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify" / "pristine").resolve())
-    assert git_calls and all(kw["cwd"] == pristine for kw in git_calls)  # never the original
+    verify_copy = str(
+        (tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify" / "verify-copy").resolve()
+    )
+    assert git_calls and all(kw["cwd"] == verify_copy for kw in git_calls)  # never the original
     assert not (tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify").exists()  # removed
     # judge got no tools; the --tools "" flag is on its argv
     judge_calls = [argv for argv, _ in popen.calls if Path(argv[0]).name == "claude"]
@@ -664,6 +674,8 @@ def test_runs_dir_holds_only_writer_files_and_scratch_is_swept(tmp_path: Path) -
     scratch_dir = tmp_path / "cache" / "scratch"
     (scratch_dir / "orphan-run").mkdir(parents=True)
     (scratch_dir / "orphan-run" / "leftover").write_text("x")
+    old = time.time() - 86_400  # a day old: provably orphaned, not a concurrent run
+    os.utime(scratch_dir / "orphan-run", (old, old))
     before = tree_sha256(w["snapshot"])
     popen = Popen(outputs())
     out, err = io.StringIO(), io.StringIO()
@@ -682,15 +694,17 @@ def test_runs_dir_holds_only_writer_files_and_scratch_is_swept(tmp_path: Path) -
     assert writer_files_only(w["runs"] / "ok") == []
     assert not (scratch_dir / "ok").exists()
     judge_cwd = [kw["cwd"] for a, kw in popen.calls if Path(a[0]).name == "claude"][0]
-    assert judge_cwd == str((scratch_dir / "ok" / "judge-empty").resolve())
+    assert judge_cwd == str((scratch_dir / "ok" / "judge-adjudicator-0").resolve())
     git_cwd = {kw["cwd"] for a, kw in popen.calls if Path(a[0]).name == "git"}
-    assert git_cwd == {str((scratch_dir / "ok" / "pristine").resolve())}  # verification on the copy
+    assert git_cwd == {
+        str((scratch_dir / "ok" / "verify-copy").resolve())
+    }  # verification on the copy
     assert str(w["snapshot"].resolve()) not in git_cwd
     assert tree_sha256(w["snapshot"]) == before
     started = events_of(w["runs"] / "ok").payloads("run.started")[0]
     assert (
         started["snapshot_tree_sha256"] == before
-        and "snapshot.pristine" in events_of(w["runs"] / "ok").kinds()
+        and "snapshot.verification_copy" in events_of(w["runs"] / "ok").kinds()
     )
     # STOP refusal
     (w["runs"] / "STOP").write_text("")
@@ -892,3 +906,142 @@ def test_campaign_budget_counts_corrupt_cells_pessimistically_and_not_the_curren
     assert budget["reserved_usd"] == pytest.approx(0.5 * 1)  # single: one planned call x per_call
     assert budget["known_usd"] == 0.0  # the resumed cell's own spend is NOT in the base
     assert "t_01-r0-indep_verify" not in budget["counted_cells"]
+
+
+def test_judge_workspace_is_fresh_per_iteration_and_checked_at_spawn(tmp_path: Path) -> None:
+    """cond 2 end to end: the iterating judge arm gets a DIFFERENT empty dir
+    per iteration (each verified empty at spawn time); a workspace that is not
+    empty when the spawn is about to happen refuses the call."""
+    w = world(tmp_path)
+    asking = {
+        **ADJ,
+        "evidence_requests": [
+            {"argv": ["git", "status", "--porcelain"], "rationale": "", "expect_exit_code": None}
+        ],
+    }
+    popen = Popen(
+        {
+            "grok": [grok_envelope(GOOD_PROPOSAL)],
+            "claude": [claude_envelope(asking), claude_envelope(ADJ)],
+        }
+    )
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "indep_verify_iter", run_id="iter"),
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=popen,
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_OK, out.getvalue()
+    judge = [
+        (cwd, contents) for exe, cwd, contents in popen.cwd_contents if Path(exe).name == "claude"
+    ]
+    assert len(judge) == 2 and judge[0][0] != judge[1][0]
+    assert judge[0][1] == [] and judge[1][1] == []  # each was EMPTY at spawn time
+    assert judge[0][0].endswith("judge-adjudicator-0") and judge[1][0].endswith(
+        "judge-adjudicator-1"
+    )
+    assert not Path(judge[0][0]).exists()  # both removed with the scratch root
+    # the emptiness guard is enforced at spawn time, not only at planning
+    from eval.run import assert_judge_workspace_empty
+
+    from eris.launch import LaunchRefused, WorkerCall
+    from eris.policy import WorkerPolicy
+
+    dirty = tmp_path / "dirty-judge"
+    dirty.mkdir()
+    (dirty / "leftover").write_text("x")
+    policy = WorkerPolicy.model_validate(
+        {
+            "transport": "cli",
+            "cli": "claude",
+            "provider": "anthropic",
+            "executable_sha256": "a" * 64,
+            "timeout_s": 60,
+            "max_stdout_bytes": 1000,
+        }
+    )
+    call = WorkerCall(
+        worker_id="judge",
+        policy=policy,
+        prompt="p",
+        cwd=dirty,
+        task_id="t",
+        stage=Stage.ADJUDICATE,
+        repeat_index=0,
+        policy_sha256="0" * 64,
+    )
+    with pytest.raises(LaunchRefused, match="not empty"):
+        assert_judge_workspace_empty(call)
+    (dirty / "leftover").unlink()
+    assert_judge_workspace_empty(call)  # empty again: fine
+    assert_judge_workspace_empty(call.__class__(**{**call.__dict__, "stage": Stage.PROPOSE}))
+
+
+def test_sweep_never_removes_a_live_scratch_dir(tmp_path: Path) -> None:
+    """cond 5: only provably orphaned entries are swept - not the current
+    run's, not one whose run still holds its writer lock, not a recent one."""
+    from eval.run import sweep_scratch
+
+    from eris.redact import Redactor
+    from eris.writer import RunWriter
+
+    scratch = tmp_path / "scratch"
+    runs = tmp_path / "runs"
+    scratch.mkdir()
+    runs.mkdir()
+    for name in ("live-run", "stale-run", "recent-run", "current-run"):
+        (scratch / name).mkdir()
+        (scratch / name / "marker").write_text("x")
+    old = 10_000.0
+    now = 100_000.0
+    for name in ("live-run", "stale-run", "current-run"):
+        os.utime(scratch / name, (old, old))
+    os.utime(scratch / "recent-run", (now - 5, now - 5))
+    live = RunWriter(runs / "live-run", Redactor(), run_id="live-run").open()  # holds the lock
+    try:
+        removed = sweep_scratch(
+            scratch,
+            io.StringIO(),
+            runs_dir=runs,
+            exclude=["current-run"],
+            now=lambda: now,
+        )
+    finally:
+        live.close()
+    assert removed == ["stale-run"]
+    assert (scratch / "live-run").is_dir() and (scratch / "current-run").is_dir()
+    assert (scratch / "recent-run").is_dir() and not (scratch / "stale-run").exists()
+    # once the lock is free and the entry is old, it is swept
+    removed = sweep_scratch(
+        scratch, io.StringIO(), runs_dir=runs, exclude=["current-run"], now=lambda: now
+    )
+    assert removed == ["live-run"]  # the lock is free now, and it is old
+
+
+def test_scan_result_is_the_last_event_even_when_an_error_is_recorded(tmp_path: Path) -> None:
+    """cond 10: a run.error raised late (the ORIGINAL snapshot changed under
+    us) is appended BEFORE the final scan, so scan.result stays last."""
+    w = world(tmp_path)
+    popen = Popen(outputs())
+    popen.snapshot = w["snapshot"]
+    popen.write_in_snapshot.add("grok")  # the worker touches the original
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="modified", panel="grok", no_cache=""),
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=popen,
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_RUN_ERROR, out.getvalue()
+    view = events_of(w["runs"] / "modified")
+    kinds = view.kinds()
+    assert kinds[-1] == "scan.result"  # genuinely last
+    assert "run.error" in kinds and kinds.index("run.error") < len(kinds) - 1
+    errors = view.payloads("run.error")
+    assert any(e["kind"] == "snapshot_modified" for e in errors)
+    assert (w["snapshot"] / "TOUCHED_BY_grok").exists()  # the test's own tampering

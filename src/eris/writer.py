@@ -126,6 +126,11 @@ class RunWriter:
         return self.run_dir / ".lock"
 
     @property
+    def closed(self) -> bool:
+        """True once finalized or closed: nothing more can be appended."""
+        return self._finalized or self._events_fh is None
+
+    @property
     def seq(self) -> int:
         return self._seq
 

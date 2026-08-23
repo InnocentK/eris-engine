@@ -493,12 +493,12 @@ def test_verification_guard_trips_on_a_changed_copy_and_stops_verification(
     """Item 4: a command that changes the verification copy is recorded
     (snapshot.violated, item.violated) and every later command is refused."""
     from eris.evidence import SnapshotGuard
-    from eris.sanitize import PRISTINE_PROFILE, sanitize_snapshot, tree_sha256
+    from eris.sanitize import VERIFICATION_PROFILE, sanitize_snapshot, tree_sha256
 
     original = make_snapshot(tmp_path)
     before = tree_sha256(original)
     copy = tmp_path / "scratch" / "pristine"
-    sanitize_snapshot(original, copy, profile=PRISTINE_PROFILE, worker_id="verify")
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
 
     class WritingPopen(ScriptedPopen):
         def __call__(self, args: Any, **kw: Any) -> FakeProcess:
