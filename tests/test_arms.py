@@ -356,7 +356,12 @@ def test_budget_trip_marks_the_cell_missing_and_skips_the_remaining_stages(tmp_p
 
 
 def test_adjudicate_iter_executes_the_judges_requests_and_reruns(tmp_path: Path) -> None:
-    first = {**ADJ_ANY, "evidence_requests": [{"argv": ["git", "status", "--porcelain"]}]}
+    first = {
+        **ADJ_ANY,
+        "evidence_requests": [
+            {"argv": ["git", "status", "--porcelain"], "rationale": "", "expect_exit_code": None}
+        ],
+    }
     fleet = Fleet(
         tmp_path, answers({("judge", "adjudicate"): [first, first, ADJ_ANY]}), cache=False
     )
@@ -378,10 +383,22 @@ def test_adjudicate_iter_executes_the_judges_requests_and_reruns(tmp_path: Path)
 
 def test_adjudicate_iter_caps_at_max_iterations(tmp_path: Path) -> None:
     reqs = [
-        [{"argv": ["git", "status", "--porcelain"]}],
-        [{"argv": ["git", "grep", "-l", "-e", "x", "--", "src"]}],
-        [{"argv": ["git", "rev-parse", "HEAD"]}],
-        [{"argv": ["git", "log", "--oneline", "-n", "3"]}],
+        [{"argv": ["git", "status", "--porcelain"], "rationale": "", "expect_exit_code": None}],
+        [
+            {
+                "argv": ["git", "grep", "-l", "-e", "x", "--", "src"],
+                "rationale": "",
+                "expect_exit_code": None,
+            }
+        ],
+        [{"argv": ["git", "rev-parse", "HEAD"], "rationale": "", "expect_exit_code": None}],
+        [
+            {
+                "argv": ["git", "log", "--oneline", "-n", "3"],
+                "rationale": "",
+                "expect_exit_code": None,
+            }
+        ],
     ]
     adjs = [{**ADJ_ANY, "evidence_requests": r} for r in reqs]
     fleet = Fleet(tmp_path, answers({("judge", "adjudicate"): adjs}), cache=False)

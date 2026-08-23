@@ -108,80 +108,83 @@ class StageError(RuntimeError):
 
 
 class _Wire(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    """Output-only models. NO defaults: every key is required and validated
+    STRICTLY from the JSON text (no int/str coercion); ``extra="forbid"``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
 class ClaimOut(_Wire):
     text: str = Field(min_length=1)
-    path: str | None = None
-    line_start: int | None = Field(default=None, ge=1)
-    line_end: int | None = Field(default=None, ge=1)
-    evidence_refs: list[str] = Field(default_factory=list)
+    path: str | None
+    line_start: int | None = Field(ge=1)
+    line_end: int | None = Field(ge=1)
+    evidence_refs: list[str]
 
 
 class FindingOut(_Wire):
     severity: Severity
-    path: str | None = None
-    line_start: int | None = Field(default=None, ge=1)
-    line_end: int | None = Field(default=None, ge=1)
+    path: str | None
+    line_start: int | None = Field(ge=1)
+    line_end: int | None = Field(ge=1)
     description: str = Field(min_length=1)
-    claim_indexes: list[int] = Field(default_factory=list)
+    claim_indexes: list[int]
 
 
 class RequestOut(_Wire):
     argv: list[str] = Field(min_length=1)
-    rationale: str = ""
-    expect_exit_code: int | None = None
+    rationale: str
+    expect_exit_code: int | None
 
 
 class ProposalOut(_Wire):
     summary: str
-    claims: list[ClaimOut] = Field(default_factory=list)
-    findings: list[FindingOut] = Field(default_factory=list)
-    assumptions: list[str] = Field(default_factory=list)
-    evidence_requests: list[RequestOut] = Field(default_factory=list)
+    claims: list[ClaimOut]
+    findings: list[FindingOut]
+    assumptions: list[str]
+    evidence_requests: list[RequestOut]
 
 
 class ChallengeOut(_Wire):
     target: str = Field(pattern=r"^P[1-9][0-9]*$")
-    target_claim_index: int | None = Field(default=None, ge=0)
+    target_claim_index: int | None = Field(ge=0)
     text: str = Field(min_length=1)
     severity: Severity
-    evidence_refs: list[str] = Field(default_factory=list)
-    evidence_request: RequestOut | None = None
+    evidence_refs: list[str]
+    evidence_request: RequestOut | None
 
 
 class CritiqueOut(_Wire):
-    challenges: list[ChallengeOut] = Field(default_factory=list)
+    challenges: list[ChallengeOut]
 
 
 class RulingOut(_Wire):
     claim_id: str = Field(min_length=1)
     status: ClaimStatus
-    evidence_refs: list[str] = Field(default_factory=list)
-    note: str = ""
+    evidence_refs: list[str]
+    note: str
 
 
 class DissentOut(_Wire):
     position: str = Field(min_length=1)
-    proposal: str | None = None  # "P2": which reviewer holds the position
-    contested_claim_ids: list[str] = Field(default_factory=list)
-    evidence_refs: list[str] = Field(default_factory=list)
+    proposal: str | None  # "P2": which reviewer holds the position
+    contested_claim_ids: list[str]
+    evidence_refs: list[str]
 
 
 class RiskOut(_Wire):
     text: str = Field(min_length=1)
     severity: Severity
-    mitigation: str | None = None
+    mitigation: str | None
 
 
 class AdjudicationOut(_Wire):
     verdict: Verdict
-    rulings: list[RulingOut] = Field(default_factory=list)
-    dissent: list[DissentOut] = Field(default_factory=list)
-    residual_risks: list[RiskOut] = Field(default_factory=list)
-    rationale: str = ""
-    evidence_requests: list[RequestOut] = Field(default_factory=list)
+    rulings: list[RulingOut]
+    dissent: list[DissentOut]
+    residual_risks: list[RiskOut]
+    rationale: str
+    evidence_requests: list[RequestOut]
 
 
 WIRE_MODELS: dict[str, type[_Wire]] = {
@@ -225,6 +228,11 @@ def wire_schema(model: type[BaseModel]) -> dict[str, Any]:
     return schema
 
 
+def wire_from_dict(model: type[BaseModel], data: Mapping[str, Any]) -> BaseModel:
+    """Strict JSON-mode validation of a wire object (the only way in)."""
+    return model.model_validate_json(json.dumps(dict(data)), strict=True)
+
+
 def parse_wire(role: str, result: WorkerResult) -> tuple[BaseModel | None, str | None]:
     """``structured`` else ``_structured_from_text(text)``, validated through
     the role's wire model. Returns (parsed, rejection reason)."""
@@ -237,7 +245,8 @@ def parse_wire(role: str, result: WorkerResult) -> tuple[BaseModel | None, str |
     if not isinstance(data, dict):
         return None, f"output is a JSON {type(data).__name__}, not an object"
     try:
-        return model.model_validate(data), None
+        # strict, from the JSON text: no coercion, every key required, no extras
+        return model.model_validate_json(json.dumps(data), strict=True), None
     except ValidationError as exc:
         return None, f"{model.__name__} rejected: {exc.error_count()} error(s): {exc!s:.300}"
 
@@ -635,7 +644,7 @@ class StageOutcome:
     prompt_sha256: str
     invocation: Invocation | None
     result: WorkerResult | None
-    parsed: BaseModel | None
+    parsed: BaseModel | None  # the wire object (already converted successfully)
     error_class: ErrorClass
     reason: str
     reused: bool = False
@@ -644,6 +653,29 @@ class StageOutcome:
     @property
     def ok(self) -> bool:
         return self.parsed is not None
+
+
+Converter = Callable[[BaseModel, str, str], BaseModel]
+"""(wire object, invocation_id, finished_at) -> record; raises StageError on a
+semantic violation (unknown label, claim index out of range, invalid ref).
+``finished_at`` (the Invocation's, replayed as-is on a cache hit) is the
+claims' ``revised_at`` so fresh and replayed records are byte-identical."""
+CHECK_TS = "2000-01-01T00:00:00Z"
+
+
+def parse_and_convert(
+    role: str, result: WorkerResult, convert: Converter, invocation_id: str
+) -> tuple[BaseModel | None, str | None]:
+    """Wire parse + semantic conversion. Either failure is a rejection
+    reason (``malformed_output``: retried with the identical prompt, cap 2)."""
+    parsed, why = parse_wire(role, result)
+    if parsed is None:
+        return None, why
+    try:
+        convert(parsed, invocation_id, CHECK_TS)
+    except StageError as exc:
+        return None, f"{type(parsed).__name__} semantic violation: {exc}"
+    return parsed, None
 
 
 def build_call(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPrompt) -> WorkerCall:
@@ -671,11 +703,14 @@ def build_call(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPro
     )
 
 
-def invoke(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPrompt) -> StageOutcome:
+def invoke(
+    ctx: StageContext, worker_id: str, role: str, prompt: RenderedPrompt, convert: Converter
+) -> StageOutcome:
     """One worker call through the cache (hit → replay) or the retry driver
-    (fresh). Output is validated through the wire model; a rejection is
-    ``stage.output_rejected`` + class malformed_output (retried by the
-    driver, cap 2). Never raises on worker behaviour."""
+    (fresh). Output is validated through the wire model AND the stage's
+    semantic conversion; a rejection is ``stage.output_rejected`` + class
+    malformed_output (retried by the driver, cap 2). Never raises on worker
+    behaviour."""
     call = build_call(ctx, worker_id, role, prompt)
     key = idempotency_key(call)
     writer = ctx.writer
@@ -697,7 +732,9 @@ def invoke(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPrompt)
         )
         if isinstance(hit, CacheHit):
             replay = replay_hit(writer, hit, campaign_id=ctx.campaign_id)
-            parsed, why = parse_wire(role, replay.result)
+            parsed, why = parse_and_convert(
+                role, replay.result, convert, replay.invocation.invocation_id
+            )  # conversion re-run by the stage with the replayed finished_at
             if parsed is not None:
                 return StageOutcome(
                     worker_id,
@@ -721,7 +758,7 @@ def invoke(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPrompt)
             )
 
     def output_check(result: WorkerResult) -> str | None:
-        parsed_, why_ = parse_wire(role, result)
+        parsed_, why_ = parse_and_convert(role, result, convert, "inv-check")
         if parsed_ is None:
             writer.append(
                 "stage.output_rejected", {"worker_id": worker_id, "role": role, "reason": why_}
@@ -740,7 +777,7 @@ def invoke(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPrompt)
     )
     final = outcome.final
     if outcome.ok:
-        parsed, _ = parse_wire(role, final.result)
+        parsed, _ = parse_and_convert(role, final.result, convert, final.invocation.invocation_id)
         ctx.pending_cache.append(
             PendingCacheEntry(call, final.result, final.invocation, final.blobs, prompt.sha256)
         )
@@ -814,50 +851,27 @@ def run_propose(
     ctx: StageContext, worker_id: str, pack: PackBuild
 ) -> tuple[StageOutcome, Proposal | None]:
     prompt = proposer_prompt(ctx, pack)
-    out = invoke(ctx, worker_id, "proposer", prompt)
+
+    def convert(wire: BaseModel, invocation_id: str, finished_at: str) -> Proposal:
+        assert isinstance(wire, ProposalOut)
+        return proposal_from_wire(
+            wire,
+            key=idempotency_key(build_call(ctx, worker_id, "proposer", prompt)),
+            task_id=ctx.task.task_id,
+            invocation_id=invocation_id,
+            worker_id=worker_id,
+            ts=finished_at,
+        )
+
+    out = invoke(ctx, worker_id, "proposer", prompt, convert)
     proposal: Proposal | None = None
     if out.ok and out.invocation is not None:
-        assert isinstance(out.parsed, ProposalOut)
-        try:
-            proposal = proposal_from_wire(
-                out.parsed,
-                key=out.key,
-                task_id=ctx.task.task_id,
-                invocation_id=out.invocation.invocation_id,
-                worker_id=worker_id,
-                ts=ctx.ts(),
-            )
-        except StageError as exc:
-            ctx.writer.append(
-                "stage.output_rejected",
-                {"worker_id": worker_id, "role": "proposer", "reason": str(exc), "terminal": True},
-            )
-            ctx.writer.append(
-                "worker.absent",
-                {
-                    "worker_id": worker_id,
-                    "role": "proposer",
-                    "stage": "propose",
-                    "status": "ok",
-                    "error_class": ErrorClass.MALFORMED_OUTPUT.value,
-                    "error": str(exc),
-                },
-            )
-            out = StageOutcome(
-                worker_id,
-                "proposer",
-                out.key,
-                out.prompt_sha256,
-                out.invocation,
-                out.result,
-                None,
-                ErrorClass.MALFORMED_OUTPUT,
-                str(exc),
-                reused=out.reused,
-                retry=out.retry,
-            )
-    if proposal is not None:
-        ctx.writer.append("proposal.recorded", proposal)
+        assert out.parsed is not None
+        proposal = convert(
+            out.parsed, out.invocation.invocation_id, out.invocation.finished_at or ctx.ts()
+        )
+        # the record every later stage consumes is the REDACTED one the writer persisted
+        proposal = Proposal.model_validate(ctx.writer.append("proposal.recorded", proposal).payload)
     ctx.writer.append(
         "stage.finished",
         {
@@ -896,50 +910,24 @@ def run_critique(
     ctx: StageContext, worker_id: str, pack: PackBuild, proposals: Sequence[Proposal]
 ) -> tuple[StageOutcome, Critique | None]:
     prompt = critic_prompt(ctx, pack, proposals)
-    out = invoke(ctx, worker_id, "critic", prompt)
+
+    def convert(wire: BaseModel, invocation_id: str, _finished_at: str) -> Critique:
+        assert isinstance(wire, CritiqueOut)
+        return critique_from_wire(
+            wire,
+            key=idempotency_key(build_call(ctx, worker_id, "critic", prompt)),
+            task_id=ctx.task.task_id,
+            invocation_id=invocation_id,
+            worker_id=worker_id,
+            proposals=proposals,
+        )
+
+    out = invoke(ctx, worker_id, "critic", prompt, convert)
     critique: Critique | None = None
     if out.ok and out.invocation is not None:
-        assert isinstance(out.parsed, CritiqueOut)
-        try:
-            critique = critique_from_wire(
-                out.parsed,
-                key=out.key,
-                task_id=ctx.task.task_id,
-                invocation_id=out.invocation.invocation_id,
-                worker_id=worker_id,
-                proposals=proposals,
-            )
-        except StageError as exc:
-            ctx.writer.append(
-                "stage.output_rejected",
-                {"worker_id": worker_id, "role": "critic", "reason": str(exc), "terminal": True},
-            )
-            ctx.writer.append(
-                "worker.absent",
-                {
-                    "worker_id": worker_id,
-                    "role": "critic",
-                    "stage": "critique",
-                    "status": "ok",
-                    "error_class": ErrorClass.MALFORMED_OUTPUT.value,
-                    "error": str(exc),
-                },
-            )
-            out = StageOutcome(
-                worker_id,
-                "critic",
-                out.key,
-                out.prompt_sha256,
-                out.invocation,
-                out.result,
-                None,
-                ErrorClass.MALFORMED_OUTPUT,
-                str(exc),
-                reused=out.reused,
-                retry=out.retry,
-            )
-    if critique is not None:
-        ctx.writer.append("critique.recorded", critique)
+        assert out.parsed is not None
+        critique = convert(out.parsed, out.invocation.invocation_id, CHECK_TS)
+        critique = Critique.model_validate(ctx.writer.append("critique.recorded", critique).payload)
     ctx.writer.append(
         "stage.finished",
         {
@@ -1013,44 +1001,33 @@ def run_adjudicate(
         {"role": role, "labels": {labels[p.proposal_id]: p.worker_id for p in proposals}},
     )
     prompt = judge_prompt(ctx, pack, proposals, critiques, verification, role=role)
-    out = invoke(ctx, judge_id, role, prompt)
+    key_for_ids = f"{idempotency_key(build_call(ctx, judge_id, role, prompt))[:8]}{iteration:04x}"
+
+    def convert(wire: BaseModel, invocation_id: str, _finished_at: str) -> Adjudication:
+        assert isinstance(wire, AdjudicationOut)
+        return adjudication_from_wire(
+            wire,
+            key=key_for_ids,
+            task_id=ctx.task.task_id,
+            invocation_id=invocation_id,
+            labels={labels[p.proposal_id]: p.worker_id for p in proposals},
+        )
+
+    out = invoke(ctx, judge_id, role, prompt, convert)
     raw: Adjudication | None = None
     enforced: Adjudication | None = None
     findings: list[ValidatorFinding] = []
     if out.ok and out.invocation is not None:
-        assert isinstance(out.parsed, AdjudicationOut)
-        try:
-            raw = adjudication_from_wire(
-                out.parsed,
-                key=f"{out.key[:8]}{iteration:04x}",
-                task_id=ctx.task.task_id,
-                invocation_id=out.invocation.invocation_id,
-                labels={labels[p.proposal_id]: p.worker_id for p in proposals},
-            )
-        except StageError as exc:
-            ctx.writer.append(
-                "stage.output_rejected",
-                {"worker_id": judge_id, "role": role, "reason": str(exc), "terminal": True},
-            )
-            out = StageOutcome(
-                judge_id,
-                role,
-                out.key,
-                out.prompt_sha256,
-                out.invocation,
-                out.result,
-                None,
-                ErrorClass.MALFORMED_OUTPUT,
-                str(exc),
-                reused=out.reused,
-                retry=out.retry,
-            )
+        assert out.parsed is not None
+        raw = convert(out.parsed, out.invocation.invocation_id, CHECK_TS)
     if raw is not None:
-        ctx.writer.append("adjudication.raw", raw)
+        raw = Adjudication.model_validate(ctx.writer.append("adjudication.raw", raw).payload)
         claims = {c.claim_id: c for p in proposals for c in p.claims}
         challenges = [ch for c in critiques for ch in c.challenges]
         enforced, findings = enforce_rulings(raw, claims, evidence, challenges)
-        ctx.writer.append("adjudication.enforced", enforced)
+        enforced = Adjudication.model_validate(
+            ctx.writer.append("adjudication.enforced", enforced).payload
+        )
         ctx.writer.append(
             "validate.findings",
             {

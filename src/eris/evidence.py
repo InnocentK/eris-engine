@@ -225,8 +225,8 @@ def _record(
         summary=item.label,
         redaction_counts=dict(item.blob.redaction_counts),
     )
-    writer.append("evidence.item", record)
-    return record
+    # the record later stages consume is the REDACTED one the writer persisted
+    return EvidenceItem.model_validate(writer.append("evidence.item", record).payload)
 
 
 # --------------------------------------------------------------------------- commands
