@@ -15,6 +15,7 @@ from eris.schemas import SCHEMA_VERSION, Event, canonical_bytes, sha256_hex
 from eris.validate import validate_events
 from eris.writer import (
     LedgerInvalid,
+    ManifestNotDurable,
     RunExists,
     RunWriter,
     WriterClosed,
@@ -301,6 +302,92 @@ def test_writer_error_hierarchy() -> None:
     assert issubclass(LedgerInvalid, WriterError)
     assert issubclass(RunExists, WriterError)
     assert issubclass(WriterClosed, WriterError)
+    assert issubclass(ManifestNotDurable, WriterError)
+
+
+# --------------------------------------------------------------------------- durable seal
+
+
+def test_a_ledger_ending_in_the_final_scan_reopens_sealed(tmp_path: Path) -> None:
+    """Final item 4: the seal is part of the RECORD. After a finalize failure
+    the run is reopened with resume - and because the ledger already ends in
+    the final ``scan.result`` the writer opens SEALED, so nothing can be
+    appended behind it. The manifest can still be written (it is not an
+    event)."""
+    fail = {"now": False}
+
+    def fsync(fd: int) -> None:
+        if fail["now"]:
+            raise OSError("simulated: no space left on device")
+        os.fsync(fd)
+
+    w = make_writer(tmp_path, fsync=fsync).open()
+    w.append("run.started", {"eris_version": "t"})
+    w.append("scan.result", {"contaminated": False, "hits": []})
+    w.seal()
+    fail["now"] = True
+    with pytest.raises(OSError, match="no space"):
+        w.finalize({"status": "complete"})  # the finalize FAILS: no manifest
+    fail["now"] = False
+    w.close()
+    assert not (tmp_path / "run_01" / "manifest.json").exists()
+
+    w2 = make_writer(tmp_path, resume=True).open()
+    assert w2.sealed
+    with pytest.raises(WriterClosed, match="sealed"):
+        w2.append("run.error", {"kind": "late", "error": "behind the scan"})
+    with pytest.raises(WriterClosed, match="sealed"):
+        w2.put_blob(b"late blob")
+    kinds = [json.loads(line)["kind"] for line in read_lines(w2.events_path)]
+    assert kinds == ["run.started", "scan.result"]  # scan.result is still last
+    w2.record_post_scan_error("resume", "an append was refused after the scan")
+    manifest = json.loads(w2.finalize({"status": "resumed"}).read_bytes())
+    assert manifest["post_scan_errors"] == [
+        {"kind": "resume", "error": "an append was refused after the scan"}
+    ]
+
+
+def test_a_ledger_that_has_not_scanned_yet_reopens_unsealed(tmp_path: Path) -> None:
+    """The seal is derived from the ledger, not assumed: a run interrupted
+    before its final scan resumes and appends normally."""
+    w = make_writer(tmp_path).open()
+    w.append("run.started", {"eris_version": "t"})
+    w.append("scan.result", {"contaminated": False, "hits": []})  # scan #1, mid-run
+    w.append("arm.finished", {"status": "complete"})
+    w.close()
+    w2 = make_writer(tmp_path, resume=True).open()
+    assert not w2.sealed
+    w2.append("run.resumed", {"abandoned": 0})
+    w2.record_post_scan_error("ignored", "not sealed yet")  # a no-op before the seal
+    manifest = json.loads(w2.finalize({"status": "complete"}).read_bytes())
+    assert manifest["post_scan_errors"] == []
+
+
+def test_a_manifest_renamed_but_not_fsynced_is_its_own_failure(tmp_path: Path) -> None:
+    """Final item 7: once the rename succeeds the run IS finalized for every
+    future reader; a failing directory fsync only leaves that unproven. It
+    raises ManifestNotDurable - never a plain finalize failure - and the
+    manifest stays in place."""
+    armed = {"now": False}
+
+    def fsync(fd: int) -> None:
+        if armed["now"] and stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated: directory fsync failed")
+        os.fsync(fd)
+
+    w = make_writer(tmp_path, fsync=fsync).open()
+    w.append("run.started", {"eris_version": "t"})
+    armed["now"] = True
+    with pytest.raises(ManifestNotDurable, match="finalized, its durability is unproven"):
+        w.finalize({"status": "complete"})
+    armed["now"] = False
+    manifest_path = tmp_path / "run_01" / "manifest.json"
+    assert manifest_path.is_file()  # renamed into place: the run IS finalized
+    assert json.loads(manifest_path.read_bytes())["extra"] == {"status": "complete"}
+    assert w.closed  # the writer released the lock and the fds
+    with pytest.raises(RunExists):  # and every future open sees a finalized run
+        make_writer(tmp_path, resume=True).open()
+    assert not list((tmp_path / "run_01").glob(".manifest.*.tmp"))
 
 
 # --------------------------------------------------------------------------- F5: blobs re-hash on resume

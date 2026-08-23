@@ -20,6 +20,13 @@ Guarantees (each has a test in tests/test_writer.py; see docs/INVARIANTS.md):
   A complete line that does not validate, anywhere including last, makes
   the ledger INVALID and the writer refuses.
 * Failures raise. Nothing is swallowed; no partial blob is left behind.
+* The seal is DURABLE: a ledger whose last event is ``scan.result`` reopens
+  sealed, so no resume can append behind the final scan. A failure that
+  happens after the seal is recorded in manifest.json
+  (``post_scan_errors``), not only on stderr.
+* A manifest that is renamed into place but whose directory fsync fails
+  raises :class:`ManifestNotDurable` - the run IS finalized, only its
+  durability is unproven; it is never reported as a finalize failure.
 """
 
 from __future__ import annotations
@@ -66,6 +73,15 @@ class WriterClosed(WriterError):
     """append/put_blob after finalize()/close()."""
 
 
+class ManifestNotDurable(WriterError):
+    """manifest.json was renamed into place but the directory fsync failed.
+
+    The run IS finalized as far as every future reader is concerned (the
+    manifest exists, so a later open refuses with :class:`RunExists`); only
+    its durability across a power loss is unproven. It is NOT a finalize
+    failure and must not be reported as one."""
+
+
 @dataclass(frozen=True)
 class BlobRef:
     sha256: str
@@ -104,6 +120,7 @@ class RunWriter:
         self._redaction_totals: dict[str, int] = {}
         self._finalized = False
         self._sealed = False
+        self._post_scan_errors: list[dict[str, str]] = []
         self.torn_tail_truncated = False
         self.resumed_from_seq: int | None = None
         self.corrupt_blobs: list[str] = []  # names that did not re-hash on resume (F5)
@@ -139,8 +156,26 @@ class RunWriter:
         """Close the ledger for EVENTS while leaving :meth:`finalize` able to
         write the manifest. The harness seals right after its final scan so
         that nothing can structurally appear behind ``scan.result``; a later
-        ``append`` raises :class:`WriterClosed` instead of slipping in."""
+        ``append`` raises :class:`WriterClosed` instead of slipping in.
+
+        Sealing is DURABLE: :meth:`open` re-derives it from the ledger (a
+        ledger whose last event is ``scan.result`` opens sealed), so a resume
+        after a finalize failure cannot append behind the final scan."""
         self._sealed = True
+
+    def record_post_scan_error(self, kind: str, error: str) -> None:
+        """Remember a failure that happened AFTER the final scan, when no
+        event may be appended any more. :meth:`finalize` writes it into
+        manifest.json (which is written after the scan), so the failure is
+        durable instead of stderr-only. Ignored before the seal: while the
+        ledger is open a failure is a ``run.error`` EVENT."""
+        if not self._sealed:
+            return
+        self._post_scan_errors.append({"kind": kind, "error": error})
+
+    @property
+    def post_scan_errors(self) -> list[dict[str, str]]:
+        return list(self._post_scan_errors)
 
     @property
     def seq(self) -> int:
@@ -221,6 +256,11 @@ class RunWriter:
         self._seq = len(keep)
         self._prev_sha = sha256_hex(keep[-1].rstrip(b"\n")) if keep else None
         self.resumed_from_seq = self._seq
+        # The seal is part of the RECORD, not of this process: a ledger whose
+        # last event is the final scan reopens SEALED, so a resume after a
+        # failed finalize can never append behind ``scan.result``.
+        if keep and _kind_of(keep[-1]) == FINAL_SCAN_KIND:
+            self._sealed = True
         for blob_path in sorted(self.blobs_dir.glob("*")):
             if blob_path.name.startswith("."):
                 blob_path.unlink()  # abandoned temp file from a crashed put_blob
@@ -350,6 +390,9 @@ class RunWriter:
             "redaction_totals": dict(sorted(self._redaction_totals.items())),
             "torn_tail_truncated": self.torn_tail_truncated,
             "resumed_from_seq": self.resumed_from_seq,
+            # failures that happened after the seal, when no event could be
+            # written any more: recorded HERE so they are durable
+            "post_scan_errors": list(self._post_scan_errors),
             "finalized_at": self._clock(),
         }
         if extra:
@@ -362,16 +405,42 @@ class RunWriter:
                 fh.flush()
                 self._fsync(fh.fileno())
             os.rename(tmp, self.manifest_path)
-            self._fsync_dir(self.run_dir)
         except BaseException:
             try:
                 tmp.unlink()
             except FileNotFoundError:
                 pass
             raise
+        # From here the manifest IS in place: every future open sees a
+        # finalized run. A failing directory fsync leaves that visible state
+        # untouched and only makes it unproven across a power loss, so it is
+        # reported as its own condition, never as a finalize failure.
+        try:
+            self._fsync_dir(self.run_dir)
+        except OSError as exc:
+            self.close()
+            raise ManifestNotDurable(
+                f"{self.manifest_path} was renamed into place but {self.run_dir} could not be "
+                f"fsynced ({exc}): the run is finalized, its durability is unproven"
+            ) from exc
         self.close()
         return self.manifest_path
 
 
 def _sorted_key(item: Mapping[str, Any]) -> str:
     return str(item.get("sha256", ""))
+
+
+FINAL_SCAN_KIND = "scan.result"
+"""The event that closes a run's ledger. Nothing may follow it, in this
+process or in any later one (see :meth:`RunWriter.seal`)."""
+
+
+def _kind_of(line: bytes) -> str | None:
+    """The ``kind`` of one already-validated event line."""
+    try:
+        event = json.loads(line)
+    except ValueError:  # pragma: no cover - validate_events accepted the line
+        return None
+    kind = event.get("kind") if isinstance(event, dict) else None
+    return kind if isinstance(kind, str) else None

@@ -317,6 +317,44 @@ def test_invoke_scratch_lives_under_scratch_dir_and_a_planted_entry_is_refused(
     )
 
 
+def test_invoke_reserves_the_scratch_before_the_writer_opens(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final item 2 (invoke path): the reservation is the mkdir, and it happens
+    BEFORE the writer opens. An entry appearing between the precheck and the
+    mkdir refuses with no run directory created and the entry left alone."""
+    import eval.run as run_module
+
+    w = setup_world(tmp_path)
+    runs = tmp_path / "runs"
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir()
+    real = run_module.make_private_dir
+    planted: list[Path] = []
+
+    def racing_make_private_dir(path: Path) -> None:
+        if not planted:
+            Path(path).mkdir(parents=True)
+            (Path(path) / "not-ours").write_text("planted")
+            planted.append(Path(path))
+        real(path)
+
+    monkeypatch.setattr(run_module, "make_private_dir", racing_make_private_dir)
+    factory = fake_process(stdout=b"{}")
+    out = io.StringIO()
+    rc = main(
+        ["invoke", *common_args(w), "--runs-dir", str(runs), "--run-id", "raced"],
+        out=out,
+        home=tmp_path,
+        popen=factory,
+        killpg=lambda *_: None,
+    )
+    assert rc == 2 and "refusing" in json.loads(out.getvalue())["error"]
+    assert factory.instances == []  # nothing spawned
+    assert not (runs / "raced").exists()  # no ledger, no run dir
+    assert planted[0].is_dir() and (planted[0] / "not-ours").read_text() == "planted"
+
+
 def test_invoke_surfaces_cleanup_failure_as_run_error(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory], monkeypatch: pytest.MonkeyPatch
 ) -> None:

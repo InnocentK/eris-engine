@@ -20,11 +20,13 @@ from eval.run import (
     EXIT_CONFIG,
     EXIT_CONTAMINATED,
     EXIT_INCOMPLETE,
+    EXIT_NOT_DURABLE,
     EXIT_OK,
     EXIT_RUN_ERROR,
     EXIT_SIGINT,
     EXIT_STOP,
     main,
+    sweep_scratch,
 )
 
 from eris.ledger import LedgerView
@@ -1233,3 +1235,144 @@ def test_scratch_over_the_retention_bound_is_swept_even_when_liveness_is_unprova
     line = [json.loads(x) for x in err.getvalue().splitlines() if "scratch_swept" in x][0]
     assert line["forced_over_retention"] == ["just-over"]
     assert line["kept"]["just-under"].startswith("run is live")
+
+
+def test_exclusion_outranks_the_retention_bound_in_the_sweep(tmp_path: Path) -> None:
+    """Final item 1: the retention bound sweeps ORPHANS only. An entry whose
+    run id belongs to this command is never removed, at any age - deleting a
+    live run's scratch is worse than leaking a stale directory."""
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir()
+    ancient = time.time() - 30 * 86_400  # far beyond the 7-day bound
+    mine, theirs = scratch_dir / "current-run", scratch_dir / "someone-else"
+    for d in (mine, theirs):
+        d.mkdir()
+        (d / "payload").write_text("x")
+        os.utime(d, (ancient, ancient))
+    err = io.StringIO()
+    removed = sweep_scratch(
+        scratch_dir,
+        err,
+        runs_dir=tmp_path / "runs",
+        exclude=["current-run"],
+        max_age_s=7 * 86_400.0,
+    )
+    assert removed == ["someone-else"] and not theirs.exists()
+    assert mine.is_dir() and (mine / "payload").read_text() == "x"  # untouched, whatever its age
+    line = [json.loads(x) for x in err.getvalue().splitlines() if "scratch_swept" in x][0]
+    assert line["forced_over_retention"] == ["someone-else"]
+    assert line["kept"] == {"current-run": "current run"}
+
+
+def test_a_scratch_entry_appearing_after_the_precheck_refuses_before_any_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final item 2: the mkdir(exist_ok=False) IS the reservation and it runs
+    BEFORE the writer opens, so an entry that appears between the precheck and
+    it refuses with no ledger created, no run dir, and nothing deleted."""
+    import eval.run as run_module
+
+    w = world(tmp_path)
+    scratch_dir = tmp_path / "cache" / "scratch"
+    scratch_dir.mkdir(parents=True)
+    real = run_module.make_private_dir
+    planted: list[Path] = []
+
+    def racing_make_private_dir(path: Path) -> None:
+        if not planted:  # a concurrent placement, exactly between check and mkdir
+            Path(path).mkdir(parents=True)
+            (Path(path) / "not-ours").write_text("planted")
+            planted.append(Path(path))
+        real(path)
+
+    monkeypatch.setattr(run_module, "make_private_dir", racing_make_private_dir)
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="raced", panel="grok"),
+        out=out,
+        err=err,
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_CONFIG, out.getvalue()
+    assert "refusing" in json.loads(out.getvalue())["error"]
+    assert not (w["runs"] / "raced").exists()  # NO ledger, no run dir
+    entry = planted[0]
+    assert entry.is_dir() and (entry / "not-ours").read_text() == "planted"  # untouched
+
+
+def test_a_post_scan_failure_is_durable_in_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final item 7: a failure after the seal cannot be an event, so it is
+    recorded in manifest.json - which is written after the scan - instead of
+    living only on stderr."""
+    from eris.writer import RunWriter as RealWriter
+
+    real_finalize = RealWriter.finalize
+    calls = {"n": 0}
+
+    def broken_once(self: RealWriter, extra: Any = None) -> Path:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated manifest failure after the scan")
+        return real_finalize(self, extra)
+
+    monkeypatch.setattr(RealWriter, "finalize", broken_once)
+    w = world(tmp_path)
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="durable", panel="grok", no_cache=""),
+        out=out,
+        err=err,
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_RUN_ERROR
+    view = events_of(w["runs"] / "durable")
+    assert view.kinds()[-1] == "scan.result"  # still nothing behind the scan
+    manifest = json.loads((w["runs"] / "durable" / "manifest.json").read_bytes())
+    errors = manifest["post_scan_errors"]
+    assert [e["kind"] for e in errors] == ["OSError"]
+    assert "simulated manifest failure" in errors[0]["error"]
+    assert [json.loads(x) for x in err.getvalue().splitlines() if '"after_scan"' in x]
+
+
+def test_a_finalized_but_unfsynced_manifest_gets_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final item 7: the manifest rename succeeded, so every future open sees a
+    FINALIZED run; only its durability is unproven. That is its own exit code
+    and its own log line, never a finalize failure."""
+    from eris.writer import RunWriter as RealWriter
+
+    real_fsync_dir = RealWriter._fsync_dir
+
+    def flaky(self: RealWriter, path: Path) -> None:
+        # only the post-rename fsync of the run dir (the manifest is in place)
+        if Path(path) == self.run_dir and self.manifest_path.is_file():
+            raise OSError("simulated directory fsync failure after the rename")
+        real_fsync_dir(self, path)
+
+    monkeypatch.setattr(RealWriter, "_fsync_dir", flaky)
+    w = world(tmp_path)
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="unsynced", panel="grok", no_cache=""),
+        out=out,
+        err=err,
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_NOT_DURABLE and EXIT_NOT_DURABLE not in (EXIT_RUN_ERROR, EXIT_CONFIG)
+    summary = json.loads(out.getvalue())
+    assert summary["status"] == "not_durable" and "fsynced" in summary["error"]
+    logged = [json.loads(x) for x in err.getvalue().splitlines() if '"not_durable"' in x]
+    assert logged and "run_id" in logged[0]
+    manifest_path = w["runs"] / "unsynced" / "manifest.json"
+    assert manifest_path.is_file()  # the run IS finalized
+    assert json.loads(manifest_path.read_bytes())["extra"]["status"] == "complete"
+    assert events_of(w["runs"] / "unsynced").kinds()[-1] == "scan.result"

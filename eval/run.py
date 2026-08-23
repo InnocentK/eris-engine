@@ -98,7 +98,14 @@ from eris.schemas import (
 from eris.snapshot import read_head_sha
 from eris.stages import StageContext, load_prompt_files, store_pending_cache
 from eris.version import __version__
-from eris.writer import LedgerInvalid, RunExists, RunWriter, WriterError, WriterLocked
+from eris.writer import (
+    LedgerInvalid,
+    ManifestNotDurable,
+    RunExists,
+    RunWriter,
+    WriterError,
+    WriterLocked,
+)
 
 DEFAULT_POLICY = "policies/default.yaml"
 DEFAULT_PROMPTS = "eval/prompts"
@@ -111,6 +118,7 @@ EXIT_RUN_ERROR = 4
 EXIT_STOP = 5
 EXIT_CONTAMINATED = 6
 EXIT_GATE = 7
+EXIT_NOT_DURABLE = 8  # manifest renamed into place, directory fsync failed
 EXIT_SIGINT = 130
 
 # Stage events streamed to stderr (one JSON line each, reliability R18 fields).
@@ -278,7 +286,7 @@ def cmd_invoke(
         exclude=[run_id],
         max_age_s=float(loaded.policy.scratch_retention_s),
     )
-    scratch = scratch_root / run_id  # path only; created AFTER the writer holds the lock
+    scratch = scratch_root / run_id
     # cond 5b: refuse BEFORE anything is written, and leave the entry alone
     if scratch.exists() or scratch.is_symlink():
         raise LaunchRefused(
@@ -287,7 +295,10 @@ def cmd_invoke(
         )
     call = _build_call(loaded, args, env_values, home, scratch)
     plan_key = plan_call(call).idempotency_key if call.policy.executable else None
-    with RunWriter(run_dir, redactor, run_id=run_id) as writer, _scratch_root(scratch):
+    # The RESERVATION is the mkdir(exist_ok=False) inside _scratch_root, and it
+    # happens BEFORE the writer opens: an entry that appears between the check
+    # above and the mkdir refuses with no ledger created and nothing deleted.
+    with _scratch_root(scratch), RunWriter(run_dir, redactor, run_id=run_id) as writer:
         (scratch / "tmp").mkdir()
         started = now_ts()
         writer.append(
@@ -538,10 +549,13 @@ def sweep_scratch(
     has not been touched within ``min_age_s``. Symlinks are unlinked, never
     followed. A concurrent run's scratch is left alone.
 
-    ``max_age_s`` (the policy's ``scratch_retention_s``) is a HARD bound: an
-    entry older than it is swept even when liveness cannot be disproved, so a
-    platform without a working lock probe cannot accumulate scratch forever.
-    Those sweeps are logged separately as ``forced``."""
+    ``max_age_s`` (the policy's ``scratch_retention_s``) is a hard bound on
+    ORPHANS: an entry older than it is swept even when liveness cannot be
+    disproved, so a platform without a working lock probe cannot accumulate
+    scratch forever. Those sweeps are logged separately as ``forced``.
+    EXCLUSION OUTRANKS RETENTION: a path whose run id is in ``exclude``
+    belongs to this command and is never swept, at any age - deleting a live
+    run's scratch is worse than leaking a stale directory."""
     removed: list[str] = []
     forced: list[str] = []
     skipped: dict[str, str] = {}
@@ -555,8 +569,8 @@ def sweep_scratch(
         except OSError:
             age = 0.0
         over_retention = max_age_s is not None and age >= max_age_s
-        if entry.name in excluded and not over_retention:
-            reason = "current run"
+        if entry.name in excluded:
+            reason = "current run"  # outranks the retention bound, at any age
         elif over_retention:
             forced.append(entry.name)  # hard bound: swept whatever the lock says
         else:
@@ -764,21 +778,30 @@ def run_cell(
                 "ledger is created. It was left untouched: remove it or use another run id."
             ),
         )
-    scratch_created = False
+    # RESERVE the scratch before anything else: the mkdir(exist_ok=False) IS the
+    # reservation, so an entry that appears between the check above and it can
+    # never end up with a ledger created behind it. The refusal deletes nothing.
+    try:
+        make_private_dir(scratch)
+    except LaunchRefused as exc:
+        return CellOutcome(run_id, EXIT_CONFIG, "refused", error=str(exc))
+    scratch_created = True
     try:
         writer = RunWriter(
             run_dir, h.redactor, run_id=run_id, resume=resume, on_event=_stream(h.err, run_id)
         ).open()
-    except RunExists as exc:
-        return CellOutcome(run_id, EXIT_CONFIG, "exists", error=str(exc))
-    except LedgerInvalid as exc:
-        return CellOutcome(run_id, EXIT_RUN_ERROR, "corrupt", error=str(exc))
-    except WriterLocked as exc:
-        return CellOutcome(run_id, EXIT_RUN_ERROR, "locked", error=str(exc))
+    except (RunExists, LedgerInvalid, WriterLocked) as exc:
+        # the reservation is ours and no ledger opened: give it back
+        _remove_scratch(scratch)
+        if isinstance(exc, RunExists):
+            return CellOutcome(run_id, EXIT_CONFIG, "exists", error=str(exc))
+        status = "corrupt" if isinstance(exc, LedgerInvalid) else "locked"
+        return CellOutcome(run_id, EXIT_RUN_ERROR, status, error=str(exc))
     prompts = load_prompt_files(h.prompts_dir)
     snapshot_sha = read_head_sha(snapshot)
     original_tree = tree_sha256(snapshot)
     outcome = CellOutcome(run_id, EXIT_OK, "running")
+    manifest_extra: dict[str, Any] = {"arm": spec.arm.value, "status": "post_scan_failure"}
     try:
         prior: Prior | None = None
         if resume:
@@ -798,8 +821,6 @@ def run_cell(
             base_known, base_reserved = _spent_from_view(view)
         else:
             base_known, base_reserved = 0.0, 0.0
-        make_private_dir(scratch)  # after the lock; refuses a planted entry; never under runs/
-        scratch_created = True
         (scratch / "tmp").mkdir()
 
         def judge_workspace(role: str, iteration: int) -> Path:
@@ -925,6 +946,7 @@ def run_cell(
                 runner=runner,
                 cache=h.cache,
                 campaign_id=campaign_id,
+                prior_attempts=dict(prior.attempts) if prior is not None else {},
             )
             try:
                 draft = run_arm(spec, ctx, env, prior=prior)
@@ -964,23 +986,39 @@ def run_cell(
         scan_incomplete = first.scan_incomplete or scan.scan_incomplete
         totals = cost_totals(LedgerView.from_path(writer.events_path))
         run_errors = [e for e in LedgerView.from_path(writer.events_path).payloads("run.error")]
-        writer.finalize(
-            {
-                "arm": spec.arm.value,
-                "status": record.status.value,
-                "contaminated": scan_contaminated,
-                "scan_incomplete": scan_incomplete,
-                "stopped": draft.stopped,
-                "spent_known_usd": budget.spent_known_usd,
-                "spent_reserved_usd": budget.reserved_usd,
-                "cost_attributed_usd": totals.attributed_usd,
-                "run_errors": len(run_errors),
-            }
-        )
+        manifest_extra = {
+            "arm": spec.arm.value,
+            "status": record.status.value,
+            "contaminated": scan_contaminated,
+            "scan_incomplete": scan_incomplete,
+            "stopped": draft.stopped,
+            "spent_known_usd": budget.spent_known_usd,
+            "spent_reserved_usd": budget.reserved_usd,
+            "cost_attributed_usd": totals.attributed_usd,
+            "run_errors": len(run_errors),
+        }
+        not_durable: str | None = None
+        try:
+            writer.finalize(manifest_extra)
+        except ManifestNotDurable as exc:
+            # the run IS finalized (the manifest is in place); only its
+            # durability across a power loss is unproven -> its OWN exit code
+            not_durable = str(exc)
+            print(
+                json.dumps({"status": "not_durable", "run_id": run_id, "error": not_durable}),
+                file=h.err,
+                flush=True,
+            )
         outcome.contaminated = scan_contaminated
         outcome.stopped = draft.stopped
         outcome.status = record.status.value
-        if run_errors:
+        if not_durable is not None:
+            outcome.exit_code, outcome.status, outcome.error = (
+                EXIT_NOT_DURABLE,
+                "not_durable",
+                not_durable,
+            )
+        elif run_errors:
             outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
         elif draft.stopped is not None:
             outcome.exit_code = EXIT_STOP
@@ -1008,6 +1046,7 @@ def run_cell(
             if error is not None:
                 outcome.exit_code, outcome.status = EXIT_RUN_ERROR, "run_error"
                 _record_run_error(writer, h, "scratch_cleanup_failed", error)
+            _finalize_after_post_scan_failure(writer, h, manifest_extra, outcome)
         finally:
             writer.close()  # always: no fd outlives the cell, whatever propagated
 
@@ -1038,6 +1077,10 @@ def _record_run_error(writer: RunWriter, h: Harness, kind: str, error: str) -> N
     it goes to stderr and the exit code instead: nothing may appear behind
     ``scan.result`` (cond 10), and nothing is silently dropped either."""
     if writer.closed or writer.sealed:
+        # durable too: the manifest is written AFTER the scan, so a post-scan
+        # failure is recorded there and not only on stderr (it is stderr-only
+        # when the manifest is already written, i.e. the writer is closed)
+        writer.record_post_scan_error(kind, error)
         print(
             json.dumps({"status": "error", "kind": kind, "error": error, "after_scan": True}),
             file=h.err,
@@ -1045,6 +1088,38 @@ def _record_run_error(writer: RunWriter, h: Harness, kind: str, error: str) -> N
         )
         return
     writer.append("run.error", {"kind": kind, "error": error})
+
+
+def _finalize_after_post_scan_failure(
+    writer: RunWriter, h: Harness, extra: dict[str, Any], outcome: CellOutcome
+) -> None:
+    """A failure between the seal and the manifest leaves a sealed, UNfinalized
+    run: finalize it here so the failure itself (``post_scan_errors``) reaches
+    disk. Never raises - the cell's exit code already reports the failure."""
+    if not writer.sealed or writer.closed:
+        return  # not sealed yet (nothing durable to add), or already finalized
+    try:
+        writer.finalize(extra)
+    except ManifestNotDurable as exc:
+        outcome.exit_code, outcome.status, outcome.error = EXIT_NOT_DURABLE, "not_durable", str(exc)
+        print(
+            json.dumps({"status": "not_durable", "run_id": writer.run_id, "error": str(exc)}),
+            file=h.err,
+            flush=True,
+        )
+    except (OSError, WriterError) as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "kind": "post_scan_finalize_failed",
+                    "error": str(exc),
+                    "after_scan": True,
+                }
+            ),
+            file=h.err,
+            flush=True,
+        )
 
 
 def _remove_scratch(scratch: Path) -> str | None:
@@ -1641,6 +1716,11 @@ def main(
         if not args.campaign_id:
             raise ValueError("campaign needs --campaign-id")
         return cmd_campaign(args, out, err, home, popen, killpg)
+    except ManifestNotDurable as exc:
+        # finalized but not proven durable: never a config error, never a
+        # finalize failure (docs/SECURITY.md "Durability of the record")
+        print(json.dumps({"status": "not_durable", "error": str(exc)}), file=out)
+        return EXIT_NOT_DURABLE
     except (PolicyError, LaunchRefused, CredentialFileError, OSError, ValueError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}), file=out)
         return EXIT_CONFIG
