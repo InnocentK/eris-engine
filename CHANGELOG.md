@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - Milestone 2b, Phase 1: harness modules (2026-08-22, in progress)
+## 0.3.0 - Milestone 2b: end-to-end harness (2026-08-23)
 
 Schema `SCHEMA_VERSION` 0.1.2 → **0.1.3** (new golden dir
 `tests/fixtures/records/0.1.3/`, MANIFEST block pinned; 0.1.0–0.1.2 untouched)
@@ -174,6 +174,12 @@ New modules (Phase 1; each requirement has a named test)
   stage (+ unknown-cost count), wall, attempts. Arm 1 findings come from
   the proposal; arm 2 is scored on the RAW summarizer verdict; paired
   deltas 3b−3 and 4−3 per (task, repeat) only with identical `propose_keys`.
+
+Docs: INVARIANTS rows for every M2b rule; PROTOCOL stage contracts;
+SECURITY (sanitization + residuals, scan + false-negative limits, cache,
+prompt envelope, retry/budget/STOP/resume/SIGINT, A17, E17); EVAL-PLAN
+(runnable now, arm-2 raw-scoring note, plan-category caveat, A17/E17 rows,
+E16 built); README/AGENTS/ARCHITECTURE mention `run`/`campaign`/`score`.
 
 Defect fixes (step A; each with a test)
 * F1 `parse_claude` keeps usage/cost/model names on `is_error` and composes

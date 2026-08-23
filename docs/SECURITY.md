@@ -1,4 +1,4 @@
-# Security model (Milestone 1 + 2a)
+# Security model (Milestone 1 + 2a + 2b)
 
 Single-user, self-hosted. The threat model is accidental: a worker CLI that
 reads or writes where it should not, a secret that reaches the ledger, a
@@ -46,12 +46,15 @@ per-host privileged-user recipe (option 1) is the wrong shape, and Docker
 (option 2) is a large lift for what E1 needs now. Consequences that code and
 docs must keep honoring:
 
-* `eval/score.py` (M2b) must refuse to score defect-detection or ABSTAIN
-  arms unless the run manifest records a containment mechanism; plumbing and
-  clean-control arms score normally.
+* `eval/score.py` refuses to score defect-detection or ABSTAIN categories
+  (`revert`, `planted`, `insufficient`) unless `ArmRun.containment ==
+  "container"` (exit 7, no metrics, no CLI override); `control` and `plan`
+  score normally. `containment` is a policy DECLARATION (`containment: null`
+  in `default.yaml`), not a verification, until M2c builds the container.
+  BUILT (M2b): `tests/test_score.py::test_e1_gate_refuses_defect_categories_without_containment`.
 * The envelope/ledger scan for the Athena path, `athena-assistant`, answer-key
-  strings and fix-hunk lines is an M2b deliverable; a hit marks the run
-  `contaminated` (detects, never prevents).
+  strings and fix-hunk lines is BUILT (`eris.scan`, M2b; see "Contamination
+  scan" below); a hit marks the run `contaminated` (detects, never prevents).
 * The eventual portable containment is container-based (Docker/Podman on
   Linux, macOS, Windows; a Debian LXC is itself a container but does not
   confine the workers' reads *within* it). Per-OS user tricks are out.
@@ -138,10 +141,14 @@ What each part of the required argv enforces, and what it does not:
   reply began `MANGO KIWI`, the markers planted in the workspace's
   `AGENTS.md` and `GEMINI.md`). A9/A11 saw no injection only because no
   workspace was declared (vacuous). No opt-out flag exists. Mitigation =
-  per-worker snapshot sanitization (strip `AGENTS.md`/`GEMINI.md`/
-  `CLAUDE.md`/`.agents/` from the agy worktree copy, recorded in the
-  manifest) — **Milestone 2b**. Until then agy proposals/critiques are
-  exposed to repo-authored instructions, the same class as grok.
+  per-worker snapshot sanitization (`eris.sanitize`, BUILT in M2b; see
+  "Snapshot sanitization" below): agy's proposer/critic roles run on a
+  private copy with the instruction files stripped and `--add-dir` pointing
+  at that copy (`test_sanitize.py::test_agy_add_dir_is_the_copy_root`).
+  **A17 (2026-08-22):** with `--add-dir`, agy resolved an in-workspace
+  symlink `LINK_TO_OUTSIDE.txt -> ../outside` to its real path and DENIED
+  the read - agy's confinement resolves symlinks; the sanitizer's symlink
+  drop is defence in depth, not the only control.
 * Canonical argv order (the code is the reference; docs and sidecars follow
   it): `-p <prompt> --model <m> --mode plan --sandbox --add-dir <snapshot
   realpath> --output-format json --disable-slash-commands --print-timeout
@@ -232,6 +239,96 @@ One writer per run (`flock`), temp+fsync+rename for blobs and manifest,
 append+fsync for events, hash chain. Only a partial (non-newline-terminated)
 final line is truncated, and only on explicit resume; any complete invalid
 line, including the last, is INVALID. Failures raise.
+
+## Milestone 2b controls
+
+### Snapshot sanitization (`src/eris/sanitize.py`)
+Workers whose policy says `sanitize_snapshot: true` (agy and grok in
+`default.yaml`) run their proposer/critic roles on a PRIVATE COPY of the
+snapshot under the run's scratch dir, removed in `finally` (a cleanup
+failure is a `run.error`, never silent). Verification ALWAYS runs on the
+original. The strip list is the policy's `sanitize` section on top of an
+enforced minimum (R3.1): `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`,
+`GEMINI.md`, `GROK.md`; `.agents`, `.claude`, `.codex`, `.gemini`, `.grok`,
+`.antigravity`, `.cursor`, `.github/copilot-instructions.md` - matched by
+name at any depth, case-insensitively, whatever the entry is (a file, a
+directory, or a symlink named `AGENTS.md`). Files get new inodes (never
+hardlinks); symlinks are kept only when relative, resolving inside the tree
+and not into a stripped entry (every other link is dropped and recorded);
+`.git` is copied without `hooks`. `SnapshotSanitization` records the
+profile hash, the original's tree hash, the copy's tree hash, every stripped
+file (relpath, size, sha256) and every dropped link.
+
+**Residual (in-band instruction channels that remain):** comments,
+docstrings, READMEs and commit messages are still read by the worker; a
+worker with git tools can still `git show HEAD:AGENTS.md`; the
+`.git` objects are copied verbatim. Sanitization removes what the CLIs load
+AUTOMATICALLY; it does not make a repository trustworthy. **E17
+(2026-08-22):** grok, asked to quote any begin-reply instructions, replied
+`None` (the API then refused the reproduction prompt with a 403 safety
+check, fixture `grok/1.0.5/api_error_403.json`); E1's grok reply had begun
+`MANGO PINEAPPLE`. Injection was observed once and not reproduced; grok is
+sanitized anyway (cheap) and the result is recorded honestly.
+
+### Contamination scan (`src/eris/scan.py`) - tripwire, detect only
+Every run is scanned BEFORE finalize and re-scanned read-only by the
+scorer: every blob, every event payload, the rendered pack and any reused
+cache entry. Patterns are derived at RUN TIME - the source repository's
+path (`key.json.source_repo`) and `Path.home()`-rooted vendor memory stores
+(`~/.claude/projects`, `~/.codex/sessions`,
+`~/.gemini/antigravity-cli/brain`), the fixed markers `athena-assistant`,
+`eval/corpus/`, `key.json`, the key's fix-hunk lines and extra strings, and
+policy strings - whitespace-folded and sha256-named. The ledger carries
+pattern hashes and counts ONLY (`ScanResult`); no fix-hunk text exists in
+this repository or in any run. A hit marks the run `contaminated` (exit 6;
+the scorer excludes it from quality metrics and counts its cost); a
+truncated stdout or an empty-stdout TIMEOUT makes the scan `scan_incomplete`
+(treated as contaminated).
+
+**False-negative limits (documented, not fixed):** a worker that read the
+answer key but paraphrased it leaves no pattern; patterns shorter than 12
+characters (except the fixed markers), present in the pre-fix tree, or
+contained in the harness's own recorded paths (the snapshot and run
+directories) are dropped as non-distinctive (counted, never listed) - a
+marker that Eris's own `run.started`/`Invocation.cwd` necessarily contain
+cannot discriminate; binary or truncated output is not scanned beyond the
+cap. The scan is evidence of contamination when it fires; silence is not
+evidence of cleanliness.
+
+### Call cache (`src/eris/cache.py`)
+Lives in `cache/` (policy `cache_dir`, gitignored, refused when equal to or
+under `runs/`). Entry bytes come out of `RunWriter.put_blob` (redacted) and
+the entry file is named by their sha256; blobs are copied from the run's
+blob files and re-hashed. Write-once (`O_EXCL`): a different entry under the
+same key is a `conflict`, never an overwrite. A HIT needs the current
+executable pin, key + prompt match, same campaign (unless
+`--reuse-across-campaigns`), status ok, `scan_hits == 0` (a contaminated
+entry is never reused), a known model, the current schema version, the
+entry hash == name and every blob re-hashing; every file is `lstat`-checked
+and opened `O_NOFOLLOW`; any failure is a reasoned miss and a fresh call.
+A replay whose blob changes under the reusing run's redactor (a secret
+learned later) is refused. Without `O_NOFOLLOW` (Windows) the cache refuses
+to construct (documented; M2c adds a portable fallback).
+
+### Prompt envelope (`src/eris/stages.py`)
+DATA is one canonical-JSON document between nonce delimiters; repository
+text appears only inside JSON strings; a nonce inside the data is
+neutralised and recorded. Prompts over 256 KiB are refused and never
+spilled to a file. Model output enters only through closed wire models;
+Eris assigns every id. The judge sees executable basenames, never host
+paths, and never another stage's instructions.
+
+### Retry, budget, STOP, resume, SIGINT
+Unknown failures are terminal; the judge's timeout is terminal; the retry
+weight budget is 3 per call. The money pre-check (`spent_known + reserved +
+per_call_usd > ceiling`, per run and per campaign) runs before EVERY spawn
+and records a `BUDGET_TRIPPED` invocation without spawning. STOP files
+(`runs/STOP`, `runs/<campaign>/STOP`) are checked before every step, every
+worker call, every attempt and every verification command; the attempt in
+flight always completes. Resume replays only stages whose blobs re-hash,
+records abandoned attempts with a pessimistic cost, kills surviving process
+groups recorded at spawn time (refused where `os.killpg` is missing) and
+removes stale scratch. The SIGINT handler lives only in `eval/run.py`.
 
 ## Residual risks (UNKNOWN / not enforced)
 * Workers other than agy READ outside the snapshot (E1, measured): see the
