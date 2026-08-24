@@ -272,8 +272,10 @@ line, including the last, is INVALID. Failures raise.
 Workers whose policy says `sanitize_snapshot: true` (agy and grok in
 `default.yaml`) run their proposer/critic roles on a PRIVATE COPY of the
 snapshot under the run's scratch dir, removed in `finally` (a cleanup
-failure is a `run.error`, never silent). Verification ALWAYS runs on the
-original. The strip list is the policy's `sanitize` section on top of an
+failure is a `run.error`, never silent). Verification NEVER runs in one of
+those stripped copies - and it does not run in the original either: it runs in
+a separate private VERIFICATION copy (`VERIFICATION_PROFILE`, below), which
+strips nothing from the working tree. The strip list is the policy's `sanitize` section on top of an
 enforced minimum (R3.1): `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`,
 `GEMINI.md`, `GROK.md`; `.agents`, `.claude`, `.codex`, `.gemini`, `.grok`,
 `.antigravity`, `.cursor`, `.github/copilot-instructions.md` - matched by
@@ -411,7 +413,7 @@ The executable pin, the subcommand lists, the per-tool hard-deny (`--ext-diff`,
 the repository chose the program, not the model.
 
 **What survives in the copy** (`GIT_CONFIG_ALLOWED_CORE_KEYS`,
-`GIT_CONFIG_ALLOWED_SECTIONS`): `core.repositoryformatversion`,
+`GIT_CONFIG_EXTENSIONS_KEPT`): `core.repositoryformatversion`,
 `core.filemode`, `core.bare`, `core.symlinks`, `core.ignorecase`,
 `core.precomposeunicode`, `core.logallrefupdates`, and - from `extensions` -
 only `objectformat` and `compatobjectformat`, and only with a value in
@@ -552,6 +554,17 @@ nothing Eris rewrites, deletes or hashes could have helped.
   root - directory, gitlink file or symlink, at any depth. The root's own
   `.git` is skipped; a file merely NAMED like one (`.gitignore`,
   `.gitmodules`) is not a repository.
+* **Names are compared FOLDED (`_fold`: NFC + casefold), because the
+  filesystem may be.** Measured 2026-08-24 on macOS/APFS: `sub/.GIT` is
+  reported by `os.walk` under that literal name while `sub/.git` EXISTS and
+  git resolves it, so the first version of this walk missed it - and, one
+  level up, `.GIT/HOOKS` was being copied into the verification copy. The NFC
+  step is a measured no-op for `.git` (pure ASCII has no decomposed form) and
+  is kept only so the helper survives a future non-ASCII marker name;
+  compatibility lookalikes are deliberately not folded, so a fullwidth
+  `.gｉt` - a genuinely different file - is not a false refusal. On a
+  case-SENSITIVE filesystem `.GIT` is a distinct directory git never reads, so
+  folding costs a refused copy there and never an escape.
 * A GITLINK in the index refuses the verification run, taken on the guard's
   baseline out of the `ls-files -s -v -f` output the tripwire already spawns
   (`-s` prints the mode, so it costs no extra command). This is the half the
@@ -566,6 +579,36 @@ nothing Eris rewrites, deletes or hashes could have helped.
   at all**, checked out or not. This is the largest scope reduction in the M2c
   follow-ups. It shows up as a clean refusal naming the path, never as a quiet
   half-verification.
+
+#### A repository config is not only a git problem (final round)
+
+The config allowlist fixed `git`. Measured 2026-08-24 against the other two
+allowlisted tools, and both were already true before any of this work:
+
+| tool | what a repository config did | Eris's flag |
+|---|---|---|
+| `mypy` | `mypy.ini` with `plugins = ./evil_plugin.py` **EXECUTED the plugin** - arbitrary code execution, the same class as `[diff] external` | `--config-file <os.devnull>` |
+| `ruff` | `ruff.toml` with `[lint] select = []` made `ruff check` report "All checks passed!" on a file with an unused import - **evidence manipulation**, not execution | `--isolated` |
+
+Eris appends these itself (`verify.ERIS_ISOLATION_FLAGS`), on exactly the
+contract `--no-optional-locks` already had: FIRST in argv, before any
+subcommand or positional, and **hard-denied to a model** so a proposal can
+neither double the flag nor point it somewhere else. The ruff case is not
+execution, but for an engine whose one job is deciding whether an answer is
+defensible *given the evidence*, a repository that can choose which findings
+exist is its own kind of serious.
+
+`os.devnull` rather than a literal `/dev/null`: Windows spells it `nul`, and
+whether mypy accepts `--config-file nul` there is **UNKNOWN and untested**.
+mypy also prints `<devnull>: No [mypy] section in config file` on stderr, which
+lands in the recorded evidence; that noise is accepted in exchange for the
+isolation.
+
+**`pytest` gets no isolation flag, because none exists.** `conftest.py` IS
+repository code that pytest imports and executes by design, and no switch turns
+that off - which is exactly why `pytest` carries `requires_trusted` and is
+refused unless the policy is `trusted: true`. `-p no:cacheprovider` is about
+the cache directory, not about isolation.
 
 #### What is still open after M2c follow-up 5
 
@@ -746,11 +789,15 @@ leaves the shared file behind, so the tree stays changed.
 
 If the copy has a `.git` directory and no digest can be taken (git unavailable,
 unpinned, non-zero exit, timeout, truncated output - including a probe that
-stops working part way through a run), the guard FAILS CLOSED: it drops the
-byte exclusion for that run and hashes `.git/index` like any other file, and
-the event records `index_check: "bytes_fallback"`. That costs false positives
-on the stat refresh; it never silently skips the check. A copy with no `.git`
-directory has no index to guard (`index_check: "none"`).
+stops working part way through a run), the guard FAILS CLOSED by REFUSING the
+run (`IndexScopeUnknown`). Until 0.3.10 it degraded to hashing `.git/index`
+like any other file (`index_check: "bytes_fallback"`); the advisor round found
+that this was a hole rather than a fallback, because without the digest the
+GITLINK scan never runs and a superproject sails straight through. Nothing real
+is lost by refusing: every command in the default battery IS git, so a copy
+whose pinned git cannot be run has no verification to produce. A copy with no
+`.git` directory has no index to guard and is not refused (`index_check:
+"none"`).
 
 ### The judge never sees the snapshot (item 2)
 The adjudicator/summarizer cwd - and agy's `--add-dir`, codex's `-C` - is an
