@@ -1362,3 +1362,136 @@ def test_a_cleanup_failure_on_a_refusal_reports_both(
             raise AssertionError("the body must never run")  # pragma: no cover
     assert isinstance(caught.value.__cause__, SanitizeError)
     assert "a NESTED repository" in str(caught.value.__cause__)
+
+
+@pytest.mark.parametrize("spelling", [".git", ".GIT", ".Git", ".gIT"])
+def test_a_nested_repository_is_refused_whatever_its_case(tmp_path: Path, spelling: str) -> None:
+    """The nested-repo walk compares FOLDED names, because the filesystem may.
+
+    Measured 2026-08-24 on macOS/APFS: a directory created as `.GIT` is
+    reported by `os.walk` under that literal name, while `Path("sub/.git")
+    .exists()` is True and git resolves it. An exact `name == ".git"` test
+    therefore missed it, and the "ANY `.git`, any shape, any depth" claim was
+    false as written.
+
+    On a case-SENSITIVE filesystem `.GIT` is a distinct directory git never
+    reads, so folding costs a refused copy there and never an escape."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    (original / "sub").mkdir()
+    (original / "sub" / spelling).mkdir()
+    (original / "sub" / spelling / "config").write_text("[diff]\n\texternal = /tmp/evil.sh\n")
+
+    with pytest.raises(SanitizeError, match=r"sub/\." + spelling[1:] + ": a NESTED repository"):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+def test_the_git_name_fold_is_ascii_only_and_normalisation_is_a_no_op() -> None:
+    """What `_fold` does and does not do, pinned rather than assumed.
+
+    `.git` is pure ASCII, so NFC/NFD/NFKC/NFKD all return it unchanged - there
+    is NO decomposed spelling of `.git` to defend against, and the NFC step is
+    a measured no-op kept only so the helper stays correct if a non-ASCII
+    marker name is ever added.
+
+    It must NOT fold compatibility lookalikes: a fullwidth `.g<U+FF49>t` is a
+    DIFFERENT file (measured 2026-08-24 on APFS - creating it leaves `.git`
+    non-existent), so matching it would be a false refusal."""
+    import unicodedata
+
+    from eris.sanitize import _fold, _is_git_name
+
+    for form in ("NFC", "NFD", "NFKC", "NFKD"):
+        assert unicodedata.normalize(form, ".git") == ".git", form
+    for spelling in (".git", ".GIT", ".Git", ".gIT", unicodedata.normalize("NFD", ".GIT")):
+        assert _is_git_name(spelling), spelling
+    for other in (".gitignore", "git", ".gi", ".gｉt", "..git", " .git"):
+        assert not _is_git_name(other), other
+    assert _fold(".GIT") == _fold(".git") == ".git"
+
+
+def test_a_case_folded_git_hooks_directory_is_still_not_copied(tmp_path: Path) -> None:
+    """The same fold, one level down and in the COPIER. `.git/hooks` is
+    dropped because our allowlist runs git and a repository hook would fire on
+    the first invocation - and on a case-insensitive filesystem `.GIT/HOOKS`
+    is that same directory."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    (original / ".GIT" / "HOOKS").mkdir(parents=True)
+    (original / ".GIT" / "HOOKS" / "pre-commit").write_text("#!/bin/sh\nexit 1\n")
+    (original / ".GIT" / "HEAD").write_text("ref: refs/heads/main\n")
+    (original / "keep.txt").write_text("k\n")
+
+    copy = tmp_path / "c"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="v")
+
+    assert not (copy / ".GIT" / "HOOKS").exists()
+    assert (copy / ".GIT" / "HEAD").is_file()  # the rest of the gitdir is copied
+
+
+def test_a_directory_appearing_in_the_reservation_window_is_never_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2c follow-up 5, final round, item 4: the cleanup RACE.
+
+    The removal used to be gated on an existence check taken BEFORE
+    `make_private_dir`. A directory appearing in that window would be refused
+    by `make_private_dir` (correctly) and then DELETED by the cleanup
+    (catastrophically) - because "it did not exist when I looked" was being
+    used as "I created it".
+
+    Ownership is now the successful `mkdir(exist_ok=False)` itself: the
+    reservation happens in `sanitized_copy`, and nothing is removed unless
+    that call returned normally. Here the directory is planted inside the
+    window, exactly as a concurrent process would."""
+    import eris.launch as launch_mod
+    import eris.sanitize as sanitize_mod
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    scratch = tmp_path / "scratch"
+    dest = scratch / "sanitized-verify"
+    real_make = launch_mod.make_private_dir
+
+    def racing(path: Path) -> None:
+        if path == dest and not path.exists():
+            path.mkdir(parents=True)  # a concurrent process wins the race
+            (path / "someone-elses.txt").write_text("do not delete me\n")
+        real_make(path)
+
+    monkeypatch.setattr(sanitize_mod, "make_private_dir", racing)
+
+    with pytest.raises(LaunchRefused, match="already exists"):
+        with sanitized_copy(original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"):
+            raise AssertionError("the body must never run")  # pragma: no cover
+
+    assert (dest / "someone-elses.txt").read_text() == "do not delete me\n"
+
+
+def test_the_reservation_is_made_once_and_owned_by_the_context_manager(tmp_path: Path) -> None:
+    """The other half: `sanitized_copy` reserves, and `sanitize_snapshot` is
+    told the reservation is already held so it does not try again. A direct
+    `sanitize_snapshot` call still reserves for itself - the two entry points
+    must not drift into double-reserving or into never reserving."""
+    from eris.sanitize import VERIFICATION_PROFILE, sanitize_snapshot
+
+    original = _mkgit(tmp_path / "o")
+
+    # direct call: reserves for itself, so a pre-existing dest is refused
+    (tmp_path / "taken").mkdir()
+    with pytest.raises(LaunchRefused, match="already exists"):
+        sanitize_snapshot(original, tmp_path / "taken", profile=VERIFICATION_PROFILE, worker_id="v")
+
+    # ... and with the reservation declared, it writes into the dir it was given
+    reserved = tmp_path / "reserved"
+    reserved.mkdir()
+    record = sanitize_snapshot(
+        original,
+        reserved,
+        profile=VERIFICATION_PROFILE,
+        worker_id="v",
+        dest_reserved=True,
+    )
+    assert (reserved / "keep.txt").is_file() and record.worker_id == "v"

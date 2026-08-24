@@ -53,6 +53,7 @@ import errno
 import os
 import shutil
 import stat
+import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -258,6 +259,45 @@ class SanitizeProfile:
 # --------------------------------------------------------------------------- tree hash
 
 
+def _fold(name: str) -> str:
+    """One filesystem name, folded the way a CASE-INSENSITIVE filesystem
+    compares it: NFC-normalised, then case-folded.
+
+    Measured 2026-08-24 on macOS/APFS: a directory created as ``.GIT`` is
+    reported by ``os.walk``/``os.listdir`` under its literal name, while
+    ``Path("sub/.git").exists()`` is True and git resolves it - so an exact
+    ``name == ".git"`` test misses a nested repository the kernel happily
+    hands to git. That is the whole reason this exists.
+
+    The NFC step is a NO-OP for ``.git`` and is measured to be one: ``.git``
+    is pure ASCII, so NFC, NFD, NFKC and NFKD all return it unchanged, and
+    there is no decomposed spelling of it. It is kept so the helper stays
+    correct if a non-ASCII marker name is ever added, not because ``.git``
+    needs it. It deliberately does NOT fold compatibility lookalikes: a
+    fullwidth ``.gｉt`` is a DIFFERENT file on this filesystem (measured -
+    creating it leaves ``.git`` non-existent), so treating it as ``.git``
+    would be a false refusal.
+
+    On a case-SENSITIVE filesystem ``.GIT`` is a distinct, ordinary directory
+    that git never reads, so folding costs a refused copy there and never an
+    escape - the safe direction."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _is_git_name(name: str) -> bool:
+    """True when the filesystem may hand ``name`` to git as ``.git``."""
+    return _fold(name) == _fold(GIT_DIR)
+
+
+def _under_git_path(parts: tuple[str, ...], expected: tuple[str, ...]) -> bool:
+    """True when the relpath ``parts`` is at or below ``expected``, comparing
+    each component with :func:`_fold` - so ``.GIT/hooks`` is still the hooks
+    directory Eris refuses to copy."""
+    if len(parts) < len(expected):
+        return False
+    return all(_fold(a) == _fold(b) for a, b in zip(parts, expected, strict=False))
+
+
 def tree_sha256(root: Path, *, skip: Callable[[PurePosixPath], bool] | None = None) -> str:
     """Order-independent hash of a tree: one line per entry (file content
     sha, directory, or symlink target), sorted by relative path. Symlinks
@@ -325,15 +365,26 @@ def _symlink_keepable(
 
 
 def sanitize_snapshot(
-    original: Path, dest: Path, *, profile: SanitizeProfile, worker_id: str
+    original: Path,
+    dest: Path,
+    *,
+    profile: SanitizeProfile,
+    worker_id: str,
+    dest_reserved: bool = False,
 ) -> SnapshotSanitization:
     """Build ``dest`` (created fresh; refused if it exists or is a symlink)
-    as the sanitized copy of ``original``. Never writes to ``original``."""
+    as the sanitized copy of ``original``. Never writes to ``original``.
+
+    ``dest_reserved`` says the CALLER already made the ``make_private_dir``
+    call - that is, the caller holds the proof that the successful ``mkdir``
+    was its own. :func:`sanitized_copy` uses it so that its cleanup can never
+    delete a directory somebody else created (advisor round, item 4)."""
     original = Path(original).resolve()
     if not original.is_dir():
         raise SanitizeError(f"snapshot {original} is not a directory")
     dest = Path(dest)
-    make_private_dir(dest)
+    if not dest_reserved:
+        make_private_dir(dest)
     dest = dest.resolve()
     if dest == original or _is_under(dest, original) or _is_under(original, dest):
         raise SanitizeError("the copy must not live inside the original (or vice versa)")
@@ -345,13 +396,15 @@ def sanitize_snapshot(
     made_dirs: list[tuple[Path, Path]] = [(original, dest)]
     for dirpath, dirnames, filenames in os.walk(original, topdown=True, followlinks=False):
         base = Path(dirpath)
-        in_git = _rel(base, original).parts[:1] == (GIT_DIR,) if base != original else False
+        in_git = (
+            _under_git_path(_rel(base, original).parts, (GIT_DIR,)) if base != original else False
+        )
         keep_dirs: list[str] = []
         for d in sorted(dirnames):
             src = base / d
             rel = _rel(src, original)
-            if rel.parts[: len(GIT_HOOKS)] == GIT_HOOKS:
-                continue  # .git/hooks is never copied
+            if _under_git_path(rel.parts, GIT_HOOKS):
+                continue  # .git/hooks is never copied (`.GIT/HOOKS` too: see `_fold`)
             if not in_git and profile.matches(rel):
                 stripped.extend(_collect(src, original))
                 continue
@@ -906,6 +959,12 @@ def assert_no_nested_repositories(copy_root: Path) -> None:
     a config tree of unbounded depth, some of it outside the snapshot, and
     getting it wrong is exactly this bug again.
 
+    Names are compared with :func:`_fold`, not for equality. Measured
+    2026-08-24 on macOS/APFS: ``sub/.GIT`` is reported by ``os.walk`` under
+    that literal name while ``sub/.git`` EXISTS as far as the kernel and git
+    are concerned, so an exact comparison missed it and the "any ``.git``, any
+    shape, any depth" promise was false as written.
+
     The root's own ``.git`` is not a nested repository and is skipped; a
     gitdir under it (``.git/modules/``) is refused by
     :func:`assert_no_repo_escapes`. The INDEX side of the same scope rule - a
@@ -918,12 +977,12 @@ def assert_no_nested_repositories(copy_root: Path) -> None:
         base = Path(dirpath)
         if base == root:
             # the copy's OWN `.git` is the repository being verified
-            dirnames[:] = [d for d in dirnames if d != GIT_DIR]
-            names = [f for f in filenames if f != GIT_DIR]
+            dirnames[:] = [d for d in dirnames if not _is_git_name(d)]
+            names = [f for f in filenames if not _is_git_name(f)]
         else:
             names = list(filenames)
         for name in (*dirnames, *names):
-            if name == GIT_DIR:
+            if _is_git_name(name):
                 rel = _rel(base / name, root).as_posix()
                 raise SanitizeError(
                     f"{rel}: a NESTED repository is present in the copy; refusing the copy "
@@ -983,7 +1042,7 @@ def rewrite_git_config(copy_root: Path) -> ConfigRewrite:
     So the previous model - neutralise the keys we happen to know about
     (``core.fsmonitor``, ``core.untrackedCache``) - was the wrong shape. This
     keeps only :data:`GIT_CONFIG_ALLOWED_CORE_KEYS` and
-    :data:`GIT_CONFIG_ALLOWED_SECTIONS` and drops EVERYTHING else: every
+    :data:`GIT_CONFIG_EXTENSIONS_KEPT` and drops EVERYTHING else: every
     ``diff.*``, ``filter.*``, ``merge.*``, ``gpg.*``, ``credential.*``,
     ``url.*``, ``http.*``, ``uploadpack.*``, ``include.*``, ``includeIf.*``,
     ``alias.*``, ``remote.*``, ``branch.*``, ``user.*``, and every ``core.*``
@@ -1220,26 +1279,33 @@ def sanitized_copy(
     private dir under ``scratch_dir`` and is removed in ``finally``. A
     removal failure raises :class:`SanitizeCleanupError` (never swallowed).
 
-    A failure while the copy is being BUILT removes it too. This is the part
-    the advisor caught: ``sanitize_snapshot`` used to run before the
-    ``try``/``finally``, so every refusal - and there are now many, each of
-    them a deliberate one - left a half-built copy behind in the scratch dir
-    for the orphan sweep to find hours later. The copy is removed only when
-    THIS call created it: a ``dest`` that already existed is refused by
-    ``make_private_dir`` and left exactly as found, the same rule the run
-    scratch reservation follows."""
+    A failure while the copy is being BUILT removes it too. ``sanitize_snapshot``
+    used to run before the ``try``/``finally``, so every refusal - and there
+    are now many, each of them deliberate - left a half-built copy behind in
+    the scratch dir for the orphan sweep to find hours later.
+
+    **The removal is gated on the ``mkdir``, not on a prior existence check.**
+    ``make_private_dir`` is called HERE, and only a call that returned
+    normally sets ``created``: that successful ``mkdir(exist_ok=False)`` IS the
+    proof of ownership. Checking ``dest.exists()`` first and cleaning up
+    afterwards was a race - a directory appearing in the window would be
+    refused by ``make_private_dir`` and then deleted by the cleanup, which is
+    somebody else's data. This is the same reservation rule the run scratch
+    already follows: an entry Eris did not create is left exactly as found."""
     dest = Path(scratch_dir) / (name or f"sanitized-{worker_id}")
-    pre_existing = dest.is_symlink() or dest.exists()
+    make_private_dir(dest)  # THE reservation: if this raises, `dest` is not ours
+    created = True
     try:
-        record = sanitize_snapshot(original, dest, profile=profile, worker_id=worker_id)
+        record = sanitize_snapshot(
+            original, dest, profile=profile, worker_id=worker_id, dest_reserved=created
+        )
     except BaseException as exc:
-        if not pre_existing and (dest.is_symlink() or dest.exists()):
-            try:
-                _remove_copy(dest)
-            except SanitizeCleanupError as cleanup:
-                # never silent, and never at the cost of the reason: the
-                # refusal that started this is the `__cause__`
-                raise cleanup from exc
+        try:
+            _remove_copy(dest)
+        except SanitizeCleanupError as cleanup:
+            # never silent, and never at the cost of the reason: the
+            # refusal that started this is the `__cause__`
+            raise cleanup from exc
         raise
     try:
         yield dest.resolve(), record

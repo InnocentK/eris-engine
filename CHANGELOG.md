@@ -135,6 +135,28 @@ Fixed - docs that had drifted from the code
   `docs/SECURITY.md` section for nested repositories with the measurement
   table.
 
+Fixed (final round) - `.GIT` evaded the nested-repo walk
+* The "ANY `.git`, any shape, any depth" promise was FALSE as written.
+  Measured 2026-08-24 on macOS/APFS: a directory created as `sub/.GIT` is
+  reported by `os.walk` under that literal name, while `Path("sub/.git")
+  .exists()` is True and git resolves it - so the exact `name == ".git"` test
+  missed a nested repository the kernel hands straight to git.
+* Names are now compared FOLDED (`_fold`: NFC then casefold), and the same
+  fold guards the copier's `.git/hooks` skip and its in-git test. That second
+  one was a hole in its own right, found by the fix: **`.GIT/HOOKS` was being
+  COPIED into the verification copy**, where our allowlisted git would have
+  run a repository hook on the first invocation.
+* Honest limits, both measured. NFC is a **no-op** for `.git`: it is pure
+  ASCII, so NFC/NFD/NFKC/NFKD all return it unchanged and there is no
+  decomposed spelling to defend against - the step is kept only so the helper
+  survives a future non-ASCII marker name, not because `.git` needs it, and
+  the "NFD-composed variant" the round asked for a test for does not exist.
+  Compatibility lookalikes are deliberately NOT folded: a fullwidth `.gｉt` is
+  a genuinely different file (creating it leaves `.git` non-existent), so
+  matching it would be a false refusal.
+* On a case-SENSITIVE filesystem `.GIT` is a distinct directory git never
+  reads, so folding costs a refused copy there and never an escape.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c
