@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.14 - the whole reporter body is guarded, not its last step (2026-08-24)
+
+Twelfth stop-time finding, and the third in a row on the same helper. Each
+previous fix guarded exactly the step the previous finding named - the write
+(0.3.12), then the caller's formatting (0.3.13) - leaving the next step
+exposed. This one stops chasing steps.
+
+* `_print_scratch_cleanup_failure`'s ENTIRE body is inside one guard,
+  including the dict construction where `str(scratch)` lived. `_safe_text` is
+  kept inside it as belt-and-braces, not as the mechanism.
+* Test explodes a DIFFERENT step than any previous finding did (a path whose
+  `__str__` raises) and fails against the 0.3.13 shape.
+
+The rule, and the reason it took three rounds: a handler already dealing with
+a failure must be unable to raise ANYWHERE, so the guard belongs around the
+whole body and must stay there as the body changes - guarding "the line that
+broke" is what produced three findings instead of one.
+
 ## 0.3.13 - formatting a cleanup failure cannot replace the reason (2026-08-24)
 
 Eleventh stop-time finding, and a fair correction to 0.3.12's claim that it

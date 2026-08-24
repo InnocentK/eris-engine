@@ -1688,3 +1688,26 @@ def test_remove_scratch_never_raises_on_an_unprintable_error(
 
     monkeypatch.setattr(run_module.shutil, "rmtree", boom)
     assert run_module._remove_scratch(scratch) == f"{scratch}: <unprintable error>"
+
+
+class _UnprintablePath(type(Path())):  # type: ignore[misc]
+    """A path whose ``__str__`` raises - stands in for anything in the report
+    that could explode while being formatted."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("this path cannot be printed")
+
+
+def test_the_whole_report_is_guarded_not_just_its_last_step(tmp_path: Path) -> None:
+    """The reporter must be unable to raise ANYWHERE in its body.
+
+    This was fixed three times one step at a time (the write, the caller's
+    formatting, the dict construction) because each fix guarded only the step
+    the previous finding named. The guard now wraps the whole body; this test
+    explodes a DIFFERENT step than any of those findings did.
+    """
+    import eval.run as run_module
+
+    run_module._print_scratch_cleanup_failure(
+        io.StringIO(), "r6", _UnprintablePath(tmp_path / "s"), "EBUSY"
+    )
