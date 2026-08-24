@@ -99,6 +99,7 @@ class Fleet:
             cwd_for=lambda _w, _r, _i: self.snapshot,
             scratch_dir=run_dir / "scratch",
             home=str(self.tmp / "home"),
+            user="testuser",
             path_env="/usr/bin:/bin",
             runner=self.spy,
             cache=self.cache,

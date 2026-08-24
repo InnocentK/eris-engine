@@ -254,6 +254,7 @@ class World:
             cwd_for=lambda _w, _r, _i: self.snapshot,
             scratch_dir=tmp_path / "runs" / "r1" / "scratch",
             home=str(tmp_path / "home"),
+            user="testuser",
             path_env="/usr/bin:/bin",
             runner=self.spy,
             cache=Cache(tmp_path / "cache", runs_dir=tmp_path / "runs") if cache else None,
@@ -367,6 +368,7 @@ def _ok_result(structured: Any, text: str | None = None) -> WorkerResult:
         stage=Stage.PROPOSE,
         repeat_index=0,
         policy_sha256="0" * 64,
+        user="testuser",
     )
     return (
         Spy._result(call, WorkerStatus.OK, structured)

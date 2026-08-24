@@ -14,12 +14,14 @@ from typing import Any
 import pytest
 
 from eris.launch import (
+    BASE_ENV,
     FORBIDDEN_ARGV_TOKENS,
     GIT_HARDENING,
     PARSERS,
     PER_CLI_ENV,
     LaunchRefused,
     WorkerCall,
+    _passwd_user,
     agy_print_timeout_s,
     assert_agy_workspace,
     assert_argv_safe,
@@ -37,6 +39,7 @@ from eris.launch import (
     parse_grok,
     plan_call,
     preflight_executable,
+    resolve_user,
     run_worker,
     spawn,
 )
@@ -325,14 +328,125 @@ def test_argv_hygiene() -> None:
 def test_env_is_built_from_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ERIS_CANARY_SHOULD_NOT_LEAK", "1")
     monkeypatch.setenv("OPENAI_API_KEY", "from-os-environ")
-    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t")
+    monkeypatch.setenv("USER", "from-os-environ")
+    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t", user="alice")
     assert "ERIS_CANARY_SHOULD_NOT_LEAK" not in env
     assert "OPENAI_API_KEY" not in env
     assert env["PATH"] == "/usr/bin" and env["HOME"] == "/h" and env["TMPDIR"] == "/t"
+    assert env["USER"] == "alice"  # the caller's value, never os.environ's
     assert env["DISABLE_AUTOUPDATER"] == "1"
     for k, v in GIT_HARDENING.items():
         assert env[k] == v
     assert "CLAUDECODE" not in env and "CLAUDE_CODE_ENTRYPOINT" not in env
+
+
+def test_env_key_set_is_exact_for_every_cli() -> None:
+    """The environment is an ALLOWLIST, not a starting point: pin the exact
+    key set per CLI so a new name can never be added by accident (M2c: USER
+    was added deliberately - see build_env - and nothing else came with it)."""
+    common = set(BASE_ENV) | set(GIT_HARDENING) | {"PATH", "HOME", "TMPDIR", "USER"}
+    for cli in ("claude", "codex", "agy", "grok"):
+        env = build_env(cli, path_env="/usr/bin", home="/h", tmpdir="/t", user="alice")
+        assert set(env) == common | set(PER_CLI_ENV[cli]), cli
+    # an unresolvable account omits USER rather than inventing one
+    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t", user=None)
+    assert "USER" not in env
+
+
+def test_resolve_user_prefers_passwd_and_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The account name comes from the OS, never from a filtered os.environ.
+    getpass is the portable fallback (Windows has no `pwd`) and is consulted
+    only when it CANNOT be answering out of the environment."""
+    import eris.launch as launch_mod
+
+    for name in launch_mod._GETPASS_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(launch_mod, "_passwd_user", lambda: "from-passwd")
+    monkeypatch.setattr(launch_mod.getpass, "getuser", lambda: "from-getpass")
+    assert resolve_user() == "from-passwd"
+
+    def _no_pwd() -> str:
+        raise ImportError("no pwd module on this platform")
+
+    monkeypatch.setattr(launch_mod, "_passwd_user", _no_pwd)
+    assert resolve_user() == "from-getpass"
+
+    def _boom() -> str:
+        raise KeyError("no account name anywhere")
+
+    monkeypatch.setattr(launch_mod.getpass, "getuser", _boom)
+    assert resolve_user() is None
+
+
+@pytest.mark.parametrize("name", ["LOGNAME", "USER", "LNAME", "USERNAME"])
+def test_resolve_user_ignores_an_environment_derived_fallback(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """`getpass.getuser()` reads LOGNAME/USER/LNAME/USERNAME BEFORE the passwd
+    database. When passwd cannot answer and any of those is set, the fallback
+    would hand a worker CLI a name an attacker (or a stray export) chose. That
+    is treated as UNRESOLVED - omitted, never passed through."""
+    import eris.launch as launch_mod
+
+    for n in launch_mod._GETPASS_ENV_NAMES:
+        monkeypatch.delenv(n, raising=False)
+
+    def _no_pwd() -> str:
+        raise ImportError("no pwd module on this platform")
+
+    monkeypatch.setattr(launch_mod, "_passwd_user", _no_pwd)
+    monkeypatch.setattr(launch_mod.getpass, "getuser", lambda: "attacker")
+    monkeypatch.setenv(name, "attacker")
+    assert resolve_user() is None
+    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t", user=resolve_user())
+    assert "USER" not in env
+
+
+def test_user_is_not_policy_or_secret_controllable() -> None:
+    """USER is Eris's, from the OS. A policy `env` or an `env_allow` secret
+    that names it is REFUSED outright, and the OS value is written LAST so
+    nothing already in the dict can override it."""
+    with pytest.raises(LaunchRefused, match="USER is set by Eris"):
+        build_env(
+            "claude",
+            path_env="/usr/bin",
+            home="/h",
+            tmpdir="/t",
+            user="alice",
+            policy_env={"USER": "root"},
+        )
+    with pytest.raises(LaunchRefused, match="USER is set by Eris"):
+        build_env(
+            "claude",
+            path_env="/usr/bin",
+            home="/h",
+            tmpdir="/t",
+            user="alice",
+            secrets={"USER": "root"},
+        )
+    # refused even when Eris itself could not resolve an account
+    with pytest.raises(LaunchRefused, match="USER is set by Eris"):
+        build_env(
+            "grok", path_env="/usr/bin", home="/h", tmpdir="/t", user=None, policy_env={"USER": "x"}
+        )
+    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t", user="alice")
+    assert env["USER"] == "alice"
+
+
+@pytest.mark.parametrize("bad", ["", "a\nb", "x\x00y", "u" * 65])
+def test_resolve_user_discards_an_implausible_name(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    import eris.launch as launch_mod
+
+    monkeypatch.setattr(launch_mod, "_passwd_user", lambda: bad)
+    monkeypatch.setattr(launch_mod.getpass, "getuser", lambda: bad)
+    assert resolve_user() is None
+
+
+def test_the_real_passwd_user_matches_the_account_running_the_suite() -> None:
+    """`_passwd_user` reads the passwd database (no subprocess, no env)."""
+    assert resolve_user() == _passwd_user()
 
 
 @pytest.mark.parametrize(
@@ -359,15 +473,21 @@ def test_env_is_built_from_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_never_list_names_are_refused(name: str) -> None:
     with pytest.raises(LaunchRefused, match="NEVER list"):
-        build_env("codex", path_env="/usr/bin", home="/h", tmpdir="/t", policy_env={name: "x"})
+        build_env(
+            "codex", path_env="/usr/bin", home="/h", tmpdir="/t", user="u", policy_env={name: "x"}
+        )
     with pytest.raises(LaunchRefused):
-        build_env("codex", path_env="/usr/bin", home="/h", tmpdir="/t", secrets={name: "x"})
+        build_env(
+            "codex", path_env="/usr/bin", home="/h", tmpdir="/t", user="u", secrets={name: "x"}
+        )
     with pytest.raises(LaunchRefused):
-        build_env("agy", path_env="/usr/bin", home="/h", tmpdir="/t", policy_env={name: "x"})
+        build_env(
+            "agy", path_env="/usr/bin", home="/h", tmpdir="/t", user="u", policy_env={name: "x"}
+        )
 
 
 def test_agy_env_disables_auto_update_and_agy_prefix_is_not_banned() -> None:
-    env = build_env("agy", path_env="/usr/bin", home="/h", tmpdir="/t")
+    env = build_env("agy", path_env="/usr/bin", home="/h", tmpdir="/t", user="u")
     assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1" and PER_CLI_ENV["agy"] == {
         "AGY_CLI_DISABLE_AUTO_UPDATE": "1"
     }
@@ -378,6 +498,7 @@ def test_agy_env_disables_auto_update_and_agy_prefix_is_not_banned() -> None:
         path_env="/usr/bin",
         home="/h",
         tmpdir="/t",
+        user="u",
         policy_env={"AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
     )
     assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1"
@@ -400,7 +521,7 @@ def test_spawn_passes_hardened_popen_kwargs(
     tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
 ) -> None:
     factory = fake_process(stdout=b"out", stderr=b"err", returncode=0)
-    env = build_env("grok", path_env="/usr/bin", home=str(tmp_path), tmpdir=str(tmp_path))
+    env = build_env("grok", path_env="/usr/bin", home=str(tmp_path), tmpdir=str(tmp_path), user="u")
     res = spawn(
         ["/x/grok", "-p", "hi"],
         env=env,
@@ -939,6 +1060,7 @@ def make_call(tmp_path: Path, policy: WorkerPolicy, **kw: Any) -> WorkerCall:
         "stage": Stage.PROPOSE,
         "repeat_index": 0,
         "policy_sha256": "0" * 64,
+        "user": "testuser",
         "home": str(tmp_path / "home"),
         "tmpdir": str(tmp_path / "tmp"),
         "path_env": "/usr/bin:/bin",

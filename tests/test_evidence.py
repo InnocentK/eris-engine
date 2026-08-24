@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -83,7 +83,7 @@ class ScriptedPopen:
     def __call__(self, args: Any, **kw: Any) -> FakeProcess:
         argv = [os.fsdecode(a) for a in args]
         self.calls.append((argv, kw))
-        key = argv[1] if len(argv) > 1 else ""
+        key = next((a for a in argv[1:] if not a.startswith("-")), "")
         out = self.outputs.get(key, f"{key} output\n".encode())
         return FakeProcess(
             argv, stdout=out, stderr=b"", returncode=self.returncode, popen_kwargs=kw
@@ -226,7 +226,9 @@ def test_pack_is_content_derived_identical_across_runs_and_carries_no_clock(tmp_
     assert [i.kind for i in b1.items if i.label.startswith("battery")] == [EvidenceKind.TOOL_OUTPUT]
     # executed argv recorded on the pack (resolved executable, allowlisted form)
     assert len(b1.pack.git_argv) == 6 and all(a[0].endswith("/bin/git") for a in b1.pack.git_argv)
-    assert b1.pack.git_argv[0][1:] == ["show", "--no-color", "HEAD"]
+    # Eris appends --no-optional-locks to every git invocation, before the
+    # subcommand (M2c defect B): it is on the executed argv, not the request.
+    assert b1.pack.git_argv[0][1:] == ["--no-optional-locks", "show", "--no-color", "HEAD"]
     assert b1.pack.nonce == derive_nonce(
         snapshot_sha="f" * 40,
         task_id="t_01",
@@ -412,7 +414,11 @@ def test_evidence_requests_refusals_dedupe_caps_and_expectations(tmp_path: Path)
     assert items[0].origin is Origin.MECHANICALLY_OBSERVED and items[0].exit_code == 0
     assert items[0].summary == "P1: exit 0"
     assert items[1].summary == "P1: exit 0; expected 3"  # recorded, never overwritten
-    assert items[0].argv is not None and items[0].argv[1:] == ["rev-parse", "HEAD"]
+    assert items[0].argv is not None and items[0].argv[1:] == [
+        "--no-optional-locks",
+        "rev-parse",
+        "HEAD",
+    ]
     kinds = [e["kind"] for e in events(w)]
     assert kinds == [
         "evidence.item",
@@ -537,6 +543,112 @@ def test_verification_guard_trips_on_a_changed_copy_and_stops_verification(
     assert len(popen.calls) == 2  # the third command never spawned
     assert tree_sha256(original) == before  # the ORIGINAL is untouched
     assert all(kw["cwd"] == str(copy.resolve()) for _a, kw in popen.calls)
+
+
+def test_the_guard_excluded_set_is_exactly_the_git_index(tmp_path: Path) -> None:
+    """M2c defect B: the tripwire ignores git's stat cache and NOTHING else.
+    Widening this set is how a verification command gets to rewrite refs,
+    objects or config unnoticed - pin it."""
+    from eris.evidence import GUARD_EXCLUDED_RELPATHS, _guard_skip
+
+    assert GUARD_EXCLUDED_RELPATHS == {".git/index", ".git/index.lock"}
+    assert _guard_skip(PurePosixPath(".git/index"))
+    assert _guard_skip(PurePosixPath(".git/index.lock"))
+    # near misses are NOT excluded: only the two names, only at the root .git
+    for rel in (
+        ".git",
+        ".git/index2",
+        ".git/HEAD",
+        ".git/config",
+        ".git/refs/heads/main",
+        "index",
+        "sub/.git/index",
+    ):
+        assert not _guard_skip(PurePosixPath(rel)), rel
+
+
+@pytest.mark.parametrize(
+    ("written", "trips"),
+    [
+        ("PLANTED", True),  # a tracked working-tree file
+        (".git/refs/heads/main", True),  # history: must still be caught
+        (".git/config", True),
+        (".git/objects/ab/cdef0123", True),  # a new object
+        (".git/HEAD", True),  # the current branch
+        (".git/hooks/pre-commit", True),  # code that would run on the next git
+        (".git/index", False),  # git's stat cache: the ONLY tolerated write
+        (".git/index.lock", False),  # the file it writes the stat cache through
+    ],
+)
+def test_the_guard_still_trips_on_everything_but_the_git_index(
+    tmp_path: Path, written: str, trips: bool
+) -> None:
+    """M2c defect B: narrowing the tripwire must not blind it. `.git` is NOT
+    excluded wholesale - a command that rewrites refs or config is a
+    violation exactly as before."""
+    from eris.evidence import SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    guard = SnapshotGuard.over(root)
+    target = root / written
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("changed by a verification command\n")
+    assert (guard.changed() is not None) is trips
+
+
+def test_request_key_ignores_the_options_eris_appends(tmp_path: Path) -> None:
+    """M2c defect B: the dedupe key must survive Eris's own git globals, or a
+    RESUMED run re-executes every request it already executed (the recorded
+    argv carries them, the freshly validated one does too, but a key built
+    from either must match)."""
+    from eris.evidence import request_key
+    from eris.verify import GIT_ERIS_GLOBALS
+
+    validated = ["/usr/bin/git", "ls-files"]
+    recorded = ["/opt/homebrew/bin/git", *GIT_ERIS_GLOBALS, "ls-files"]
+    assert request_key(recorded) == request_key(validated)
+    assert request_key(["git", "log"]) != request_key(["git", "ls-files"])
+
+
+def test_a_model_supplied_eris_global_is_refused_not_deduped(tmp_path: Path) -> None:
+    """M2c follow-up: `request_key` strips the options Eris appends, so keying
+    a RAW request would let `git --no-optional-locks ls-files` alias an
+    already-executed `git ls-files` and come back as `verify.duplicate` - a
+    hard-denied option quietly becoming a no-op. The grammar therefore runs
+    BEFORE the key is computed: the request is REFUSED, and the legitimate
+    repeat right after it is still deduped."""
+    make_snapshot(tmp_path)
+    policy = make_policy(tmp_path)
+    popen = ScriptedPopen()
+    env = make_env(tmp_path, tmp_path / "snap", popen, policy)
+    w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
+    items = execute_evidence_requests(
+        [
+            EvidenceRequest(argv=["git", "ls-files"]),
+            EvidenceRequest(argv=["git", "--no-optional-locks", "ls-files"]),
+            EvidenceRequest(argv=["git", "ls-files", "--no-optional-locks"]),
+            EvidenceRequest(argv=["git", "ls-files"]),  # the legitimate repeat
+        ],
+        source="P1",
+        env=env,
+        writer=w,
+        state=RequestState(),
+        task_id="t_01",
+        stop_check=lambda: False,
+    )
+    w.close()
+    ev = events(w)
+    kinds = [e["kind"] for e in ev]
+    assert len(items) == 1 and len(popen.calls) == 1  # only the first request ran
+    refused = [e["payload"] for e in ev if e["kind"] == "verify.refused"]
+    assert len(refused) == 2, refused
+    assert [r["argv"][1:] for r in refused] == [
+        ["--no-optional-locks", "ls-files"],
+        ["ls-files", "--no-optional-locks"],
+    ]
+    assert "hard-denied" in refused[1]["reason"]
+    # and the honest repeat is still a duplicate, not a re-spawn
+    assert kinds.count("verify.duplicate") == 1
 
 
 def test_pytest_commands_carry_no_cacheprovider(tmp_path: Path) -> None:

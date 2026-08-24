@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
+from pydantic import ValidationError
+
 from eris.arms import (
     ARM_ORDER,
     CellSpec,
@@ -66,6 +68,7 @@ from eris.launch import (
     invocation_id_for,
     make_private_dir,
     plan_call,
+    resolve_user,
     run_worker,
 )
 from eris.ledger import LedgerCorrupt, LedgerView, cost_totals
@@ -217,6 +220,7 @@ def _build_call(
         scratch_dir=scratch_dir,
         home=str(home),
         tmpdir=str(scratch_dir / "tmp") if scratch_dir else "/tmp",
+        user=resolve_user(),
         path_env=loaded.policy.path_env,
         secrets={k: v for k, v in secrets.items() if k in worker.env_allow},
         snapshot_sha=read_head_sha(snapshot),  # filesystem-observed, never user-supplied
@@ -443,6 +447,9 @@ class Harness:
     redactor: Redactor
     secrets: dict[str, str]
     home: Path
+    # The account name CLI workers run as; resolved once per command from the
+    # OS, never from a filtered os.environ (eris.launch.resolve_user).
+    user: str | None
     prompts_dir: Path
     runs_dir: Path
     popen: PopenFactory
@@ -627,6 +634,7 @@ def load_harness(
         redactor=Redactor(list(env_values.values()) + creds.values),
         secrets=env_values,
         home=home,
+        user=resolve_user(),
         prompts_dir=Path(getattr(args, "prompts_dir", None) or DEFAULT_PROMPTS),
         runs_dir=runs_dir,
         popen=popen,
@@ -941,6 +949,7 @@ def run_cell(
                 cwd_for=cwd_for,
                 scratch_dir=scratch,
                 home=str(h.home),
+                user=h.user,
                 path_env=policy.path_env,
                 secrets=h.secrets,
                 runner=runner,
@@ -1348,8 +1357,20 @@ def campaign_cells(
     return cells
 
 
+def task_is_scored(task_file: Path) -> bool:
+    """``task.json``'s ``scored`` flag (default True). An unparsable task file
+    is left to the caller to fail on - never silently skipped."""
+    try:
+        return bool(TaskSpec.model_validate_json(Path(task_file).read_bytes()).scored)
+    except (OSError, ValidationError):
+        return True
+
+
 def discover_tasks(corpus: Path) -> list[Path]:
-    return sorted(p for p in Path(corpus).glob("*/task.json") if p.is_file())
+    """Every scored ``task.json`` under the corpus. A task with
+    ``"scored": false`` is a PLUMBING task: it is skipped here so a campaign
+    never sweeps it up, while an explicit ``--task-file`` still runs it."""
+    return sorted(p for p in Path(corpus).glob("*/task.json") if p.is_file() and task_is_scored(p))
 
 
 def _cell_state(cell_dir: Path) -> str:

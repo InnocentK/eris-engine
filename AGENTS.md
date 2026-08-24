@@ -110,11 +110,15 @@ never push without being asked) → stop and report.
   `tests/conftest.py` blocks `shutil.which` for worker binaries, all subprocess
   entry points, and sockets. Tests that must spawn a real process use the
   `real_subprocess` marker and only `sys.executable`/`sleep` (plus `git`, via
-  `allow=["git"]`, for the single snapshot integration test).
+  `allow=["git"]`, for exactly two integration tests: the snapshot builder and
+  the M2c verification battery).
 - **One writer to disk under `runs/`** — `eris.writer.RunWriter`. Redaction
   happens BEFORE hashing. Writer failures raise; they are never swallowed.
 - **Subprocess env is built from `{}`**, never filtered from `os.environ`.
-  `--bare` is forbidden for claude (breaks OAuth here). Codex gets
+  `USER` is part of it and is load-bearing: without it claude reports a valid
+  login as "Not logged in" (M2c, 2026-08-23); it is resolved from the OS, not
+  read out of the environment. `--bare` is forbidden for claude (breaks OAuth
+  here). Codex gets
   `-c project_doc_max_bytes=0` (repo `AGENTS.md` is otherwise injected even with
   `--ignore-rules` — verified 2026-08-21). `agy` gets `--mode plan --sandbox
   --add-dir <snapshot> --output-format json --disable-slash-commands

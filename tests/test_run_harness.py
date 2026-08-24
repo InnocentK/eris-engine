@@ -25,10 +25,12 @@ from eval.run import (
     EXIT_RUN_ERROR,
     EXIT_SIGINT,
     EXIT_STOP,
+    discover_tasks,
     main,
     sweep_scratch,
 )
 
+from eris.launch import resolve_user
 from eris.ledger import LedgerView
 from eris.schemas import Stage
 from tests.conftest import FakeProcess
@@ -109,7 +111,7 @@ class Popen:
         if name == "pytest":
             return FakeProcess(argv, stdout=b"1 passed\n", returncode=0, popen_kwargs=kw)
         if name == "git":
-            sub = argv[1] if len(argv) > 1 else ""
+            sub = next((a for a in argv[1:] if not a.startswith("-")), "")
             out = {"rev-parse": b"f" * 40 + b"\n"}.get(sub, f"{sub} output\n".encode())
             return FakeProcess(argv, stdout=out, returncode=0, popen_kwargs=kw)
         if name == self.interrupt_on:
@@ -328,6 +330,10 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
     assert grok_calls and all(
         kw["cwd"] != str(w["snapshot"]) and "sanitized-grok" in kw["cwd"] for kw in grok_calls
     )
+    # M2c defect A: every CLI worker spawned by the harness carries USER (the
+    # harness's own resolved account). Without it claude reports a valid login
+    # as "Not logged in"; the harness path must thread it, not just `invoke`.
+    assert all(kw["env"].get("USER") == resolve_user() for kw in grok_calls)
     verify_copy = str(
         (tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify" / "verify-copy").resolve()
     )
@@ -979,6 +985,7 @@ def test_judge_workspace_is_fresh_per_iteration_and_checked_at_spawn(tmp_path: P
         stage=Stage.ADJUDICATE,
         repeat_index=0,
         policy_sha256="0" * 64,
+        user="testuser",
     )
     with pytest.raises(LaunchRefused, match="not empty"):
         assert_judge_workspace_empty(call)
@@ -1376,3 +1383,70 @@ def test_a_finalized_but_unfsynced_manifest_gets_its_own_exit_code(
     assert manifest_path.is_file()  # the run IS finalized
     assert json.loads(manifest_path.read_bytes())["extra"]["status"] == "complete"
     assert events_of(w["runs"] / "unsynced").kinds()[-1] == "scan.result"
+
+
+def test_campaign_discovery_skips_an_unscored_plumbing_task(tmp_path: Path) -> None:
+    """M2c: `"scored": false` in task.json is ENFORCED, not just documented -
+    a campaign never sweeps a plumbing task up. An explicit --task-file still
+    runs it, which is the whole point of having one."""
+    w = world(tmp_path)
+    plumbing = w["corpus"] / "t_plumb"
+    (plumbing / "snapshot" / ".git").mkdir(parents=True)
+    (plumbing / "snapshot" / ".git" / "HEAD").write_text("f" * 40 + "\n")
+    (plumbing / "snapshot" / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    spec = json.loads((w["corpus"] / "t_01" / "task.json").read_text())
+    spec.update({"task_id": "t_plumb", "scored": False, "diff_rev": None, "excerpts": []})
+    (plumbing / "task.json").write_text(json.dumps(spec))
+    (plumbing / "key.json").write_text((w["corpus"] / "t_01" / "key.json").read_text())
+
+    assert [p.parent.name for p in discover_tasks(w["corpus"])] == ["t_01"]
+
+    out = io.StringIO()
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c1",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+            "--dry-run",
+        ],
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+    )
+    assert rc == EXIT_OK
+    cells = json.loads(out.getvalue())["cells"]
+    assert cells and all(c["task_id"] == "t_01" for c in cells)
+    # ... but naming it explicitly still runs it
+    assert [p.name for p in [plumbing / "task.json"]] == ["task.json"]
+    out2 = io.StringIO()
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c2",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+            "--task-file",
+            str(plumbing / "task.json"),
+            "--dry-run",
+        ],
+        out=out2,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+    )
+    assert rc == EXIT_OK
+    assert {c["task_id"] for c in json.loads(out2.getvalue())["cells"]} == {"t_plumb"}

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from eris.launch import build_env
+from eris.launch import build_env, resolve_user
 from eris.policy import LoadedPolicy, PolicyError, load_policy, sha256_file
 from eris.redact import CredentialFileError, Redactor, load_credential_values, parse_dotenv
 from eris.schemas import Transport
@@ -147,17 +147,30 @@ def run_doctor(
     runner: Runner = default_probe_runner,
     home: Path | None = None,
     which: Callable[[str], str | None] | None = None,
+    user_resolver: Callable[[], str | None] | None = None,
 ) -> DoctorReport:
     home = home or Path.home()
     # Resolved at call time on purpose: a default argument would bind the
     # original function and bypass the test suite's shutil.which guard.
     which = which or shutil.which
+    user_resolver = user_resolver or resolve_user
     report = DoctorReport()
     v = sys.version_info
     report.add(
         "OK" if v >= (3, 12) else "FAIL",
         "python",
         f"{v.major}.{v.minor}.{v.micro} (>= 3.12 required)",
+    )
+    # The account NAME is never printed: the doctor reports names, not values,
+    # and a username is a value (it also leaks into pasted terminal output).
+    user = user_resolver()
+    report.add(
+        "OK" if user else "WARN",
+        "user",
+        "USER: resolved (passed to every CLI worker)"
+        if user
+        else 'USER: could not be resolved (claude will report "Not logged in" even when '
+        "the credentials are valid); see docs/SECURITY.md",
     )
     try:
         loaded: LoadedPolicy = load_policy(policy_path)
@@ -249,7 +262,12 @@ def run_doctor(
                 report.add("WARN", f"worker.{wid}.probe", "skipped: binary is not pinned/verified")
                 continue
             env = build_env(
-                w.cli, path_env=pol.path_env, home=str(home), tmpdir="/tmp", policy_env=w.env
+                w.cli,
+                path_env=pol.path_env,
+                home=str(home),
+                tmpdir="/tmp",
+                user=user,
+                policy_env=w.env,
             )
             version = runner([exe, "--version"], env)
             if version is None:

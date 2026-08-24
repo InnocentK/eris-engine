@@ -54,6 +54,11 @@ tasks:
       - task: coverage
       - task: audit
 
+  corpus:plumbing-snapshot:
+    desc: (Re)build the plumbing-control snapshot repo from its tracked files
+    cmds:
+      - '{{.PY}} eval/make_control_snapshot.py eval/corpus/plumbing-control --message "plumbing control: calc.py"'
+
   hooks:install:
     desc: Install the pre-commit hooks into .git
     cmds:

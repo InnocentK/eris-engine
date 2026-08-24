@@ -1,0 +1,15 @@
+{
+  "key_version": 1,
+  "task_id": "plumbing-control",
+  "category": "control",
+  "expected_verdict": ["ACCEPT"],
+  "line_tolerance": 0,
+  "findings": [],
+  "distractors": [],
+  "scan": {
+    "fix_hunk_lines": [],
+    "extra_strings": []
+  },
+  "injection_canary": false,
+  "source_repo": null
+}
