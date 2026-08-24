@@ -33,6 +33,16 @@ mechanism (a new one is one line in ``INDEX_MUTATIONS``) - it is what caught
 ``test_the_index_digest_does_not_cover_the_index_extensions`` /
 ``test_the_split_index_is_caught_by_the_tree_hash_not_by_the_digest`` pin, by
 measurement, what the digest does NOT cover.
+
+Follow-up 3 is the fsmonitor chain, and it needed a real ``git`` twice over.
+The digest is ``ls-files -s -v -f``: the per-entry FSMONITOR-VALID bit makes
+git treat a file as unchanged and ``-v`` does not print it. The bit only
+persists with an ACTIVE monitor returning a real token, so the two enumeration
+cases install a ``core.fsmonitor`` hook that emits one - and the same
+measurement is why the verification copy unsets ``core.fsmonitor`` /
+``core.untrackedCache``: left on, the monitor marks entries valid by itself and
+the digest moves with no verification command responsible
+(``test_an_inherited_fsmonitor_left_on_would_false_trip_the_guard``).
 """
 
 from __future__ import annotations
@@ -294,21 +304,39 @@ def test_a_real_staging_change_trips_the_guard_with_reason_git_index(
 # working tree at all.
 EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 
+# A `core.fsmonitor` hook speaking the v2 protocol: a NUL-terminated update
+# TOKEN and no changed paths. The token is what makes the fsmonitor-valid bit
+# persist - with no fsmonitor configured `update-index --fsmonitor-valid` exits
+# 0 and stores nothing, and with a hook that prints nothing git warns "Empty
+# last update token" and clears every bit (measured 2026-08-24, git 2.50.1).
+FSMONITOR_HOOK = '#!/bin/sh\nprintf "eris-fsmonitor-token\\0"\nexit 0\n'
+#: Turn the hook on, then prime it. TWO refreshes are needed on a fresh copy
+#: and that is measured, not assumed: the first writes the FSMN section and its
+#: token but marks nothing (the copied working tree does not match the stat
+#: data in `.git/index`, so every entry is "changed"); the second, with the
+#: token now in hand and the hook reporting no changes, marks every entry
+#: fsmonitor-valid - `ls-files -v -f` turns from `H` to `h`.
+FSMONITOR_ON: tuple[tuple[str, ...], ...] = (
+    ("config", "core.fsmonitor", ".git/hooks/fsm"),
+    ("status", "--porcelain"),
+    ("status", "--porcelain"),
+)
+
 #: Every index-mutating mechanism reachable through `git update-index` and
-#: friends: ``(files written before the baseline, setup argv, mutating argv)``.
+#: friends: ``(files written before the baseline, setup argvs, mutating argv)``.
 #: A new mechanism is ONE line here.
 INDEX_MUTATIONS: list[Any] = [
     pytest.param({}, (), ("update-index", "--skip-worktree", "calc.py"), id="skip-worktree"),
     pytest.param(
         {},
-        ("update-index", "--skip-worktree", "calc.py"),
+        (("update-index", "--skip-worktree", "calc.py"),),
         ("update-index", "--no-skip-worktree", "calc.py"),
         id="no-skip-worktree",
     ),
     pytest.param({}, (), ("update-index", "--assume-unchanged", "calc.py"), id="assume-unchanged"),
     pytest.param(
         {},
-        ("update-index", "--assume-unchanged", "calc.py"),
+        (("update-index", "--assume-unchanged", "calc.py"),),
         ("update-index", "--no-assume-unchanged", "calc.py"),
         id="no-assume-unchanged",
     ),
@@ -327,12 +355,27 @@ INDEX_MUTATIONS: list[Any] = [
         id="add-a-modified-file",
     ),
     pytest.param({}, (), ("rm", "--cached", "-q", "README.md"), id="rm-cached"),
+    pytest.param(
+        {".git/hooks/fsm": FSMONITOR_HOOK},
+        (*FSMONITOR_ON, ("update-index", "--no-fsmonitor-valid", "calc.py")),
+        ("update-index", "--fsmonitor-valid", "calc.py"),
+        id="fsmonitor-valid",
+    ),
+    pytest.param(
+        {".git/hooks/fsm": FSMONITOR_HOOK},
+        FSMONITOR_ON,
+        ("update-index", "--no-fsmonitor-valid", "calc.py"),
+        id="no-fsmonitor-valid",
+    ),
 ]
 
 
 @pytest.mark.parametrize(("files", "setup", "mutation"), INDEX_MUTATIONS)
 def test_every_index_mutation_trips_the_guard(
-    tmp_path: Path, files: dict[str, str], setup: tuple[str, ...], mutation: tuple[str, ...]
+    tmp_path: Path,
+    files: dict[str, str],
+    setup: tuple[tuple[str, ...], ...],
+    mutation: tuple[str, ...],
 ) -> None:
     """M2c follow-up 2, the ENUMERATION that stops the whack-a-mole: every
     index-mutating mechanism reachable through `git update-index` and friends
@@ -346,7 +389,21 @@ def test_every_index_mutation_trips_the_guard(
     2.50.1). `-v` prints the per-entry status letter (`H` cached, `S`
     skip-worktree, lowercase = assume-unchanged) in the SAME invocation - no
     extra spawn - so the flag bits are in the digest. Reverting to `--stage`
-    makes the four flag cases here FAIL."""
+    makes the four flag cases here FAIL.
+
+    Follow-up 3 adds `-f` and the two `--fsmonitor-valid` cases for the same
+    reason one level down: the per-entry FSMONITOR-VALID bit makes git treat a
+    file as unchanged, and `-v` does NOT show it - only `-f` does (lowercase
+    letters for fsmonitor-valid entries). It is a REAL trip, not a hypothetical
+    one: with the `core.fsmonitor` hook these cases install, setting and
+    clearing the bit moves the `-s -v -f` digest and leaves the `-s -v` digest
+    byte-identical (measured 2026-08-24, git 2.50.1). Dropping `-f` makes both
+    fsmonitor cases FAIL.
+
+    The verification copy unsets `core.fsmonitor` (`eris.sanitize`), so these
+    two cases have to turn it back ON in the copy - which is the point: the
+    digest is defence in depth for the day that neutralisation is bypassed,
+    widened or wrong."""
     git = _git_executable()
     source = tmp_path / "snapshot"
     _make_repo(source, git)
@@ -355,9 +412,12 @@ def test_every_index_mutation_trips_the_guard(
     # anything the mutation needs must exist BEFORE the baseline, so the guard
     # reacts to the INDEX mutation and not to the file that set it up
     for name, content in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
         (repo / name).write_text(content)
-    if setup:
-        _git(repo, git, *setup)
+        if content.startswith("#!"):
+            (repo / name).chmod(0o755)  # a hook git can actually run
+    for argv in setup:
+        _git(repo, git, *argv)
 
     policy = _policy(tmp_path, git)
     env = _verify_env(policy, repo, tmp_path / "verify-home")
@@ -374,6 +434,114 @@ def test_every_index_mutation_trips_the_guard(
     assert env.violated is True  # verification is stopped for the run
     with pytest.raises(PermissionError, match="verification is stopped"):
         env.run(["git", "ls-files"])
+
+
+# ------------------------------------------- an INHERITED fsmonitor (follow-up 3)
+
+# A hook OUTSIDE `.git/hooks`: `core.fsmonitor` may name any path, so dropping
+# `.git/hooks` from the copy does not disable an inherited monitor. Unsetting
+# the config is a separate control, and this is why it is needed.
+TRACKED_HOOK = "tools/fsm"
+
+
+def _make_fsmonitor_repo(root: Path, git: Path) -> None:
+    """A snapshot taken from a repository that already uses a filesystem
+    monitor - the case a corpus task can really arrive in."""
+    _make_repo(root, git)
+    (root / "tools").mkdir()
+    (root / TRACKED_HOOK).write_text(FSMONITOR_HOOK)
+    (root / TRACKED_HOOK).chmod(0o755)
+    _git(root, git, "add", "-A")
+    _git(root, git, "commit", "-qm", "c2")
+    _git(root, git, "config", "core.fsmonitor", TRACKED_HOOK)
+
+
+def _letters(repo: Path, git: Path) -> str:
+    """The `ls-files -v -f` status letters, lowercase = fsmonitor valid."""
+    out = _git(repo, git, "--no-optional-locks", "ls-files", "-v", "-f").stdout
+    return "".join(line.split()[0] for line in out.decode().splitlines())
+
+
+def test_an_inherited_fsmonitor_is_off_in_the_verification_copy_never_in_the_original(
+    tmp_path: Path,
+) -> None:
+    """M2c follow-up 3, item 2: a snapshot whose `.git/config` sets
+    `core.fsmonitor` arrives with it enabled. The verification COPY unsets it -
+    while the copy is being built, so it is already off before the guard takes
+    its baseline and before any verification command runs - and the ORIGINAL is
+    never modified.
+
+    Dropping `.git/hooks` is not enough on its own: `core.fsmonitor` may name
+    any path in the repository (here a tracked `tools/fsm`), so the monitor
+    survives the hook removal. `core.untrackedCache` is neutralised beside it,
+    same class of inherited cache."""
+    from eris.sanitize import tree_sha256
+
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_fsmonitor_repo(source, git)
+    source_before = tree_sha256(source)
+    assert _git(source, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"tools/fsm"
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    # the copy: git itself resolves the value, so this is not a text assertion
+    assert _git(repo, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"false"
+    assert _git(repo, git, "config", "--get", "core.untrackedCache").stdout.strip() == b"false"
+    assert (repo / TRACKED_HOOK).is_file()  # the hook file is still there, unused
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    baseline = env.guard.index_digest
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "status", "--porcelain"]]:
+        assert env.run(argv).violated is False, argv
+    _git(repo, git, "status", "--porcelain")  # what repository code (a trusted
+    _git(repo, git, "status", "--porcelain")  # pytest) would spawn: no flag
+    assert _letters(repo, git) == "HHH"  # nothing was ever marked fsmonitor valid
+    assert env.guard.changed() is None and env.guard.index_digest == baseline
+    assert b"FSMN" not in (repo / ".git" / "index").read_bytes()
+
+    # THE ORIGINAL IS NEVER MODIFIED: it still has its monitor, byte for byte
+    assert _git(source, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"tools/fsm"
+    assert tree_sha256(source) == source_before
+
+
+def test_an_inherited_fsmonitor_left_on_would_false_trip_the_guard(tmp_path: Path) -> None:
+    """M2c follow-up 3, item 2, the counterfactual that justifies it: with the
+    inherited `core.fsmonitor` put BACK (what a raw `cp -a` would have left),
+    a command that changes nothing makes the index digest move.
+
+    Measured 2026-08-24, git 2.50.1: the first refresh installs the FSMN token,
+    the second marks every unchanged entry fsmonitor-valid, and `ls-files -s -v
+    -f` therefore moves with no staged content changed and no file outside
+    `.git/index` touched. That is a violation no verification command caused -
+    it would halt verification for the run. Unsetting the config in the copy is
+    what stops it; the `-s -v` digest never saw it either way."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_fsmonitor_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    _git(repo, git, "config", "core.fsmonitor", TRACKED_HOOK)  # undo the neutralisation
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    files_before = _files(repo)
+    stage_before = _git(repo, git, "--no-optional-locks", "ls-files", "-s", "-v").stdout
+
+    assert _letters(repo, git) == "HHH"
+    _git(repo, git, "status", "--porcelain")
+    _git(repo, git, "status", "--porcelain")
+    assert _letters(repo, git) == "hhh"  # marked valid by the monitor, not by us
+
+    change = env.guard.changed()
+    assert change is not None and change.reason == "git_index"  # a FALSE violation
+    assert _files(repo) == files_before  # nothing outside `.git/index` moved
+    # ... and the pre-`-f` digest is flat, which is the whole point of `-f`
+    assert _git(repo, git, "--no-optional-locks", "ls-files", "-s", "-v").stdout == stage_before
 
 
 # --------------------------------------------------------- what it does NOT cover

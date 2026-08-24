@@ -281,7 +281,9 @@ name at any depth, case-insensitively, whatever the entry is (a file, a
 directory, or a symlink named `AGENTS.md`). Files get new inodes (never
 hardlinks); symlinks are kept only when relative, resolving inside the tree
 and not into a stripped entry (every other link is dropped and recorded);
-`.git` is copied without `hooks`. `SnapshotSanitization` records the
+`.git` is copied without `hooks` and with `core.fsmonitor`/`core.untrackedCache`
+neutralised in the COPY's `.git/config` (see the verification-copy section).
+`SnapshotSanitization` records the
 profile hash, the original's tree hash, the copy's tree hash, every stripped
 file (relpath, size, sha256) and every dropped link.
 
@@ -356,18 +358,39 @@ verification command therefore runs in a fresh copy of the original
 (`sanitize.VERIFICATION_PROFILE`) under the run's scratch root - never in
 the original and never in a sanitized copy. That profile strips NOTHING
 (verification must see the repository as it is, instruction files included)
-and differs from a raw `cp -a` in exactly two documented ways: `.git/hooks`
+and differs from a raw `cp -a` in exactly three documented ways: `.git/hooks`
 is not copied (our allowlist runs `git`, so a repository hook would fire on
-the first invocation), and a symlink that is absolute, dangling or resolves
-outside the tree is dropped and recorded. File set, bytes, FILE AND
-DIRECTORY modes (the copy root included), kept symlink targets and `.git`
-itself are identical; a preserved read-only directory cannot wedge cleanup
+the first invocation); the COPY's `.git/config` has `core.fsmonitor` and
+`core.untrackedCache` removed and explicitly set to `false`; and a symlink
+that is absolute, dangling or resolves outside the tree is dropped and
+recorded. File set, bytes, FILE AND DIRECTORY modes (the copy root
+included), kept symlink targets and the rest of `.git`
+are identical; a preserved read-only directory cannot wedge cleanup
 (owner write is restored on retry). `evidence.SnapshotGuard` compares the
 copy after every command: a change is recorded (`snapshot.violated`,
 `EvidenceItem.violated`, the item's summary) and verification stops for the
 run; the original's tree hash is recorded in `run.started` and asserted
 unchanged at the end (`run.error snapshot_modified`). pytest always carries
 `-p no:cacheprovider`.
+
+**The copy's filesystem-monitor settings are neutralised** (M2c follow-up 3,
+`sanitize.neutralise_git_config`). A snapshot taken from a repository that
+configures `core.fsmonitor` inherits it verbatim, and dropping `.git/hooks` does
+not disable it: the value may name any path in the repository. The copy's
+`.git/config` therefore has `core.fsmonitor` and `core.untrackedCache` (same
+class of inherited cache) removed and explicitly set to `false` - the removal
+handles case, bare keys and backslash-continued values, and the appended
+`[core]` block, being last, also covers a value pulled in by an `include`. **The
+ORIGINAL is never opened for writing**; the edit happens while the copy is being
+built, so it is in place before the guard takes its baseline and before any
+verification command runs. It matters in both directions, and both are
+measured (2026-08-24, git 2.50.1,
+`test_verify_real_git.py::test_an_inherited_fsmonitor_left_on_would_false_trip_the_guard`,
+`::test_an_inherited_fsmonitor_is_off_in_the_verification_copy_never_in_the_original`):
+a live monitor marks index entries fsmonitor-valid BY ITSELF on the second
+refresh of a fresh copy, which the index digest reports as a violation no
+verification command caused (verification would halt for the run); and a stale
+cache lets a command answer from data the working tree no longer supports.
 
 The guard has two halves, because one cannot do the job.
 
@@ -376,7 +399,7 @@ The guard has two halves, because one cannot do the job.
 forced: `.git/index` is git's stat cache, and on a freshly copied tree the
 recorded stat data never matches, so a read-only command rewrites it. Measured
 2026-08-24 on git 2.50.1: with `--no-optional-locks` on every invocation,
-`status --porcelain`, `ls-files`, `ls-files --stage`, `ls-files -s -v` (the
+`status --porcelain`, `ls-files`, `ls-files --stage`, `ls-files -s -v -f` (the
 probe itself, re-measured 2026-08-24), `log --oneline`,
 `grep`, `blame`, `show` and `rev-parse` leave the file byte-identical, but the
 first command that reads the working tree against the index (`diff`,
@@ -389,8 +412,8 @@ command that rewrites history or config is still caught.
 index is not inert: `git ls-files` reads it directly and `git diff`/`git
 status` compare against it, so a command that mutates it changes what LATER
 evidence reports. The guard therefore also digests
-`git --no-optional-locks ls-files -s -v` (per entry: the status letter, then
-mode, blob sha, stage and path) before and after each command. Measured on the
+`git --no-optional-locks ls-files -s -v -f` (per entry: the status letter,
+then mode, blob sha, stage and path) before and after each command. Measured on the
 same day: the digest is stable across every read-only command, across the stat
 refresh and across an UNSTAGED working-tree edit, and moves on `git add` and on
 `git rm --cached`. `git rm --cached` changes nothing else in the tree at all, so
@@ -409,14 +432,27 @@ same invocation, so no extra spawn buys the coverage.
 ENUMERATES the mechanisms rather than chasing them one at a time:
 `--skip-worktree`, `--no-skip-worktree`, `--assume-unchanged`,
 `--no-assume-unchanged`, `--cacheinfo`, `--chmod=+x`, `-N`/`--intent-to-add`,
-`git add` of a modified file and `git rm --cached` all trip the guard with
-`reason: "git_index"`, and a new mechanism is one line in that table.
+`git add` of a modified file, `git rm --cached`, `--fsmonitor-valid` and
+`--no-fsmonitor-valid` all trip the guard with `reason: "git_index"`, and a new
+mechanism is one line in that table.
+
+`-f` (M2c follow-up 3) for the same reason one level down: `-v` is blind to the
+per-entry FSMONITOR-VALID bit, which makes git treat a file as unchanged.
+git-ls-files(1): "-f  Similar to -t, but use lowercase letters for files that
+are marked as fsmonitor valid". The bit only persists with an ACTIVE monitor
+returning a real update token - measured 2026-08-24 on git 2.50.1: with no
+`core.fsmonitor`, `git update-index --fsmonitor-valid` exits 0 and stores
+nothing; with a hook that prints nothing git warns "Empty last update token" and
+clears every bit; with a hook that emits a token, the bit persists and setting
+or clearing it moves the `-s -v -f` digest while leaving the `-s -v` digest
+byte-identical. Without an active monitor `-f` prints exactly what `-v` prints,
+so the flag costs no false positive and no extra spawn.
 
 The digest runs on the POLICY-PINNED `git` with a FIXED Eris-internal argv. It
 is deliberately not routed through the model-facing allowlist: it is neither
-proposed nor influenced by a model, and `check_command` would refuse `-s`/`-v`
-(and `--stage`) anyway. The pin is still enforced by hand - an unpinned, missing
-or since-changed binary yields no digest.
+proposed nor influenced by a model, and `check_command` would refuse
+`-s`/`-v`/`-f` (and `--stage`) anyway. The pin is still enforced by hand - an
+unpinned, missing or since-changed binary yields no digest.
 
 **What the digest does NOT cover.** Measured 2026-08-24 on git 2.50.1, each
 case checked rather than assumed
@@ -425,20 +461,36 @@ case checked rather than assumed
 
 | index feature | tree hash | index digest |
 |---|---|---|
-| untracked cache (`UNTR`) | no | no |
-| fsmonitor (`FSMN`) | no | no |
+| untracked cache (`UNTR`) | no | no (disabled in the copy) |
+| fsmonitor: enabling it (`core.fsmonitor`) | YES - `.git/config` is hashed | no |
+| fsmonitor: the `FSMN` section and its token | no | no |
+| fsmonitor: the per-entry VALID BIT | no | **YES - this is what `-f` buys** |
 | cache-tree (`TREE`) | only the tree OBJECT `write-tree` writes | no |
 | resolve-undo (`REUC`) | no | no |
 | split index (`--split-index`) | YES - the new `.git/sharedindex.<sha>` file | no |
 
-The four EXTENSIONS live inside `.git/index`, which the byte hash excludes, and
+**fsmonitor is a chain, not a single row.** It is the one extension that
+changes what a later `git status`/`git diff` reports - an fsmonitor-valid entry
+is treated as unchanged - so it gets three answers rather than one. Turning it
+on means writing `core.fsmonitor` into `.git/config`, which is inside the tree
+hash and not in `GUARD_EXCLUDED_RELPATHS`: that step alone is `reason: "tree"`.
+The per-entry valid bit is covered by the index digest, since `-f` prints it.
+The `FSMN` section itself - its presence and its update token - is not visible
+in any `ls-files` output at any verbosity and lives in the excluded bytes, so
+nothing catches it; on its own it changes no report. And the copy starts with
+`core.fsmonitor` unset (above), so an inherited monitor is off before the first
+command.
+
+The other EXTENSIONS live inside `.git/index`, which the byte hash excludes, and
 `ls-files` prints no trace of them at any verbosity - so **nothing in Eris
 catches them**. That is a stated gap, not an implied completeness: they are
 caches and undo data, and none of them changes what a later `git status`, `git
 diff` or `git ls-files` reports, which is the property the tripwire exists to
 protect. If that ever stops being true for one of them, it needs a check of its
 own. (The cache-tree case looks caught and is not: the guard trips there only
-because `write-tree` also writes a new object under `.git/objects`.)
+because `write-tree` also writes a new object under `.git/objects`. The
+untracked cache is uncaught but neutralised: the copy sets
+`core.untrackedCache = false`.)
 
 The split index is different, and the answer is measured, not assumed:
 `git update-index --split-index` writes a NEW file, `.git/sharedindex.<sha>`,
