@@ -558,8 +558,8 @@ def _read_value(reader: _ConfigReader) -> bytes:
         space = 0
         if c == 0x5C:  # backslash
             c = reader.next()
-            if c == 0x0A:
-                continue  # a value continued on the next line
+            if c in (0x0A, _EOF):
+                continue  # a value continued on the next line (git reads EOF as one)
             escaped = {0x74: 0x09, 0x62: 0x08, 0x6E: 0x0A, 0x5C: 0x5C, 0x22: 0x22}.get(c)
             if escaped is None:
                 raise GitConfigParseError("bad escape in a value")

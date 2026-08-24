@@ -45,7 +45,11 @@ Fixed
   is a header AND a variable on one line, and `[core][diff] external = x` puts
   the variable in `diff` - which a line filter looking for `[core]` would have
   kept. A config Eris cannot parse REFUSES the copy; git refuses to open such a
-  repository too.
+  repository too. One divergence found by re-measuring rather than by reading:
+  git's `get_next_char` reports EOF AS a newline, so a config whose last value
+  ends in a trailing backslash with no final newline ENDS the value
+  (`core.filemode=tru`) instead of being a bad escape - refusing it would have
+  been a false refusal, and the parser and a test row now match git.
 * **The repository-level escapes are removed or refused.** The copy deletes
   `.git/objects/info/alternates`, `.git/objects/info/http-alternates` and
   `.git/config.worktree` (`drop_git_repo_escapes`), and REFUSES a copy that is

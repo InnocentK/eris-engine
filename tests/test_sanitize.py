@@ -488,6 +488,9 @@ def test_the_copy_config_keeps_only_the_allowlisted_keys(tmp_path: Path) -> None
         (b"[CORE]\n\tFileMode = TRUE\n", [("core.filemode", b"TRUE")]),
         (b"[core]\n\tbare\n", [("core.bare", None)]),  # a bare key is boolean true
         (b"[core]\n\tfilemode = tr\\\nue\n", [("core.filemode", b"true")]),  # continued
+        # git reads EOF as a newline, so a trailing backslash ENDS the value
+        # rather than being a bad escape (`config.c`, `get_next_char`)
+        (b"[core]\n\tfilemode = tru\\", [("core.filemode", b"tru")]),
         (b'[core]\n\tfilemode = "a\\tb\\nc\\\\d\\"e"\n', [("core.filemode", b'a\tb\nc\\d"e')]),
         (b"[core]\r\n\tfilemode = true\r\n", [("core.filemode", b"true")]),  # CRLF
         (b"\xef\xbb\xbf[core]\n\tfilemode = true\n", [("core.filemode", b"true")]),  # BOM
