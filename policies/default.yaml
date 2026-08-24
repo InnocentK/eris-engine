@@ -112,7 +112,7 @@ verify:
   max_wall_s: 1800                # wall-clock budget for all evidence requests of a run
   commands:
     # `eris policy pin` must pin git: the pin gates BOTH model-proposed git
-    # commands and the tripwire's internal `ls-files --stage` index digest,
+    # commands and the tripwire's internal `ls-files -s -v` index digest,
     # which falls back to hashing `.git/index` bytes without a pinned git.
     git:
       executable: /usr/bin/git

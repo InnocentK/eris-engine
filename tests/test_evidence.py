@@ -598,7 +598,7 @@ def test_the_guard_still_trips_on_everything_but_the_git_index(
 
 
 class FakeIndexProbe:
-    """Stands in for `git ls-files --stage`. The hermetic suite may not spawn
+    """Stands in for `git ls-files -s -v`. The hermetic suite may not spawn
     git, so the STAGED CONTENT is whatever this holder says it is; rewriting
     ``digest`` is a staging change, leaving it alone is a stat refresh."""
 
@@ -708,28 +708,36 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
 ) -> None:
     """M2c item 4: fixed Eris-internal argv on the POLICY-PINNED git with the
     Eris git globals - and deliberately NOT through `check_command`, which
-    refuses `--stage` (it is not an allowlisted flag)."""
+    refuses `-s`/`-v` (neither is an allowlisted flag).
+
+    The follow-up pins the FLAGS themselves: `-s -v`, not `--stage`. `--stage`
+    alone is blind to the index flag bits (`--skip-worktree`,
+    `--assume-unchanged`) - see
+    `test_verify_real_git.py::test_every_index_mutation_trips_the_guard`."""
     from eris.evidence import GIT_ERIS_GLOBALS, GIT_INDEX_DIGEST_ARGS, git_index_prober
     from eris.verify import check_command
 
     root = make_snapshot(tmp_path)
     policy = make_policy(tmp_path)
-    popen = ScriptedPopen({"ls-files": b"100644 abc 0\tcalc.py\n"})
+    popen = ScriptedPopen({"ls-files": b"H 100644 abc 0\tcalc.py\n"})
     digest = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
         root
     )
-    assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "--stage")
+    assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v")
     argv, kw = popen.calls[0]
     assert argv == [
         str(Path(policy.verify.commands["git"].executable).resolve()),
         "--no-optional-locks",
         "ls-files",
-        "--stage",
+        "-s",
+        "-v",
     ]
     assert kw["cwd"] == str(root.resolve())
-    assert digest == hashlib.sha256(b"100644 abc 0\tcalc.py\n").hexdigest()
+    assert digest == hashlib.sha256(b"H 100644 abc 0\tcalc.py\n").hexdigest()
     # the same argv as a MODEL request would be refused - hence "not the allowlist"
-    assert not check_command(["git", "ls-files", "--stage"], policy, root).allowed
+    assert not check_command(["git", "ls-files", "-s", "-v"], policy, root).allowed
+    for flag in ("-s", "-v", "--stage"):
+        assert not check_command(["git", "ls-files", flag], policy, root).allowed, flag
 
 
 @pytest.mark.parametrize("why", ["unpinned", "swapped-since-the-pin", "missing"])
@@ -756,7 +764,7 @@ def test_the_index_prober_refuses_an_unpinned_or_changed_git(tmp_path: Path, why
 def test_the_index_prober_yields_nothing_when_the_digest_command_fails(
     tmp_path: Path, failure: str
 ) -> None:
-    """A non-zero `ls-files --stage` (not a repository, broken index), output
+    """A non-zero `ls-files -s -v` (not a repository, broken index), output
     the cap truncated, or a spawn that raises, is a failure to CHECK - never a
     digest that would compare equal on the next call."""
     from eris.evidence import git_index_prober

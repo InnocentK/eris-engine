@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.3.6 - the index digest now sees the index FLAG BITS (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
+cross-family stop-time review of `bc33722` found the gap 0.3.5 left: `git
+ls-files --stage` prints mode, blob sha, stage and path - and NOT the index flag
+bits. `--skip-worktree` and `--assume-unchanged` change what `git status` and
+`git diff` report about a file without changing any staged content, so setting
+or clearing either left the digest byte-identical and the tripwire silent.
+
+Measured (this machine, git 2.50.1, 2026-08-24; the suite re-measures it):
+
+| index state | `ls-files --stage` | `ls-files -s -v` |
+|---|---|---|
+| baseline / both flags cleared | unchanged | unchanged |
+| `--skip-worktree` set | **unchanged (SILENT)** | moves |
+| `--assume-unchanged` set | **unchanged (SILENT)** | moves |
+| stat refresh (`touch` + `diff HEAD`) | unchanged | unchanged (no false positive) |
+| unstaged working-tree edit | unchanged | unchanged (the letter stays `H`) |
+
+Fixed
+* **`GIT_INDEX_DIGEST_ARGS` is now `ls-files -s -v`.** `-v` prepends the
+  per-entry status letter (`H` cached, `S` skip-worktree, lowercase =
+  assume-unchanged) in the SAME invocation: no extra spawn, no schema change,
+  strictly more coverage. The probe itself still leaves `.git/index`
+  byte-identical (re-measured). `check_command` refuses `-s`/`-v` exactly as it
+  refused `--stage`, so the digest stays off the model-facing allowlist.
+* **The mechanisms are ENUMERATED, not chased one at a time.** This was the
+  third finding against the same control, so
+  `test_verify_real_git.py::test_every_index_mutation_trips_the_guard` walks
+  `--skip-worktree`, `--no-skip-worktree`, `--assume-unchanged`,
+  `--no-assume-unchanged`, `--cacheinfo`, `--chmod=+x`, `-N`, `git add` of a
+  modified file and `git rm --cached`, and asserts `reason: "git_index"` for
+  each. A new mechanism is one line in `INDEX_MUTATIONS`. Reverted to
+  `--stage`, the four flag cases fail.
+
+Documented, having CHECKED each rather than assuming (`docs/SECURITY.md`, "What
+the digest does NOT cover"; two named tests):
+* The index EXTENSIONS - untracked cache (`UNTR`), fsmonitor (`FSMN`),
+  cache-tree (`TREE`), resolve-undo (`REUC`) - live inside `.git/index`, which
+  the byte hash excludes, and `ls-files` prints no trace of them at any
+  verbosity. **Neither half of the guard catches any of the four.** Stated
+  plainly rather than implied away: they are caches and undo data and none of
+  them changes what a later `status`/`diff`/`ls-files` reports, which is the
+  property the tripwire protects. The cache-tree case looks caught and is not -
+  the guard trips there only on the object `write-tree` writes.
+* The SPLIT index IS caught, and by the tree hash: `git update-index
+  --split-index` writes a new `.git/sharedindex.<sha>`, which is not in
+  `GUARD_EXCLUDED_RELPATHS`, so enabling it is `reason: "tree"`. The digest is
+  blind to the split itself but keeps working over it - a `--skip-worktree`
+  applied afterwards still moves it. `--no-split-index` leaves the shared file
+  behind, so the tree stays changed.
+
 ## 0.3.5 - the verification tripwire now sees git index mutations (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; `snapshot.violated` is an

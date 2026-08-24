@@ -257,11 +257,18 @@ def _record(
 # the transient file it writes it through.
 #
 # The exclusion is NOT a blind spot any more: the index is covered SEMANTICALLY
-# by :func:`git_index_prober` (a digest of `git ls-files --stage`), which is
+# by :func:`git_index_prober` (a digest of `git ls-files -s -v`), which is
 # blind to the stat refresh and sensitive to real staging changes - `git add`
 # and `git rm --cached` both move it (measured 2026-08-24). `git rm --cached`
 # changes NOTHING else in the tree, so without the semantic digest it would be
 # invisible.
+#
+# What the digest does NOT see is documented in `docs/SECURITY.md`: the index
+# EXTENSIONS (untracked cache, fsmonitor, cache-tree, resolve-undo) live inside
+# `.git/index`, which the byte hash excludes, and `ls-files` prints no trace of
+# them - measured 2026-08-24, neither half of the guard moves for any of the
+# four. Enabling the SPLIT index is caught, by the tree hash: it writes a new
+# `.git/sharedindex.<sha>` file, which is not in the excluded set.
 #
 # Everything else under `.git` - refs, objects, HEAD, config, hooks - STAYS in
 # the byte hash, so a command that rewrites history or config is still caught.
@@ -271,10 +278,20 @@ GUARD_EXCLUDED_RELPATHS: frozenset[str] = frozenset({".git/index", ".git/index.l
 # Eris-internal, FIXED argv. It is deliberately NOT routed through
 # `check_command`/`run_allowlisted`: the model-facing allowlist governs
 # model-proposed requests, and this command is neither proposed nor influenced
-# by a model. (`--stage` is not an allowlisted flag in the repo policy, so
-# routing it there would refuse it.) The pin on the git executable is still
+# by a model. (Neither `-s` nor `-v` is an allowlisted flag in the repo policy,
+# so routing it there would refuse it.) The pin on the git executable is still
 # enforced here, by hand.
-GIT_INDEX_DIGEST_ARGS: tuple[str, ...] = (*GIT_ERIS_GLOBALS, "ls-files", "--stage")
+#
+# `-s` (= `--stage`) prints mode, blob sha, stage and path; `-v` prepends the
+# per-entry STATUS LETTER in the SAME invocation - `H` cached, `S`
+# skip-worktree, lowercase = assume-unchanged. Those flag bits change what
+# `git status`/`git diff` report about a file without changing any staged
+# content, so `--stage` alone left them silent (measured 2026-08-24, git
+# 2.50.1: setting or clearing `--skip-worktree`/`--assume-unchanged` leaves the
+# `--stage` digest byte-identical and moves the `-s -v` digest). The letter is
+# NOT a working-tree comparison: an unstaged edit, and the stat refresh, both
+# leave it `H`, so this costs no false positive.
+GIT_INDEX_DIGEST_ARGS: tuple[str, ...] = (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v")
 
 # What the guard is doing about `.git/index` for a given run.
 INDEX_CHECK_SEMANTIC = "semantic"
