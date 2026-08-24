@@ -853,6 +853,54 @@ def test_a_repository_textconv_driver_cannot_execute_in_the_verification_copy(
     assert marker.read_text().startswith("EXECUTED")
 
 
+def test_a_git_info_attributes_driver_cannot_execute_in_the_verification_copy(
+    tmp_path: Path,
+) -> None:
+    """VECTOR 2, one level down and inside `.git`. `.git/info/attributes` is
+    the REPOSITORY-LOCAL attributes file: it is not tracked, it is not
+    `.gitattributes`, and the copier copies everything under `.git` except
+    `hooks`, so it arrives in the copy verbatim and always will.
+
+    Measured on git 2.50.1: with `diff.evil.textconv` defined it EXECUTES, and
+    with the driver unset it is inert - exactly like `.gitattributes`. The
+    docs previously called that inert BY REASONING (drivers come only from
+    config); this pins it. The attributes file is deliberately NOT removed
+    from the copy: what makes it safe is that nothing DEFINES the driver it
+    names, which is a property of the config allowlist. If the allowlist ever
+    gains a driver-defining key, this test is what fails."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    marker = tmp_path / "EXECUTED"
+    _evil_script(source / "tools" / "evil", marker)
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c2")
+    info = source / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "attributes").write_text("calc.py diff=evil\n")  # NOT .gitattributes
+    _git(source, git, "config", "diff.evil.textconv", "tools/evil")
+    (source / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return b + a\n")
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    # the attributes file is still there - it is `.git` content, copied verbatim
+    assert (repo / ".git" / "info" / "attributes").read_text() == "calc.py diff=evil\n"
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "diff", "HEAD"]]:
+        outcome = env.run(argv)
+        assert outcome.violated is False, (argv, outcome.violation_reason)
+    assert not marker.exists(), f"the repository's program RAN: {marker.read_text()!r}"
+    assert _git(repo, git, "config", "--get", "diff.evil.textconv", check=False).returncode == 1
+    assert "return b + a" in env.run(["git", "diff", "HEAD"]).stdout.decode()
+
+    # the vector is real in the ORIGINAL, which still has the driver: without
+    # this the test could go vacuous if git ever stopped honouring the file
+    _git(source, git, "--no-optional-locks", "diff", "HEAD")
+    assert marker.read_text().startswith("EXECUTED")
+
+
 def test_a_planted_alternates_cannot_reach_a_truncated_away_object(tmp_path: Path) -> None:
     """VECTOR 3, measured the same day. `eris.snapshot` builds a
     history-truncated clone precisely so the commits that contain the answer

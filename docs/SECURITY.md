@@ -518,11 +518,27 @@ The config is not the only part of `.git` git treats as instructions.
 
 Stated, not implied:
 
-* **The tree is still the repository's.** `.gitattributes`, `.gitmodules`,
-  `.mailmap` and every other in-tree file are copied verbatim, by design.
-  They are inert only for as long as nothing DEFINES the driver they name;
-  that is a property of the config allowlist, so widening the allowlist is
-  the thing to watch.
+* **The tree is still the repository's, and so is `.git/info/attributes`.**
+  `.gitattributes`, `.gitmodules`, `.mailmap` and every other in-tree file are
+  copied verbatim, by design, and `.git/info/attributes` - the
+  repository-LOCAL attributes file, which is not tracked and is not
+  `.gitattributes` - is copied with the rest of `.git`. Both are inert only
+  for as long as nothing DEFINES the driver they name; that is a property of
+  the config allowlist, so widening the allowlist is the thing to watch.
+  MEASURED, both of them, on git 2.50.1 (2026-08-24): with
+  `diff.evil.textconv` defined, an attributes line naming `diff=evil` executes
+  the driver; with the driver unset it is inert. Neither file is removed from
+  the copy, because removing it would change what verification SEES while the
+  allowlist is what actually stops the execution
+  (`test_verify_real_git.py::test_a_repository_textconv_driver_cannot_execute_in_the_verification_copy`,
+  `::test_a_git_info_attributes_driver_cannot_execute_in_the_verification_copy`
+  - the second is the test that fails first if the allowlist ever gains a
+  driver-defining key).
+* **`.git/info/exclude` is copied verbatim and has NOT been measured.** It
+  changes which untracked files `git status` reports, so it can hide a file
+  from the evidence pack. It names no program, and by the same reasoning as
+  the attributes files it cannot define a driver - but that is reasoning, not
+  a measurement, and it is recorded here as such.
 * **Objects and refs are copied verbatim.** A malicious commit message, a
   branch name, a tag or a note is still an in-band instruction channel, and a
   worker with git tools can still read them.

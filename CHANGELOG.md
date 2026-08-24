@@ -105,6 +105,13 @@ Tests
   measured vectors, end to end through `sanitize_snapshot` and a real
   verification command. Each also proves the vector is REAL by running the same
   thing in the untouched original.
+* `::test_a_git_info_attributes_driver_cannot_execute_in_the_verification_copy` -
+  the same vector one level down, through `.git/info/attributes` (the
+  repository-LOCAL attributes file, not tracked, copied with the rest of
+  `.git`). Measured on git 2.50.1: with the driver defined it EXECUTES, with
+  the driver unset it is inert. The docs called this inert BY REASONING; it is
+  now pinned, and it is the test that fails first if the allowlist ever gains
+  a driver-defining key.
 * `::test_an_ordinary_repository_still_runs_the_whole_battery_after_the_rewrite`
   (no false refusal), `::test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports`
   (the round trip, judged by `git config --list` rather than by Eris's own
