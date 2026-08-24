@@ -42,7 +42,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -62,7 +62,7 @@ from eris.schemas import (
     now_ts,
     sha256_hex,
 )
-from eris.verify import run_allowlisted
+from eris.verify import GIT_ERIS_GLOBALS, run_allowlisted
 from eris.writer import BlobRef, RunWriter
 
 PACK_COMMANDS: tuple[tuple[str, ...], ...] = (
@@ -237,21 +237,37 @@ def _record(
 # --------------------------------------------------------------------------- commands
 
 
+# The ONLY paths the verification tripwire ignores. `.git/index` is git's stat
+# cache, not history: a read-only command may rewrite it (M2c defect B - `git
+# status` did, which tripped the guard and refused every later command in the
+# first live run). `.git/index.lock` is the transient file it writes it
+# through. Everything else under `.git` - refs, objects, HEAD, config, hooks -
+# STAYS in the hash, so a command that rewrites history or config is still
+# caught. Excluding `.git` wholesale would hide exactly that.
+GUARD_EXCLUDED_RELPATHS: frozenset[str] = frozenset({".git/index", ".git/index.lock"})
+
+
+def _guard_skip(rel: PurePosixPath) -> bool:
+    return rel.as_posix() in GUARD_EXCLUDED_RELPATHS
+
+
 @dataclass
 class SnapshotGuard:
     """Tree-hash tripwire over the PRISTINE verification copy: a command
     that changes it is recorded (``snapshot.violated``, the item's
-    ``violated`` flag) and verification stops for the run."""
+    ``violated`` flag) and verification stops for the run.
+
+    :data:`GUARD_EXCLUDED_RELPATHS` names the only exceptions."""
 
     root: Path
     baseline: str
 
     @classmethod
     def over(cls, root: Path) -> SnapshotGuard:
-        return cls(Path(root), tree_sha256(Path(root)))
+        return cls(Path(root), tree_sha256(Path(root), skip=_guard_skip))
 
     def changed(self) -> str | None:
-        now = tree_sha256(self.root)
+        now = tree_sha256(self.root, skip=_guard_skip)
         return None if now == self.baseline else now
 
 
@@ -558,10 +574,16 @@ def rebuild_pack(
 
 def request_key(argv: Sequence[str]) -> str:
     """Dedupe key of a request: canonical argv with the executable's basename
-    (so a recorded, resolved argv and a raw request compare equal)."""
+    and without the options Eris itself appends (so a recorded, resolved argv
+    and a raw request compare equal - a resumed run must recognise a request
+    it already executed). Dropping them cannot alias two distinct requests:
+    every one of them is hard-denied from a model."""
     argv = list(argv)
     if argv:
         argv[0] = Path(argv[0]).name
+        if argv[0] == "git":
+            while len(argv) > 1 and argv[1] in GIT_ERIS_GLOBALS:
+                del argv[1]
     return canonical_bytes({"argv": argv}).decode("utf-8")
 
 

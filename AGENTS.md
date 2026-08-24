@@ -110,7 +110,8 @@ never push without being asked) → stop and report.
   `tests/conftest.py` blocks `shutil.which` for worker binaries, all subprocess
   entry points, and sockets. Tests that must spawn a real process use the
   `real_subprocess` marker and only `sys.executable`/`sleep` (plus `git`, via
-  `allow=["git"]`, for the single snapshot integration test).
+  `allow=["git"]`, for exactly two integration tests: the snapshot builder and
+  the M2c verification battery).
 - **One writer to disk under `runs/`** — `eris.writer.RunWriter`. Redaction
   happens BEFORE hashing. Writer failures raise; they are never swallowed.
 - **Subprocess env is built from `{}`**, never filtered from `os.environ`.

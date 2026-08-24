@@ -11,7 +11,14 @@ import pytest
 
 from eris.launch import GIT_HARDENING, LaunchRefused
 from eris.policy import UNPINNED, Policy
-from eris.verify import HARD_DENY, Decision, build_verify_env, check_command, run_allowlisted
+from eris.verify import (
+    GIT_ERIS_GLOBALS,
+    HARD_DENY,
+    Decision,
+    build_verify_env,
+    check_command,
+    run_allowlisted,
+)
 from tests.conftest import FakeProcessFactory
 
 
@@ -93,7 +100,53 @@ def test_git_diff_with_paths_is_allowed(world: tuple[Policy, Path]) -> None:
     assert d.allowed, d.reason
     assert d.command == "git" and d.timeout_s == 600
     assert d.argv[0] == str(Path(policy.verify.commands["git"].executable).resolve())
-    assert d.argv[1:] == ("diff", "--stat", "HEAD~1", "--", "src/a.py")
+    assert d.argv[1:] == (
+        "--no-optional-locks",  # Eris-appended, before the subcommand
+        "diff",
+        "--stat",
+        "HEAD~1",
+        "--",
+        "src/a.py",
+    )
+
+
+def test_git_argv_carries_the_eris_global_before_the_subcommand(
+    world: tuple[Policy, Path],
+) -> None:
+    """M2c defect B: Eris appends `--no-optional-locks` to EVERY git
+    invocation, and git requires a global option before the subcommand.
+    Without it `git status` rewrites `.git/index` and trips the snapshot
+    tripwire, which then refuses every later verification command."""
+    policy, snap = world
+    assert GIT_ERIS_GLOBALS == ("--no-optional-locks",)
+    for request in (
+        ["git", "log", "-p"],
+        ["git", "show", "HEAD"],
+        ["git", "diff", "--stat"],
+    ):
+        d = check_command(request, policy, snap)
+        assert d.allowed, d.reason
+        assert d.argv[1 : 1 + len(GIT_ERIS_GLOBALS)] == GIT_ERIS_GLOBALS
+        assert d.argv[1 + len(GIT_ERIS_GLOBALS)] == request[1]  # then the subcommand
+    # only git gets them
+    d = check_command(["ruff", "check", "--no-fix", "src"], policy, snap)
+    assert d.allowed and "--no-optional-locks" not in d.argv
+
+
+def test_a_model_supplied_git_global_is_still_refused(world: tuple[Policy, Path]) -> None:
+    """Eris appending an option never makes it acceptable FROM a model: it is
+    a git global option, and every git global is hard-denied."""
+    policy, snap = world
+    assert "--no-optional-locks" in HARD_DENY["git"]
+    for request in (
+        ["git", "log", "--no-optional-locks"],
+        ["git", "log", "--no-optional-locks=1"],
+    ):
+        d = check_command(request, policy, snap)
+        assert not d.allowed and "hard-denied" in d.reason, request
+    # before the subcommand it never even reaches the flag walk
+    d = check_command(["git", "--no-optional-locks", "log"], policy, snap)
+    assert not d.allowed and "subcommand must be one of" in d.reason
 
 
 def test_value_flags_both_forms(world: tuple[Policy, Path]) -> None:

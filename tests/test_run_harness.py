@@ -110,7 +110,7 @@ class Popen:
         if name == "pytest":
             return FakeProcess(argv, stdout=b"1 passed\n", returncode=0, popen_kwargs=kw)
         if name == "git":
-            sub = argv[1] if len(argv) > 1 else ""
+            sub = next((a for a in argv[1:] if not a.startswith("-")), "")
             out = {"rev-parse": b"f" * 40 + b"\n"}.get(sub, f"{sub} output\n".encode())
             return FakeProcess(argv, stdout=out, returncode=0, popen_kwargs=kw)
         if name == self.interrupt_on:

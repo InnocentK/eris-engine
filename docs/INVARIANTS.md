@@ -21,9 +21,13 @@ CHANGELOG entry.
 | Every captured envelope has a `.meta.json` sidecar whose argv is either mechanically recorded by a battery script (`scratchpad/exp2/run.sh` or `scratchpad/flagtest/claude_tests.sh`) or explicitly labelled `argv_source: reconstructed by the synthesizer …; not mechanically captured` (A7/A8/A10b/A14/A15/A16 and E17 are reconstructed); agy sidecars list flags in the canonical builder order and say when a run had no `--add-dir`. M2b captures: `claude/2.1.239/budget_tripped.json` (T2), `codex/0.147.0/auth_401.jsonl` (E2), `grok/1.0.5/api_error_403.json` (E17) | `test_fixtures.py::test_every_capture_has_a_meta_sidecar_with_argv`, `::test_agy_sidecars_state_the_canonical_argv_order` |
 
 Exception (stated in AGENTS.md as well): the marker accepts `allow=["git"]`
-and its single call site is `test_snapshot.py::test_snapshot_has_no_future`
-(plus `test_hermeticity.py::test_marker_allow_extends_the_list`, which proves
-the allow list is honoured). No other test may spawn `git`.
+and it has exactly two call sites,
+`test_snapshot.py::test_snapshot_has_no_future` and
+`test_verify_real_git.py::test_the_default_battery_runs_clean_against_a_real_git_repository`
+(M2c defect B: the fakes never execute a real `git`, so no hermetic test could
+see `git status` rewriting `.git/index`), plus
+`test_hermeticity.py::test_marker_allow_extends_the_list`, which proves the
+allow list is honoured. No other test may spawn `git`.
 
 ## Schemas (`src/eris/schemas.py`)
 | Rule | Test |

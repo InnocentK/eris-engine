@@ -15,6 +15,9 @@ policy's ``verify.commands`` grammar, whether Eris may execute one:
   even if a policy tries to allowlist them.
 * Commands that execute repository code (``requires_trusted``) are refused
   unless the policy is ``trusted``.
+* Eris APPENDS ``--no-optional-locks`` to every ``git`` invocation, before the
+  subcommand (:data:`GIT_ERIS_GLOBALS`). A model that supplies it is still
+  refused: it is a global option and every git global is hard-denied.
 
 The execution environment is built from ``{}`` with git hardening
 (``GIT_CONFIG_GLOBAL=/dev/null``, ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_PAGER=cat``,
@@ -46,10 +49,23 @@ from eris.policy import Policy, VerifyCommand, sha256_file
 # Every entry was verified against the captured --help output of the pinned
 # tool versions in tests/fixtures/help/ (git 2.50.1, pytest 9.1.1, ruff 0.16.4,
 # mypy 2.3.1); tests/test_verify_allowlist.py asserts each entry appears there.
+# Eris-appended git global options. They sit BEFORE the subcommand (git
+# requires that of global options) and are never accepted from a model:
+# `--no-optional-locks` is in HARD_DENY below like every other git global.
+#
+# Why: the first live run (2026-08-23, M2c) showed `git status --porcelain`
+# refreshing `.git/index` (its stat cache). The verification copy's tree hash
+# changed, the snapshot guard declared a violation, and EVERY remaining
+# verification command in the run was refused. `--no-optional-locks` is git's
+# own switch for "do not take locks for optional work" - git-status(1) itself
+# recommends exactly this invocation for read-only status checks.
+GIT_ERIS_GLOBALS: tuple[str, ...] = ("--no-optional-locks",)
+
 HARD_DENY: dict[str, frozenset[str]] = {
     "git": frozenset(
         {
             # global options (git-2.50.1.txt)
+            "--no-optional-locks",  # Eris appends it; a model may not supply it
             "-c",
             "-C",
             "--exec-path",
@@ -251,6 +267,8 @@ def check_command(
 
     rest = list(argv[1:])
     out: list[str] = [str(exe.resolve())]
+    if name == "git":
+        out.extend(GIT_ERIS_GLOBALS)  # global options must precede the subcommand
     if spec.subcommands:
         if not rest or rest[0] not in spec.subcommands:
             return _refuse(f"{name} subcommand must be one of {sorted(spec.subcommands)}", name)
