@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.13 - formatting a cleanup failure cannot replace the reason (2026-08-24)
+
+Eleventh stop-time finding, and a fair correction to 0.3.12's claim that it
+"closed the class": it guarded the reporter's WRITE, but the arguments are
+built at the call site, outside that guard.
+
+* `_safe_text(value, fallback)` - `str()` that cannot raise. `_scratch_root`
+  formats the cleanup exception through it, and `_remove_scratch` formats its
+  own return text through it (that function's contract is that it NEVER
+  raises, and callers rely on the return value being the only signal).
+* An exception whose `__str__` raises - a real shape for C-extension errors -
+  no longer replaces the reason with a `RuntimeError` from the reporting path.
+* Two tests, each verified to fail without the fix.
+
+The general rule, now stated in INVARIANTS: in a handler that is already
+dealing with a failure, EVERY step - formatting, serialising, writing - must
+be unable to raise, not just the last one.
+
 ## 0.3.12 - the cleanup report cannot replace the reason (2026-08-24)
 
 Tenth stop-time finding, one level deeper than 0.3.11's: the reporting channel
