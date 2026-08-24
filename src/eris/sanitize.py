@@ -438,9 +438,18 @@ class ConfigRewrite:
 # Fail-closed direction: this parser decides only what to KEEP. If it
 # mis-parses in the direction of "this is not an allowlisted section", the entry
 # is dropped, which is safe. If it cannot parse the file at all it RAISES and
-# the copy is refused, which is also safe - git would refuse to open such a
-# repository anyway (measured: a bad escape and an unterminated quote are both
-# `fatal: bad config line`).
+# the copy is refused, which is also safe.
+#
+# What is actually VERIFIED about the correspondence with git, and no more:
+# every row of `test_sanitize.py::test_the_config_parser_reads_gits_real_grammar`
+# is replayed through a real git in
+# `test_verify_real_git.py::test_the_config_parser_agrees_with_git_on_every_
+# grammar_row`, which compares this parser's entries with `git config --list -z`
+# record for record. The refusal rows measured to be `fatal: bad config line`
+# in git are a bad escape, an unterminated quote and an EMPTY section header
+# (`[]`); the other refusals here are Eris being stricter than git, which costs
+# a copy and never an escape. This is a correspondence pinned by a table, not a
+# proof of equivalence: a construction in neither table is unverified.
 
 _CONFIG_SPACE = frozenset(b" \t\n\v\f\r")
 _CONFIG_KEYCHARS = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
@@ -521,6 +530,13 @@ def _read_section(reader: _ConfigReader) -> tuple[bytes, bytes | None]:
             raise GitConfigParseError("unterminated section header")
         if c == 0x5D:  # ]
             base = bytes(name)
+            if not base:
+                # git builds `section[.subsection]` into one buffer and then
+                # rejects the line if it is EMPTY (`config.c`: `var->len < 1`).
+                # Measured 2026-08-24, git 2.50.1: `[]` is `fatal: bad config
+                # line`, while `[ "x"]` - empty section, non-empty subsection -
+                # is ACCEPTED. Eris refuses exactly the first.
+                raise GitConfigParseError("an empty section header")
             head, dot, tail = base.partition(b".")
             return head, (tail if dot else None)
         if c in _CONFIG_SPACE:

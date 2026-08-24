@@ -65,6 +65,28 @@ Fixed - `extensions.*` is a known-key allowlist with validated values
   practice; the refusal is unconditional because a version-dependent rule is
   harder to audit than a flat one.
 
+Fixed - the parser claim is now measured rather than asserted
+* `parse_git_config` accepted `[]`, which real git REFUSES: git builds
+  `section[.subsection]` into one buffer and rejects the line when it is empty
+  (`config.c`, `var->len < 1`). Measured 2026-08-24 on git 2.50.1: `[]` is
+  `fatal: bad config line`, while `[ "x"]` - an empty section with a NON-empty
+  subsection - is accepted. Eris now refuses exactly the first.
+* The grammar table is a shared constant (`GRAMMAR_ROWS`) and is now replayed
+  through a REAL git, row by row, comparing Eris's entries with
+  `git config --list -z` record for record (NUL-separated `key\nvalue`, which
+  is unambiguous where `--list` is not because a value may contain a newline).
+  The hand-written expectations pinned what I believed git does; this pins what
+  git does.
+* The refusal table (`UNPARSEABLE_ROWS`) gets the same treatment, and the
+  measurement corrected a guess in the process: git refuses EVERY row in it
+  except "a key outside any section". So Eris refuses a superset of what git
+  refuses - stricter in exactly one place, identical everywhere else. That
+  direction costs a copy and never an escape; the reverse cannot occur, because
+  refusal is the only outcome for that table.
+* The module comment no longer claims equivalence with git's parser. It states
+  what is verified - a correspondence pinned by two tables - and says plainly
+  that a construction in neither table is unverified.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c

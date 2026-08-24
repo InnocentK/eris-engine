@@ -456,36 +456,43 @@ def test_the_copy_config_keeps_only_the_allowlisted_keys(tmp_path: Path) -> None
     assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
 
 
-@pytest.mark.parametrize(
-    ("body", "expected"),
-    [
-        # the grammar that a LINE-oriented filter gets wrong; every row was
-        # measured against real git 2.50.1 on 2026-08-24 and is re-measured
-        # end to end in `test_verify_real_git.py`
-        (b"[core] filemode = true\n", [("core.filemode", b"true")]),
-        (b"[core]filemode=true\n", [("core.filemode", b"true")]),
-        (b"[core][diff] external = x\n", [("diff.external", b"x")]),
-        (b"[core.sub]\n\tfilemode = true\n", [("core.sub.filemode", b"true")]),
-        (b'[core "SUB"]\n\tfilemode = true\n', [("core.SUB.filemode", b"true")]),
-        (b"[CORE]\n\tFileMode = TRUE\n", [("core.filemode", b"TRUE")]),
-        (b"[core]\n\tbare\n", [("core.bare", None)]),  # a bare key is boolean true
-        (b"[core]\n\tfilemode = tr\\\nue\n", [("core.filemode", b"true")]),  # continued
-        # git reads EOF as a newline, so a trailing backslash ENDS the value
-        # rather than being a bad escape (`config.c`, `get_next_char`)
-        (b"[core]\n\tfilemode = tru\\", [("core.filemode", b"tru")]),
-        (b'[core]\n\tfilemode = "a\\tb\\nc\\\\d\\"e"\n', [("core.filemode", b'a\tb\nc\\d"e')]),
-        (b"[core]\r\n\tfilemode = true\r\n", [("core.filemode", b"true")]),  # CRLF
-        (b"\xef\xbb\xbf[core]\n\tfilemode = true\n", [("core.filemode", b"true")]),  # BOM
-        (b"[core]\n\tfilemode = a # not part\n", [("core.filemode", b"a")]),
-        (b'[core]\n\tfilemode = "a ; kept"\n', [("core.filemode", b"a ; kept")]),
-        (b"[core]\n\tfilemode = bar   \n", [("core.filemode", b"bar")]),  # trailing ws
-        (b"[core]\n\tfilemode =\n", [("core.filemode", b"")]),  # empty value
-        (b"; c\n# c\n[core]\n\t; c\n\tfilemode = true\n", [("core.filemode", b"true")]),
-        # a backslash inside a subsection name takes the next byte literally
-        (b'[core "a\\\\b"]\n\tfilemode = x\n', [("core.a\\b.filemode", b"x")]),
-        (b"", []),
-    ],
+#: The git config GRAMMAR, row by row: the bytes, and the entries git reads
+#: out of them. Every row was measured against real git 2.50.1 on
+#: 2026-08-24, and every row is REPLAYED through a real git in
+#: `test_verify_real_git.py::test_the_config_parser_agrees_with_git_on_every_
+#: grammar_row`, which compares these entries with `git config --list -z`
+#: record for record. A construction in neither this table nor
+#: `UNPARSEABLE_ROWS` is not verified against git at all.
+GRAMMAR_ROWS: tuple[tuple[bytes, list[tuple[str, bytes | None]]], ...] = (
+    # the grammar that a LINE-oriented filter gets wrong; every row was
+    # measured against real git 2.50.1 on 2026-08-24 and is re-measured
+    # end to end in `test_verify_real_git.py`
+    (b"[core] filemode = true\n", [("core.filemode", b"true")]),
+    (b"[core]filemode=true\n", [("core.filemode", b"true")]),
+    (b"[core][diff] external = x\n", [("diff.external", b"x")]),
+    (b"[core.sub]\n\tfilemode = true\n", [("core.sub.filemode", b"true")]),
+    (b'[core "SUB"]\n\tfilemode = true\n', [("core.SUB.filemode", b"true")]),
+    (b"[CORE]\n\tFileMode = TRUE\n", [("core.filemode", b"TRUE")]),
+    (b"[core]\n\tbare\n", [("core.bare", None)]),  # a bare key is boolean true
+    (b"[core]\n\tfilemode = tr\\\nue\n", [("core.filemode", b"true")]),  # continued
+    # git reads EOF as a newline, so a trailing backslash ENDS the value
+    # rather than being a bad escape (`config.c`, `get_next_char`)
+    (b"[core]\n\tfilemode = tru\\", [("core.filemode", b"tru")]),
+    (b'[core]\n\tfilemode = "a\\tb\\nc\\\\d\\"e"\n', [("core.filemode", b'a\tb\nc\\d"e')]),
+    (b"[core]\r\n\tfilemode = true\r\n", [("core.filemode", b"true")]),  # CRLF
+    (b"\xef\xbb\xbf[core]\n\tfilemode = true\n", [("core.filemode", b"true")]),  # BOM
+    (b"[core]\n\tfilemode = a # not part\n", [("core.filemode", b"a")]),
+    (b'[core]\n\tfilemode = "a ; kept"\n', [("core.filemode", b"a ; kept")]),
+    (b"[core]\n\tfilemode = bar   \n", [("core.filemode", b"bar")]),  # trailing ws
+    (b"[core]\n\tfilemode =\n", [("core.filemode", b"")]),  # empty value
+    (b"; c\n# c\n[core]\n\t; c\n\tfilemode = true\n", [("core.filemode", b"true")]),
+    # a backslash inside a subsection name takes the next byte literally
+    (b'[core "a\\\\b"]\n\tfilemode = x\n', [("core.a\\b.filemode", b"x")]),
+    (b"", []),
 )
+
+
+@pytest.mark.parametrize(("body", "expected"), GRAMMAR_ROWS)
 def test_the_config_parser_reads_gits_real_grammar(
     body: bytes, expected: list[tuple[str, bytes | None]]
 ) -> None:
@@ -501,23 +508,28 @@ def test_the_config_parser_reads_gits_real_grammar(
     assert got == expected
 
 
-@pytest.mark.parametrize(
-    ("body", "reason"),
-    [
-        (b'[core]\n\tfilemode = "a\\qb"\n', "bad escape"),
-        (b'[core]\n\tfilemode = "abc\n', "missing closing quote"),
-        (b"[core\n", "newline inside a section header"),
-        (b"[core", "unterminated section header"),
-        (b"[co!re]\n", "invalid character in a section header"),
-        (b"[core x]\n", "expected a quoted subsection name"),
-        (b'[core "x\n', "unterminated subsection name"),
-        (b'[core "x\\', "unterminated subsection name"),  # a backslash at EOF
-        (b'[core "x"y\n', "expected `]` after a subsection name"),
-        (b"filemode = true\n", "a key outside any section"),
-        (b"[core]\n\t1mode = true\n", "a key must start with a letter"),
-        (b"[core]\n\tfilemode ! true\n", "expected `=` after a key"),
-    ],
+#: Configs git itself REFUSES (`fatal: bad config line`, measured) plus the
+#: places Eris is deliberately stricter than git. Eris refuses all of them.
+UNPARSEABLE_ROWS: tuple[tuple[bytes, str], ...] = (
+    (b'[core]\n\tfilemode = "a\\qb"\n', "bad escape"),
+    (b'[core]\n\tfilemode = "abc\n', "missing closing quote"),
+    (b"[core\n", "newline inside a section header"),
+    (b"[core", "unterminated section header"),
+    (b"[co!re]\n", "invalid character in a section header"),
+    (b"[core x]\n", "expected a quoted subsection name"),
+    (b'[core "x\n', "unterminated subsection name"),
+    (b'[core "x\\', "unterminated subsection name"),  # a backslash at EOF
+    (b'[core "x"y\n', "expected `]` after a subsection name"),
+    (b"filemode = true\n", "a key outside any section"),
+    # measured 2026-08-24: git rejects `[]` (`var->len < 1`) but ACCEPTS
+    # `[ "x"]`, an empty section with a non-empty subsection
+    (b"[]\n\tfilemode = true\n", "an empty section header"),
+    (b"[core]\n\t1mode = true\n", "a key must start with a letter"),
+    (b"[core]\n\tfilemode ! true\n", "expected `=` after a key"),
 )
+
+
+@pytest.mark.parametrize(("body", "reason"), UNPARSEABLE_ROWS)
 def test_a_config_eris_cannot_parse_refuses_the_copy(
     tmp_path: Path, body: bytes, reason: str
 ) -> None:

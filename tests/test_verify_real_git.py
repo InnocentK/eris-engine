@@ -71,6 +71,7 @@ from eris.redact import Redactor
 from eris.sanitize import VERIFICATION_PROFILE, SanitizeError, sanitize_snapshot
 from eris.schemas import EvidenceKind
 from eris.writer import RunWriter
+from tests.test_sanitize import GRAMMAR_ROWS, UNPARSEABLE_ROWS
 
 pytestmark = pytest.mark.real_subprocess(allow=["git"])
 
@@ -1309,3 +1310,82 @@ def test_the_worktree_config_extension_is_dropped_not_refused(tmp_path: Path) ->
     assert not (copy / ".git" / "config.worktree").exists()
     assert "extensions.worktreeconfig" not in "\n".join(_config_list(copy, git)).lower()
     assert _git(copy, git, "status", "--porcelain").stdout == b""  # still a working repo
+
+
+# ------------- M2c follow-up 5, advisor round, item 3: the parser, differentially
+
+
+def _bare_repo_with_config(root: Path, body: bytes) -> Path:
+    """The smallest thing git will read a `.git/config` out of."""
+    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (root / ".git" / "objects").mkdir()
+    (root / ".git" / "refs").mkdir()
+    (root / ".git" / "config").write_bytes(body)
+    return root
+
+
+@pytest.mark.parametrize(("body", "expected"), GRAMMAR_ROWS)
+def test_the_config_parser_agrees_with_git_on_every_grammar_row(
+    tmp_path: Path, body: bytes, expected: list[tuple[str, bytes | None]]
+) -> None:
+    """Item 3: the parser's correspondence with git, checked BY git, row by row.
+
+    `parse_git_config` is a port of git's `config.c`, and 0.3.9 asserted that
+    correspondence in a hand-written expectation table - which pins what I
+    believed git does, not what git does. Here every row of `GRAMMAR_ROWS` is
+    written into a real repository and read back with `git config --list -z`,
+    whose NUL-separated `key\nvalue` records are unambiguous where `--list`
+    is not (a value may contain a newline).
+
+    A disagreement here means Eris keeps or drops a key on a reading git does
+    not share - which is exactly how `[core][diff] external = x` would have
+    slipped a driver past a line-oriented filter."""
+    git = _git_executable()
+    repo = _bare_repo_with_config(tmp_path / "r", body)
+    result = _git(repo, git, "config", "--list", "-z", check=False)
+    assert result.returncode == 0, result.stderr  # every GRAMMAR row is valid to git
+
+    got_records = [r for r in result.stdout.split(b"\x00") if r]
+    want_records = [
+        name.encode() if value is None else name.encode() + b"\n" + value
+        for name, value in expected
+    ]
+    assert got_records == want_records, (got_records, want_records)
+
+    # ... and Eris's parser produces exactly the same entries
+    from eris.sanitize import parse_git_config
+
+    assert [(e.name, e.value) for e in parse_git_config(body)] == expected
+
+
+@pytest.mark.parametrize(("body", "reason"), UNPARSEABLE_ROWS)
+def test_eris_refuses_a_superset_of_what_git_refuses(
+    tmp_path: Path, body: bytes, reason: str
+) -> None:
+    """The other half of item 3, and the honest version of the claim. Eris
+    refuses every row of `UNPARSEABLE_ROWS`; git refuses SOME of them. This
+    test records which, by measurement, instead of asserting the two agree:
+
+    * where git also refuses, Eris costs nothing - the repository was already
+      unopenable;
+    * where git accepts, Eris is STRICTER, which costs a copy (a refusal an
+      operator sees) and never an escape.
+
+    Either way the direction is safe. What is not acceptable is the reverse -
+    Eris accepting something git refuses - and that cannot happen here,
+    because refusal is the only outcome for this table."""
+    from eris.sanitize import GitConfigParseError, parse_git_config
+
+    git = _git_executable()
+    repo = _bare_repo_with_config(tmp_path / "r", body)
+    git_refused = _git(repo, git, "config", "--list", check=False).returncode != 0
+
+    with pytest.raises(GitConfigParseError, match=reason):
+        parse_git_config(body)
+
+    # MEASURED 2026-08-24 (this assertion replaced a guess that this test
+    # itself disproved): git refuses every row here except one, so Eris is
+    # stricter in exactly one place and identical everywhere else.
+    git_accepts = {"a key outside any section"}
+    assert git_refused == (reason not in git_accepts), (reason, git_refused)
