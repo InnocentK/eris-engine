@@ -544,6 +544,57 @@ def test_an_inherited_fsmonitor_left_on_would_false_trip_the_guard(tmp_path: Pat
     assert _git(repo, git, "--no-optional-locks", "ls-files", "-s", "-v").stdout == stage_before
 
 
+def test_a_symlinked_config_cannot_smuggle_an_fsmonitor_into_the_verification_copy(
+    tmp_path: Path,
+) -> None:
+    """M2c follow-up 4: the bypass closed END TO END, on real git.
+
+    A repository whose `.git/config` is a SYMLINK to another file inside the
+    tree used to skip neutralisation entirely - `neutralise_git_config`
+    returned False for anything that was not a regular file, while git followed
+    the link and honoured `core.fsmonitor` from its target. The link is now
+    replaced by a regular, neutralised file, so the monitor is off in the copy;
+    the ORIGINAL keeps its symlink and its setting, byte for byte."""
+    from eris.sanitize import tree_sha256
+
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_fsmonitor_repo(source, git)
+    # the config becomes an in-tree symlink AFTER git has written it (`git
+    # config` replaces the file by rename, which would drop the link)
+    real = source / ".git" / "config.real"
+    (source / ".git" / "config").rename(real)
+    os.symlink("config.real", source / ".git" / "config")
+    source_before = tree_sha256(source)
+    # the bypass is real: git resolves the monitor through the link
+    assert _git(source, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"tools/fsm"
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    cfg = repo / ".git" / "config"
+    assert not cfg.is_symlink() and cfg.is_file()  # replaced, never written through
+    assert _git(repo, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"false"
+    assert _git(repo, git, "config", "--get", "core.untrackedCache").stdout.strip() == b"false"
+    assert (repo / ".git" / "config.real").read_bytes() == real.read_bytes()  # target untouched
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    baseline = env.guard.index_digest
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "status", "--porcelain"]]:
+        assert env.run(argv).violated is False, argv
+    _git(repo, git, "status", "--porcelain")  # the two refreshes that would
+    _git(repo, git, "status", "--porcelain")  # prime a live monitor
+    assert _letters(repo, git) == "HHH"  # nothing was ever marked fsmonitor valid
+    assert env.guard.changed() is None and env.guard.index_digest == baseline
+
+    # THE ORIGINAL IS NEVER MODIFIED: the link and its target are still there
+    assert (source / ".git" / "config").is_symlink()
+    assert _git(source, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"tools/fsm"
+    assert tree_sha256(source) == source_before
+
+
 # --------------------------------------------------------- what it does NOT cover
 
 

@@ -426,37 +426,32 @@ def test_the_config_neutralisation_survives_odd_spellings_includes_and_continuat
     assert text.rstrip().endswith("untrackedCache = false")
     assert _core_values(text, "fsmonitor")[-1] == "false"
     # idempotent: neutralising an already-neutralised copy adds nothing new
-    assert neutralise_git_config(copy) is True
+    assert neutralise_git_config(copy).rewritten is True
     assert _core_values((copy / ".git" / "config").read_text(), "fsmonitor") == ["false"]
 
 
-@pytest.mark.parametrize("shape", ["no-git", "git-without-config", "config-is-a-symlink"])
+@pytest.mark.parametrize("shape", ["no-git", "git-without-config", "git-is-a-gitlink-file"])
 def test_a_copy_with_nothing_to_neutralise_is_left_alone(tmp_path: Path, shape: str) -> None:
-    """Item 2: no `.git`, a `.git` with no config file (a gitlink, or not a
-    repository) or a config that is a SYMLINK - nothing was inherited and
-    nothing is written. A symlink is never followed: writing through it could
-    leave the copy."""
+    """Item 2: no `.git`, a `.git` with no config file, or a `.git` that is the
+    gitlink FILE of a worktree/submodule - nothing was inherited and nothing is
+    written. The gitlink case is why `.git` is `file_or_dir` in
+    `GIT_REQUIRED_KINDS` and why ENOTDIR counts as absent."""
     from eris.sanitize import VERIFICATION_PROFILE, neutralise_git_config
 
     original = tmp_path / "o"
     original.mkdir()
     (original / "keep.txt").write_text("k\n")
-    if shape != "no-git":
+    if shape == "git-without-config":
         (original / ".git").mkdir()
         (original / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
-    if shape == "config-is-a-symlink":
-        (original / ".git" / "real").write_text("[core]\n\tfsmonitor = true\n")
-        os.symlink("real", original / ".git" / "config")
+    if shape == "git-is-a-gitlink-file":
+        (original / ".git").write_text("gitdir: ../elsewhere/.git/worktrees/w\n")
 
     copy = tmp_path / "scratch" / "verify-copy"
     sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
 
-    assert neutralise_git_config(copy) is False
-    if shape == "config-is-a-symlink":
-        assert (copy / ".git" / "config").is_symlink()
-        assert (copy / ".git" / "real").read_text() == "[core]\n\tfsmonitor = true\n"
-    else:
-        assert not (copy / ".git" / "config").exists()
+    assert neutralise_git_config(copy).rewritten is False
+    assert not (copy / ".git" / "config").exists()
 
 
 def test_the_neutralised_config_keeps_a_read_only_file_mode(tmp_path: Path) -> None:
@@ -478,6 +473,294 @@ def test_the_neutralised_config_keeps_a_read_only_file_mode(tmp_path: Path) -> N
     assert stat.S_IMODE((copy / ".git" / "config").stat().st_mode) == 0o444
     assert text.startswith('[remote "o"]\n\turl = x\n# eris')  # a newline was supplied
     assert _core_values(text, "fsmonitor") == ["false"]
+
+
+# ------------------------------------------------ M2c follow-up 4: the control fails CLOSED
+
+
+def _mkgit(root: Path) -> Path:
+    """A minimal ORIGINAL: a `.git` with a HEAD and one tracked file."""
+    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (root / "keep.txt").write_text("k\n")
+    return root
+
+
+def test_a_symlinked_git_config_inside_the_copy_is_replaced_never_followed(
+    tmp_path: Path,
+) -> None:
+    """M2c follow-up 4, item 1: `.git/config` as a symlink used to be SKIPPED
+    silently - a complete bypass, because git follows it and honours
+    `core.fsmonitor` from the target. A link resolving INSIDE the copy is now
+    read, unlinked and replaced by a REGULAR file holding the neutralised
+    bytes: the target is never written through (item 3), the copy is still
+    usable, and the replacement is recorded in `dropped_symlinks`."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    decoy = original / "decoy"
+    decoy.write_text("[core]\n\tfsmonitor = tools/fsm\n\tuntrackedCache = true\n\tbare = 0\n")
+    os.symlink("../decoy", original / ".git" / "config")  # inside the tree: the copier keeps it
+    before_hash, before_bytes = tree_sha256(original), decoy.read_bytes()
+    before_ino = decoy.lstat().st_ino
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    rec = sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    cfg = copy / ".git" / "config"
+    assert not cfg.is_symlink() and stat.S_ISREG(cfg.lstat().st_mode)  # a REGULAR file now
+    text = cfg.read_text()
+    assert _core_values(text, "fsmonitor") == ["false"]  # the inherited value is gone
+    assert _core_values(text, "untrackedCache") == ["false"]
+    assert "\tbare = 0\n" in text  # the rest of the target's content survives
+    assert ".git/config" in rec.dropped_symlinks  # the link is recorded, not silently gone
+
+    # THE TARGET IS NEVER WRITTEN THROUGH: neither the copy's decoy nor the
+    # original's, and the ORIGINAL as a whole does not move
+    assert (copy / "decoy").read_bytes() == before_bytes
+    assert not (copy / "decoy").read_text().startswith("# eris")
+    assert decoy.read_bytes() == before_bytes and decoy.lstat().st_ino == before_ino
+    assert (original / ".git" / "config").is_symlink()
+    assert tree_sha256(original) == before_hash
+
+
+@pytest.mark.parametrize("target", ["/etc/passwd", "abs-outside", "../../outside.conf"])
+def test_a_git_config_symlink_escaping_the_copy_is_dropped_and_never_read(
+    tmp_path: Path, target: str
+) -> None:
+    """M2c follow-up 4, item 1, the other half: a link pointing OUT of the tree
+    is dropped by the copier before neutralisation ever sees it, which
+    legitimately leaves nothing to inherit - the copy proceeds with no
+    `.git/config` at all. The escape target is neither read nor written."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    outside = tmp_path / "outside.conf"
+    outside.write_text("[core]\n\tfsmonitor = tools/evil\n")
+    original = _mkgit(tmp_path / "o")
+    link = str(outside) if target == "abs-outside" else target
+    os.symlink(link, original / ".git" / "config")
+    victim = Path("/etc/passwd") if target == "/etc/passwd" else outside
+    before = victim.stat()
+    before_bytes = outside.read_bytes()
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    rec = sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    assert not (copy / ".git" / "config").exists(follow_symlinks=False)
+    assert ".git/config" in rec.dropped_symlinks
+    assert (copy / "keep.txt").read_text() == "k\n"  # the copy still proceeds
+    after = victim.stat()
+    assert (after.st_size, after.st_mtime_ns, after.st_mode) == (
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_mode,
+    )
+    assert outside.read_bytes() == before_bytes
+    # nothing anywhere in the copy carries the neutralised block's marker
+    assert not any(
+        p.is_file() and not p.is_symlink() and b"# eris:" in p.read_bytes() for p in copy.rglob("*")
+    )
+
+
+def _plant(root: Path, rel: str, shape: str) -> None:
+    """Plant `rel` in a hand-built COPY root as `shape`. Some shapes cannot be
+    produced through `sanitize_snapshot` (the copier refuses or drops them
+    first), which is exactly why the assertion below is checked directly."""
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if shape == "fifo":
+        os.mkfifo(p)
+    elif shape == "dir":
+        p.mkdir()
+    elif shape == "file":
+        p.write_text("x\n")
+    elif shape == "dangling-link":
+        os.symlink("nowhere", p)
+    elif shape == "link-to-file":
+        (p.parent / "real").write_text("[core]\n\tfsmonitor = tools/fsm\n")
+        os.symlink("real", p)
+    elif shape == "link-to-dir":
+        (p.parent / "realdir").mkdir()
+        os.symlink("realdir", p)
+    elif shape == "link-to-fifo":
+        os.mkfifo(p.parent / "realfifo")
+        os.symlink("realfifo", p)
+    elif shape == "link-escaping":
+        (root.parent / "escapee").write_text("[core]\n\tfsmonitor = tools/fsm\n")
+        os.symlink(str(root.parent / "escapee"), p)
+    else:  # pragma: no cover - a typo in the table
+        raise AssertionError(shape)
+
+
+@pytest.mark.parametrize(
+    "shape,reason",
+    [
+        ("fifo", "is a fifo"),
+        ("dir", "is a directory"),
+        ("dangling-link", "does not resolve"),
+        ("link-to-dir", "which is a directory"),
+        ("link-to-fifo", "which is a fifo"),
+        ("link-escaping", "OUTSIDE the copy root"),
+    ],
+)
+def test_neutralise_refuses_every_config_shape_it_cannot_reason_about(
+    tmp_path: Path, shape: str, reason: str
+) -> None:
+    """M2c follow-up 4, item 1: the control FAILS CLOSED. Anything at
+    `.git/config` that is not a regular file and not an in-copy link to one
+    refuses the copy loudly, naming the path and the reason. Silently skipping
+    it is what let a symlink through for four milestones."""
+    from eris.sanitize import neutralise_git_config
+
+    copy = tmp_path / "copy"
+    _mkgit(copy)
+    _plant(copy, ".git/config", shape)
+    with pytest.raises(SanitizeError, match=r"\.git/config: .*" + reason):
+        neutralise_git_config(copy)
+
+
+def test_the_config_replacement_refuses_a_link_that_changed_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2c follow-up 4, item 3, the RACE. Containment is decided on a realpath,
+    so the unlink must not trust that the link is still the link that was
+    resolved. Between the read and the `unlink` the link is re-`lstat`ed and
+    must still be the same dev+inode; here it is swapped underneath (what an
+    attacker with write access to the copy would do) and the copy is refused
+    rather than unlinking something else."""
+    import eris.sanitize as sanitize_mod
+
+    copy = tmp_path / "copy"
+    _mkgit(copy)
+    _plant(copy, ".git/config", "link-to-file")
+    (copy / ".git" / "other").write_text("[core]\n\tbare = 1\n")
+
+    real_read_all = sanitize_mod._read_all
+
+    def swap(fd: int) -> bytes:
+        data = real_read_all(fd)
+        (copy / ".git" / "config").unlink()  # the link is replaced mid-flight
+        os.symlink("other", copy / ".git" / "config")
+        return data
+
+    monkeypatch.setattr(sanitize_mod, "_read_all", swap)
+    with pytest.raises(SanitizeError, match=r"\.git/config: changed while it was being replaced"):
+        sanitize_mod.neutralise_git_config(copy)
+    assert (copy / ".git" / "config").is_symlink()  # nothing was unlinked or written
+    assert (copy / ".git" / "real").read_text() == "[core]\n\tfsmonitor = tools/fsm\n"
+
+
+def test_a_git_path_that_cannot_be_read_or_stat_ed_refuses_the_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed all the way down: an errno that is not "absent" is never
+    treated as absent, and a target that resolves but cannot be OPENED refuses
+    the copy instead of silently skipping the neutralisation."""
+    import eris.sanitize as sanitize_mod
+
+    copy = tmp_path / "copy"
+    _mkgit(copy)
+    _plant(copy, ".git/config", "link-to-file")
+
+    def denied(*_a: object, **_k: object) -> int:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(sanitize_mod.os, "open", denied)
+    with pytest.raises(SanitizeError, match=r"\.git/config: .*could not be read"):
+        sanitize_mod.neutralise_git_config(copy)
+
+    def unstattable(self: Path) -> os.stat_result:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(sanitize_mod.Path, "lstat", unstattable)
+    with pytest.raises(SanitizeError, match=r"\.git/config: cannot be checked"):
+        sanitize_mod.neutralise_git_config(copy)
+    with pytest.raises(SanitizeError, match=r"\.git: cannot be checked"):
+        sanitize_mod.assert_git_layout_sane(copy)
+
+
+#: Every entry of `GIT_REQUIRED_KINDS` gets a row: the shapes that must be
+#: REFUSED and the shapes that are fine. Adding a path to the table in
+#: `sanitize.py` without adding a row here fails the coverage assertion below.
+LAYOUT_ROWS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (".git", ("dangling-link", "link-to-dir", "fifo"), ("dir", "file")),
+    (".git/config", ("fifo", "dir", "link-to-file"), ("file",)),
+    (".git/index", ("fifo", "dir", "link-to-file", "dangling-link"), ("file",)),
+    (".git/hooks", ("fifo", "file", "link-to-dir"), ("dir",)),
+)
+
+
+@pytest.mark.parametrize(
+    "rel,shape",
+    [(rel, shape) for rel, bad, _ok in LAYOUT_ROWS for shape in bad],
+)
+def test_the_git_layout_assertion_refuses_every_non_regular_shape(
+    tmp_path: Path, rel: str, shape: str
+) -> None:
+    """M2c follow-up 4, item 2 - the GENERAL guard, and the point of this
+    change. Five stop-time findings in a row were the same shape of bug: a
+    path Eris reasons about is not what git actually reads. After sanitisation
+    every `.git` path Eris depends on must be a regular file / directory or
+    absent; anything else refuses the copy, naming the path and the reason.
+    A new dependency is one line in `GIT_REQUIRED_KINDS` and one row above."""
+    from eris.sanitize import assert_git_layout_sane
+
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    if rel != ".git":
+        _mkgit(copy)
+    _plant(copy, rel, shape)
+    with pytest.raises(SanitizeError, match=rel.replace(".", r"\.") + ": is "):
+        assert_git_layout_sane(copy)
+
+
+@pytest.mark.parametrize(
+    "rel,shape",
+    [(rel, shape) for rel, _bad, ok in LAYOUT_ROWS for shape in (*ok, "absent")],
+)
+def test_the_git_layout_assertion_accepts_the_shapes_git_really_has(
+    tmp_path: Path, rel: str, shape: str
+) -> None:
+    """The other half of the table: the legitimate shapes - including ABSENT
+    (no `.git`, no index yet, and the `hooks` directory Eris never copies) -
+    must not refuse anything. A guard that refuses a real repository is worse
+    than no guard, because it gets removed."""
+    from eris.sanitize import GIT_REQUIRED_KINDS, assert_git_layout_sane
+
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    if rel != ".git":
+        _mkgit(copy)
+    if shape != "absent":
+        _plant(copy, rel, shape)
+    assert_git_layout_sane(copy)  # no raise
+    assert {"/".join(parts) for parts, _kind in GIT_REQUIRED_KINDS} == {
+        row[0] for row in LAYOUT_ROWS
+    }, "every GIT_REQUIRED_KINDS entry needs a LAYOUT_ROWS row"
+
+
+@pytest.mark.parametrize(
+    "rel,shape,reason",
+    [
+        (".git/hooks", "file", "expected a directory"),
+        (".git/index", "link-to-file", "is a symlink"),
+        (".git/config", "fifo", "not a regular file"),
+    ],
+)
+def test_a_planted_git_shape_refuses_the_whole_sanitize_run(
+    tmp_path: Path, rel: str, shape: str, reason: str
+) -> None:
+    """The same guard reached END TO END through `sanitize_snapshot`, not just
+    called directly: a `.git/hooks` that is a FILE and a `.git/index` that is
+    an in-tree SYMLINK both survive the copier (hooks is skipped only as a
+    DIRECTORY; an in-tree link is kept by design), and a fifo is refused by the
+    copier's own check. No copy is handed to anything."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    _plant(original, rel, shape)
+    with pytest.raises(SanitizeError, match=reason):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
 
 
 def test_a_copy_with_read_only_directories_is_still_removable(tmp_path: Path) -> None:

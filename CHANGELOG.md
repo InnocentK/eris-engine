@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.3.8 - the `.git/config` control fails closed, and a general layout guard (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
+cross-family stop-time review of `731ee2f` found the FIFTH consecutive hole in
+the same control (the verification tripwire and its copy): "symlinked
+`.git/config` bypasses the new neutralisation." Correct, and the pattern is the
+finding. The four before it were an excluded `.git/index` path, a missing
+semantic index check, missing index flag bits, and the fsmonitor-valid bit -
+four different KINDS of hole in one control. Each was patched individually.
+
+The common shape: **a path Eris reasons about is not the thing git actually
+reads.** `neutralise_git_config` did `if cfg.is_symlink() or not cfg.is_file():
+return False` - it failed OPEN. Eris `lstat`ed and gave up; git followed the
+link and honoured `core.fsmonitor` from its target.
+
+Fixed
+* **The `.git/config` control fails CLOSED.** A config that is a symlink
+  resolving INSIDE the copy to a regular file is read, unlinked and REPLACED by
+  a regular file holding the neutralised bytes, recorded in `dropped_symlinks`.
+  Every other shape - a link escaping the copy root, a dangling link, a link to
+  a directory or a fifo, a fifo, a directory - RAISES `SanitizeError` naming the
+  path and the reason. A link that escapes or dangles in the ORIGINAL is dropped
+  by the copier first, which legitimately leaves nothing to inherit; that case
+  still proceeds with no config.
+* **The target is never written through** (the docstring's promise, now
+  enforced): containment is decided on the REALPATH, the read carries
+  `O_NOFOLLOW | O_NONBLOCK` (a link to a fifo fails the type check instead of
+  blocking the run forever), the link is re-`lstat`ed and must still be the same
+  dev+inode immediately before the `unlink`, and the replacement is created
+  `O_CREAT | O_EXCL | O_NOFOLLOW`. No pre-existing path, anywhere, is opened for
+  writing.
+* **A general post-sanitisation assertion, which is the point of this change.**
+  `assert_git_layout_sane` checks every path in `GIT_REQUIRED_KINDS` - `.git`
+  (directory or the gitlink FILE), `.git/config` (file), `.git/index` (file),
+  `.git/hooks` (directory) - by `lstat`, never following a link. ABSENT is
+  always allowed. Anything else refuses the copy. A path Eris comes to depend on
+  is ONE line there plus one row in `LAYOUT_ROWS`, and the test asserts the two
+  sets are EQUAL, so a new path with no test row fails the suite.
+* `neutralise_git_config` now returns `ConfigNeutralisation(rewritten,
+  replaced_symlink)` instead of a bare `bool`; `_neutralised_bytes` is factored
+  out so the symlink-replacement path and the ordinary path share exactly one
+  parser.
+
+Honest limits (not fixed, stated)
+* The assertion is a TYPE check on a FIXED list. It says nothing about the
+  CONTENT of those files, nothing about `.git` paths not on the list (`HEAD`,
+  `refs/`, `objects/`, `info/`, `commondir`, `objects/info/alternates`,
+  `modules/`), and nothing outside `.git`. In-tree symlinks elsewhere in the
+  snapshot are still kept by design.
+* It runs ONCE, at the end of sanitisation. Nothing re-checks the layout between
+  verification commands; a command that replaced `.git/config` with a symlink
+  mid-run would be caught by the guard's tree hash (which records link targets),
+  not by this.
+* An in-copy `.git/config` symlink is REPAIRED rather than refused, because the
+  copier legitimately preserves in-tree links. If that repair is ever wrong, it
+  is wrong in the direction of a working, neutralised copy.
+
+Tests
+* `test_sanitize.py::test_a_symlinked_git_config_inside_the_copy_is_replaced_never_followed`,
+  `::test_a_git_config_symlink_escaping_the_copy_is_dropped_and_never_read`
+  (parametrized over `/etc/passwd`, an absolute path outside the tree, and a
+  relative escape; the target's size, mtime and mode are asserted unchanged),
+  `::test_neutralise_refuses_every_config_shape_it_cannot_reason_about`
+  (6 shapes), `::test_the_git_layout_assertion_refuses_every_non_regular_shape`
+  and `::test_the_git_layout_assertion_accepts_the_shapes_git_really_has` (the
+  table, both directions), `::test_a_planted_git_shape_refuses_the_whole_
+  sanitize_run` (reached end to end through `sanitize_snapshot`).
+* `::test_the_config_replacement_refuses_a_link_that_changed_under_it` swaps the
+  link between the read and the unlink (the TOCTOU the realpath check alone
+  would not close) and
+  `::test_a_git_path_that_cannot_be_read_or_stat_ed_refuses_the_copy` covers the
+  errno branches: an errno that is not "absent" is never treated as absent.
+* `test_verify_real_git.py::test_a_symlinked_config_cannot_smuggle_an_fsmonitor_into_the_verification_copy`:
+  a real repository whose `.git/config` is an in-tree symlink setting
+  `core.fsmonitor` to a tracked hook. git resolves the monitor through the link
+  in the SOURCE; in the copy the config is a regular file reading `false`, the
+  battery runs clean, and two `git status` refreshes leave every entry `H` -
+  nothing is ever marked fsmonitor valid. The original keeps its link and its
+  setting, tree hash unchanged.
+
 ## 0.3.7 - the fsmonitor chain: `-f` in the digest, fsmonitor off in the copy (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
