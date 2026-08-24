@@ -388,24 +388,6 @@ def test_verification_copy_matches_the_original_except_hooks_config_and_escaping
     assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
 
 
-def _core_values(text: str, key: str) -> list[str]:
-    """Every value `git config --get-all core.<key>` would see, in file order:
-    a plain textual read of a config file, so the test does not need a git."""
-    out: list[str] = []
-    in_core = False
-    for raw in text.splitlines():
-        body = raw.strip()
-        if body.startswith("["):
-            in_core = body[1:].split("]", 1)[0].strip().lower() == "core"
-            continue
-        if not in_core or body.startswith(("#", ";")) or not body:
-            continue
-        name, _, value = body.partition("=")
-        if name.strip().lower() == key.lower():
-            out.append(value.strip() if _ else "true")
-    return out
-
-
 def _names(raw: bytes) -> list[str]:
     """`section[.subsection].key` of every entry Eris's parser finds."""
     from eris.sanitize import parse_git_config
