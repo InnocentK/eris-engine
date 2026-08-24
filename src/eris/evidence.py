@@ -291,7 +291,20 @@ GUARD_EXCLUDED_RELPATHS: frozenset[str] = frozenset({".git/index", ".git/index.l
 # `--stage` digest byte-identical and moves the `-s -v` digest). The letter is
 # NOT a working-tree comparison: an unstaged edit, and the stat refresh, both
 # leave it `H`, so this costs no false positive.
-GIT_INDEX_DIGEST_ARGS: tuple[str, ...] = (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v")
+#
+# `-f` is the third flag, for the same reason `-v` is the second: `-v` alone is
+# blind to the per-entry FSMONITOR-VALID bit, which makes git treat a file as
+# unchanged. git-ls-files(1): "-f  Similar to -t, but use lowercase letters for
+# files that are marked as fsmonitor valid". Measured 2026-08-24, git 2.50.1
+# (`test_verify_real_git.py::test_every_index_mutation_trips_the_guard`, the
+# two fsmonitor cases): with a `core.fsmonitor` hook returning a real token,
+# `update-index --fsmonitor-valid`/`--no-fsmonitor-valid` move the `-s -v -f`
+# digest and leave the `-s -v` digest byte-identical. Without an active
+# fsmonitor the bit cannot be stored at all and `-f` prints exactly what `-v`
+# prints, so this costs no false positive and no extra spawn - and the
+# verification copy unsets `core.fsmonitor` anyway (`eris.sanitize`), which is
+# what keeps a live daemon from marking entries valid mid-run.
+GIT_INDEX_DIGEST_ARGS: tuple[str, ...] = (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v", "-f")
 
 # What the guard is doing about `.git/index` for a given run.
 INDEX_CHECK_SEMANTIC = "semantic"

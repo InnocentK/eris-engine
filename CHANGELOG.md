@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.3.7 - the fsmonitor chain: `-f` in the digest, fsmonitor off in the copy (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
+cross-family stop-time review of `0f121d8` found what 0.3.6 left: the
+enumeration omitted git's behaviour-changing FSMONITOR-VALID entry bit.
+`git update-index --fsmonitor-valid <path>` sets a documented per-entry bit that
+makes git treat the file as unchanged, and `ls-files -v` does NOT show it - only
+`-f` does (git-ls-files(1): "-f  Similar to -t, but use lowercase letters for
+files that are marked as fsmonitor valid").
+
+Measured (this machine, git 2.50.1, 2026-08-24; the suite re-measures it). The
+bit only persists with an ACTIVE monitor returning a real update token, which is
+why the first attempt to reproduce it looked like a dead end:
+
+| state | `update-index --fsmonitor-valid` | `ls-files -s -v` | `ls-files -s -v -f` |
+|---|---|---|---|
+| no `core.fsmonitor` | exits 0, stores NOTHING | unchanged | unchanged |
+| hook printing nothing | `warning: Empty last update token`, all bits cleared | unchanged | unchanged |
+| hook emitting a v2 token | the bit PERSISTS | **unchanged (SILENT)** | moves |
+| the same, then `--no-fsmonitor-valid` | the bit is cleared | **unchanged (SILENT)** | moves |
+| second refresh of a fresh copy, monitor on | git marks every entry valid ITSELF | unchanged | moves |
+
+Fixed
+* **`GIT_INDEX_DIGEST_ARGS` is now `ls-files -s -v -f`.** Same single spawn, no
+  schema change, strictly more coverage: without an active monitor `-f` prints
+  exactly what `-v` prints, so it costs no false positive and the quiet battery
+  stays quiet (re-measured). `check_command` refuses `-f` exactly as it refuses
+  `-s`/`-v`/`--stage`, so the digest stays off the model-facing allowlist.
+* **The enumeration grew two REAL cases, not two comments.**
+  `test_verify_real_git.py::test_every_index_mutation_trips_the_guard` now
+  installs a `core.fsmonitor` hook that emits a v2 update token, primes it
+  (two refreshes on a fresh copy: the first writes the token, the second marks
+  entries valid), and asserts that `--fsmonitor-valid` and
+  `--no-fsmonitor-valid` both trip the guard with `reason: "git_index"`.
+  Dropping `-f` makes both cases fail.
+* **The verification copy no longer inherits a filesystem monitor.**
+  `sanitize.neutralise_git_config` removes `core.fsmonitor` and
+  `core.untrackedCache` from the COPY's `.git/config` and appends an explicit
+  `[core]` block setting both to `false`. Removing `.git/hooks` was not enough:
+  `core.fsmonitor` may name any path in the repository. The removal handles
+  case, bare keys and backslash-continued values; the appended block, being the
+  last section, also covers a value pulled in by an `include`. **The ORIGINAL is
+  never opened for writing**, and the edit happens while the copy is being
+  built - before the guard takes its baseline and before any verification
+  command runs. This is a behaviour change to a security-relevant control and it
+  earns its keep in both directions: left on, a monitor marks index entries
+  fsmonitor-valid BY ITSELF on the second refresh of a fresh copy, which the new
+  digest reports as a `snapshot.violated` that no verification command caused
+  (verification would halt for the run); and a stale cache lets a command answer
+  from data the working tree no longer supports.
+
+Documented (`docs/SECURITY.md`): fsmonitor is out of the flat "nothing catches
+these" row and into an honest chain - ENABLING it is caught by the tree hash
+(`.git/config` is hashed and is not in `GUARD_EXCLUDED_RELPATHS`), the per-entry
+valid bit is caught by the digest via `-f`, the `FSMN` section and its token are
+caught by nothing, and the copy now starts with the setting off. The
+verification copy's "differs from a raw `cp -a` in exactly two documented ways"
+becomes THREE, in `docs/SECURITY.md`, `docs/INVARIANTS.md` (two rows) and the
+`VERIFICATION_PROFILE` docstring; the untracked cache stays uncaught but is now
+neutralised the same way.
+
 ## 0.3.6 - the index digest now sees the index FLAG BITS (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The

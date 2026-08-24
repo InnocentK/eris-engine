@@ -708,12 +708,12 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
 ) -> None:
     """M2c item 4: fixed Eris-internal argv on the POLICY-PINNED git with the
     Eris git globals - and deliberately NOT through `check_command`, which
-    refuses `-s`/`-v` (neither is an allowlisted flag).
+    refuses `-s`/`-v`/`-f` (none is an allowlisted flag).
 
-    The follow-up pins the FLAGS themselves: `-s -v`, not `--stage`. `--stage`
-    alone is blind to the index flag bits (`--skip-worktree`,
-    `--assume-unchanged`) - see
-    `test_verify_real_git.py::test_every_index_mutation_trips_the_guard`."""
+    The follow-up pins the FLAGS themselves: `-s -v -f`, not `--stage`.
+    `--stage` alone is blind to the index flag bits (`--skip-worktree`,
+    `--assume-unchanged`) and `-v` alone is blind to the fsmonitor-valid bit -
+    see `test_verify_real_git.py::test_every_index_mutation_trips_the_guard`."""
     from eris.evidence import GIT_ERIS_GLOBALS, GIT_INDEX_DIGEST_ARGS, git_index_prober
     from eris.verify import check_command
 
@@ -723,7 +723,7 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
     digest = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
         root
     )
-    assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v")
+    assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v", "-f")
     argv, kw = popen.calls[0]
     assert argv == [
         str(Path(policy.verify.commands["git"].executable).resolve()),
@@ -731,12 +731,13 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
         "ls-files",
         "-s",
         "-v",
+        "-f",
     ]
     assert kw["cwd"] == str(root.resolve())
     assert digest == hashlib.sha256(b"H 100644 abc 0\tcalc.py\n").hexdigest()
     # the same argv as a MODEL request would be refused - hence "not the allowlist"
-    assert not check_command(["git", "ls-files", "-s", "-v"], policy, root).allowed
-    for flag in ("-s", "-v", "--stage"):
+    assert not check_command(["git", "ls-files", "-s", "-v", "-f"], policy, root).allowed
+    for flag in ("-s", "-v", "-f", "--stage"):
         assert not check_command(["git", "ls-files", flag], policy, root).allowed, flag
 
 

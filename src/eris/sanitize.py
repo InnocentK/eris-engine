@@ -19,8 +19,10 @@ Rules (each has a test in tests/test_sanitize.py):
   when relative, resolving inside the original tree and not into a stripped
   entry; every other symlink is DROPPED and recorded.
 * ``.git`` is copied with ``.git/hooks`` removed (``core.hooksPath`` is
-  neutralised by the launcher's git hardening). A snapshot without ``.git``
-  is fine.
+  neutralised by the launcher's git hardening) and, in the COPY's
+  ``.git/config`` only, ``core.fsmonitor`` and ``core.untrackedCache``
+  disabled (:func:`neutralise_git_config`). A snapshot without ``.git`` is
+  fine.
 * The copy lives in a ``make_private_dir`` under the run's scratch dir and
   is deleted in ``finally``; a cleanup failure raises
   :class:`SanitizeCleanupError` (the caller records a ``run.error``).
@@ -53,6 +55,27 @@ from eris.schemas import (
 
 GIT_DIR = ".git"
 GIT_HOOKS = (GIT_DIR, "hooks")
+GIT_CONFIG = (GIT_DIR, "config")
+
+#: ``core.*`` keys neutralised in the COPY's ``.git/config`` (lower-cased; git
+#: config keys are case-insensitive). Both make git answer from a filesystem
+#: cache instead of from the working tree, and both are inherited verbatim by a
+#: `cp -a` of a repository that configures them.
+NEUTRALISED_GIT_CONFIG_KEYS: tuple[str, ...] = ("fsmonitor", "untrackedcache")
+
+#: Appended to the copy's ``.git/config`` after the matching entries are
+#: removed. Removal alone is not enough: `.git/config` may `include` another
+#: file, and a later section wins in git's config order, so an explicit
+#: trailing ``[core]`` block is what actually guarantees the value.
+GIT_CONFIG_NEUTRALISED_BLOCK = (
+    "# eris: this is a private VERIFICATION/worker COPY, never the original.\n"
+    "# Filesystem-monitor caches are disabled here so that no daemon or hook\n"
+    "# can mark index entries valid mid-run and no stale cache can answer for\n"
+    "# the working tree. See docs/SECURITY.md.\n"
+    "[core]\n"
+    "\tfsmonitor = false\n"
+    "\tuntrackedCache = false\n"
+)
 
 
 class SanitizeError(RuntimeError):
@@ -225,6 +248,10 @@ def sanitize_snapshot(
             if not stat.S_ISREG(st.st_mode):
                 raise SanitizeError(f"{rel}: not a regular file, directory or symlink; refusing")
             shutil.copy2(src, dest / rel, follow_symlinks=False)  # new inode, never a hardlink
+    # BEFORE the directory modes are restored (a read-only `.git` would forbid
+    # the write) and before anything is handed to a caller, so the copy is
+    # already neutralised when the first command runs against it
+    neutralise_git_config(dest)
     # deepest first: a directory's mode may forbid writing, so it is applied
     # only once everything below it exists (fidelity, cond 4)
     for src_dir, copy_dir in reversed(made_dirs):
@@ -237,6 +264,63 @@ def sanitize_snapshot(
         stripped=sorted(stripped, key=lambda e: e.relpath),
         dropped_symlinks=sorted(dropped),
     )
+
+
+def neutralise_git_config(copy_root: Path) -> bool:
+    """Disable the inherited filesystem-monitor caches in the COPY's
+    ``.git/config``. Returns True when the file was rewritten.
+
+    **The original is never opened for writing here** - the argument is the
+    copy's root, and every path used is under it.
+
+    `core.fsmonitor` and `core.untrackedCache` are the two settings that make
+    git answer from a cache instead of from the working tree. Inherited by a
+    raw copy of a repository that configures them, they are a problem in both
+    directions: a live daemon (or a hook) can mark index entries fsmonitor-valid
+    *during* a verification run, which the index digest would report as a
+    violation that no verification command caused, and a stale cache can let a
+    command answer from data the tree no longer supports.
+
+    Matching entries are dropped (including any backslash-continued value), and
+    an explicit ``[core]`` block setting both to ``false`` is appended: a later
+    section wins in git's config order, so the appended block also covers a
+    value pulled in by an ``include``/``includeIf`` directive earlier in the
+    file. A ``.git`` with no regular ``config`` file (no repository, or a
+    gitlink) is left alone - nothing was inherited.
+
+    Bytes in, bytes out: the file is never decoded, so a non-UTF-8 or CRLF
+    config round-trips unchanged apart from the removed lines.
+    """
+    cfg = Path(copy_root).joinpath(*GIT_CONFIG)
+    if cfg.is_symlink() or not cfg.is_file():
+        return False
+    kept: list[bytes] = []
+    in_core = False
+    dropping = False
+    for line in cfg.read_bytes().splitlines(keepends=True):
+        body = line.strip()
+        if dropping:  # a continued value belongs to the key that was dropped
+            dropping = body.endswith(b"\\")
+            continue
+        if body.startswith(b"["):
+            # `[core]`, `[ CORE ]`; `[core "sub"]` is a different section
+            in_core = body[1:].split(b"]", 1)[0].strip().lower() == b"core"
+        elif in_core and not body.startswith((b"#", b";")):
+            key = body.split(b"=", 1)[0].strip().lower()
+            if key in tuple(k.encode("ascii") for k in NEUTRALISED_GIT_CONFIG_KEYS):
+                dropping = body.endswith(b"\\")
+                continue
+        kept.append(line)
+    out = b"".join(kept)
+    if out and not out.endswith((b"\n", b"\r")):
+        out += b"\n"
+    out += GIT_CONFIG_NEUTRALISED_BLOCK.encode("ascii")
+    mode = cfg.stat().st_mode
+    if not mode & stat.S_IWUSR:  # a read-only config in the copy is still ours
+        cfg.chmod(stat.S_IMODE(mode) | stat.S_IWUSR)
+    cfg.write_bytes(out)
+    cfg.chmod(stat.S_IMODE(mode))  # the copy keeps the original's file mode
+    return True
 
 
 def _collect(path: Path, original: Path) -> list[StrippedEntry]:
@@ -277,18 +361,25 @@ VERIFICATION_PROFILE = SanitizeProfile(frozenset(), frozenset())
 """The profile used for the copy mechanical verification runs in, so a command
 that executes repository code (a trusted ``pytest``) can never touch the
 original. It strips NO instruction files - verification must see the repository
-as it is - and differs from a raw ``cp -a`` in exactly two ways, both inherited
-from :func:`sanitize_snapshot` and both deliberate:
+as it is - and differs from a raw ``cp -a`` in exactly three ways, all
+inherited from :func:`sanitize_snapshot` and all deliberate:
 
 1. ``.git/hooks`` is not copied. Our allowlist runs ``git``, and a repository
    hook would execute on the first ``git`` invocation.
-2. A symlink that is absolute, dangling, or resolves outside the tree is
+2. The copy's ``.git/config`` has ``core.fsmonitor`` and
+   ``core.untrackedCache`` removed and explicitly set to ``false``
+   (:func:`neutralise_git_config`), so an inherited filesystem monitor cannot
+   mark index entries valid mid-run and no stale cache can answer for the
+   working tree. The ORIGINAL's config is never opened for writing, and the
+   edit happens while the copy is being built - before any verification
+   command, and before the guard takes its baseline.
+3. A symlink that is absolute, dangling, or resolves outside the tree is
    dropped and recorded in ``dropped_symlinks``; links that stay inside are
    copied with their target string intact.
 
-Everything else - the file set, the bytes, the modes, `.git` itself - is
+Everything else - the file set, the bytes, the modes, the rest of `.git` - is
 identical to the original (``test_sanitize.py::test_verification_copy_
-matches_the_original_except_hooks_and_escaping_links``)."""
+matches_the_original_except_hooks_config_and_escaping_links``)."""
 
 
 # O_NOFOLLOW | O_DIRECTORY makes the chmod target unambiguous (never a symlink,

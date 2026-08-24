@@ -1,11 +1,13 @@
 """eris.sanitize: strip list (minimum, any depth, case-insensitive), copy
-semantics (new inodes, symlink rules, .git without hooks), the original is
+semantics (new inodes, symlink rules, .git without hooks and with
+`core.fsmonitor`/`core.untrackedCache` neutralised), the original is
 untouched, the copy is what agy gets as --add-dir, cleanup in finally."""
 
 from __future__ import annotations
 
 import os
 import shutil
+import stat
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -42,6 +44,16 @@ def build_original(tmp_path: Path) -> Path:
         ".github/workflows/ci.yml": "kept\n",
         "sub/.cursor/x": "cursor\n",
         ".git/HEAD": "ref: refs/heads/main\n",
+        # a repository that already uses a filesystem monitor: the copy must
+        # neutralise it (`neutralise_git_config`), the original must not move
+        ".git/config": (
+            "[core]\n"
+            "\trepositoryformatversion = 0\n"
+            "\tfsmonitor = .git/hooks/fsmonitor-watchman\n"
+            "\tuntrackedCache = true\n"
+            '[remote "origin"]\n'
+            "\turl = https://example.invalid/r.git\n"
+        ),
         ".git/refs/heads/main": "a" * 40 + "\n",
         ".git/hooks/pre-commit": "#!/bin/sh\necho hook\n",
         ".git/AGENTS.md": "inside .git: not stripped, not loaded\n",
@@ -141,10 +153,13 @@ def test_sanitize_strips_minimum_and_leaves_the_original_untouched(tmp_path: Pat
         return (
             (not s.startswith(".git/") and PROFILE.matches(rel))
             or rel.parts[:2] == (".git", "hooks")
+            or rel.parts[:2] == (".git", "config")  # rewritten: fsmonitor off
             or s in dropped
         )
 
-    assert tree_sha256(copy) == tree_sha256(original, skip=skip)
+    # `.git/config` is skipped on BOTH sides: it is the one file the copy
+    # rewrites (see test_the_copy_disables_an_inherited_fsmonitor_and_...)
+    assert tree_sha256(copy, skip=skip) == tree_sha256(original, skip=skip)
     # kept symlinks are symlinks in the copy with the same relative target
     assert os.readlink(copy / "link-inside") == "README.md"
     assert os.readlink(copy / "link-dir") == "src" and (copy / "link-dir" / "app.py").is_file()
@@ -257,13 +272,14 @@ def test_tree_sha256_is_order_independent_and_sees_symlink_targets(tmp_path: Pat
     assert h3 != h1 and tree_sha256(a, skip=lambda r: r.name == "l") != h3
 
 
-def test_verification_copy_matches_the_original_except_hooks_and_escaping_links(
+def test_verification_copy_matches_the_original_except_hooks_config_and_escaping_links(
     tmp_path: Path,
 ) -> None:
     """cond 4: the verification copy is NOT a sanitized copy - it keeps every
-    instruction file - and differs from a raw copy only by `.git/hooks` and
-    dropped escaping/dangling symlinks. File set, bytes, modes and the targets
-    of kept symlinks are identical."""
+    instruction file - and differs from a raw copy only by `.git/hooks`, the
+    neutralised `.git/config` (M2c follow-up 3) and dropped escaping/dangling
+    symlinks. File set, bytes, modes and the targets of kept symlinks are
+    otherwise identical."""
     from eris.sanitize import VERIFICATION_PROFILE
 
     original = build_original(tmp_path)
@@ -305,15 +321,163 @@ def test_verification_copy_matches_the_original_except_hooks_and_escaping_links(
     expected = {
         rel: v
         for rel, v in original_entries.items()
-        if not rel.startswith(".git/hooks") and rel not in dropped
+        if not rel.startswith(".git/hooks") and rel != ".git/config" and rel not in dropped
     }
-    assert rel_entries(copy) == expected  # identical modulo the two documented exceptions
+    assert {k: v for k, v in rel_entries(copy).items() if k != ".git/config"} == expected
+    # ... and the third exception is the config, whose MODE is still identical
+    kind, meta = rel_entries(copy)[".git/config"]
+    assert kind == "file" and meta.split(":")[0] == original_entries[".git/config"][1].split(":")[0]
     assert oct((copy / "odd-mode-dir").stat().st_mode) == oct(
         (original / "odd-mode-dir").stat().st_mode
     )
     assert oct((copy / "src").stat().st_mode) == oct((original / "src").stat().st_mode)
     assert oct(copy.stat().st_mode) == oct(original.stat().st_mode)  # the root too
     assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
+
+
+def _core_values(text: str, key: str) -> list[str]:
+    """Every value `git config --get-all core.<key>` would see, in file order:
+    a plain textual read of a config file, so the test does not need a git."""
+    out: list[str] = []
+    in_core = False
+    for raw in text.splitlines():
+        body = raw.strip()
+        if body.startswith("["):
+            in_core = body[1:].split("]", 1)[0].strip().lower() == "core"
+            continue
+        if not in_core or body.startswith(("#", ";")) or not body:
+            continue
+        name, _, value = body.partition("=")
+        if name.strip().lower() == key.lower():
+            out.append(value.strip() if _ else "true")
+    return out
+
+
+def test_the_copy_disables_an_inherited_fsmonitor_and_untracked_cache(tmp_path: Path) -> None:
+    """M2c follow-up 3, item 2: a snapshot taken from a repository that already
+    configures `core.fsmonitor`/`core.untrackedCache` arrives with those
+    settings inside `.git/config`. In the COPY they are removed and explicitly
+    set to `false`; the ORIGINAL is never written.
+
+    Both directions matter. A live monitor can mark index entries
+    fsmonitor-valid DURING a run, which the `-s -v -f` digest would report as a
+    violation no verification command caused; and a stale cache lets a command
+    answer from data the working tree no longer supports."""
+    from eris.sanitize import GIT_CONFIG_NEUTRALISED_BLOCK, VERIFICATION_PROFILE
+
+    original = build_original(tmp_path)
+    before_bytes = (original / ".git" / "config").read_bytes()
+    before_hash, before_inodes = tree_sha256(original), inodes(original)
+    assert _core_values(before_bytes.decode(), "fsmonitor") == [".git/hooks/fsmonitor-watchman"]
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    text = (copy / ".git" / "config").read_text()
+    assert _core_values(text, "fsmonitor") == ["false"]  # the only surviving value
+    assert _core_values(text, "untrackedCache") == ["false"]
+    assert text.endswith(GIT_CONFIG_NEUTRALISED_BLOCK)
+    # everything else in the file is untouched, in order
+    assert "\trepositoryformatversion = 0\n" in text
+    assert '[remote "origin"]\n\turl = https://example.invalid/r.git\n' in text
+    # THE ORIGINAL IS NEVER MODIFIED
+    assert (original / ".git" / "config").read_bytes() == before_bytes
+    assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
+
+
+def test_the_config_neutralisation_survives_odd_spellings_includes_and_continuations(
+    tmp_path: Path,
+) -> None:
+    """Item 2, the parsing: git config keys and section names are
+    case-insensitive, a bare key means `true`, a value may be continued with a
+    trailing backslash, and an `include` can pull the setting in from another
+    file. The removal handles the first three; the APPENDED `[core]` block is
+    what covers the fourth - a later section wins in git's config order."""
+    from eris.sanitize import VERIFICATION_PROFILE, neutralise_git_config
+
+    original = tmp_path / "o"
+    (original / ".git").mkdir(parents=True)
+    (original / "keep.txt").write_text("k\n")
+    (original / ".git" / "config").write_text(
+        "[CORE]\n"
+        "\tFsMonitor\n"  # bare key = true
+        "\tUNTRACKEDCACHE = tr\\\n"
+        "ue\n"  # a continued value: both lines must go
+        "\t# fsmonitor = a comment, not a setting\n"
+        "\tbare = 1\n"
+        '[core "sub"]\n'
+        "\tfsmonitor = not-core.fsmonitor\n"  # a different section: kept
+        "[include]\n"
+        "\tpath = extra\n"
+    )
+    (original / ".git" / "extra").write_text("[core]\n\tfsmonitor = from-the-include\n")
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    text = (copy / ".git" / "config").read_text()
+    assert "FsMonitor\n" not in text and "UNTRACKEDCACHE" not in text and "ue\n" not in text
+    assert "\tbare = 1\n" in text  # an unrelated core key survives
+    assert "# fsmonitor = a comment, not a setting" in text  # comments are not settings
+    assert "fsmonitor = not-core.fsmonitor" in text  # `[core "sub"]` is another section
+    assert "\tpath = extra\n" in text  # the include itself is left alone
+    # the include still sets it - and the appended block, being LAST, wins
+    assert (copy / ".git" / "extra").read_text() == (original / ".git" / "extra").read_text()
+    assert text.rstrip().endswith("untrackedCache = false")
+    assert _core_values(text, "fsmonitor")[-1] == "false"
+    # idempotent: neutralising an already-neutralised copy adds nothing new
+    assert neutralise_git_config(copy) is True
+    assert _core_values((copy / ".git" / "config").read_text(), "fsmonitor") == ["false"]
+
+
+@pytest.mark.parametrize("shape", ["no-git", "git-without-config", "config-is-a-symlink"])
+def test_a_copy_with_nothing_to_neutralise_is_left_alone(tmp_path: Path, shape: str) -> None:
+    """Item 2: no `.git`, a `.git` with no config file (a gitlink, or not a
+    repository) or a config that is a SYMLINK - nothing was inherited and
+    nothing is written. A symlink is never followed: writing through it could
+    leave the copy."""
+    from eris.sanitize import VERIFICATION_PROFILE, neutralise_git_config
+
+    original = tmp_path / "o"
+    original.mkdir()
+    (original / "keep.txt").write_text("k\n")
+    if shape != "no-git":
+        (original / ".git").mkdir()
+        (original / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    if shape == "config-is-a-symlink":
+        (original / ".git" / "real").write_text("[core]\n\tfsmonitor = true\n")
+        os.symlink("real", original / ".git" / "config")
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    assert neutralise_git_config(copy) is False
+    if shape == "config-is-a-symlink":
+        assert (copy / ".git" / "config").is_symlink()
+        assert (copy / ".git" / "real").read_text() == "[core]\n\tfsmonitor = true\n"
+    else:
+        assert not (copy / ".git" / "config").exists()
+
+
+def test_the_neutralised_config_keeps_a_read_only_file_mode(tmp_path: Path) -> None:
+    """Item 2: the rewrite restores the copy's file mode, so a repository that
+    ships a read-only `.git/config` still copies faithfully (cond 4 modes) -
+    and a config with no trailing newline does not run into the appended
+    block."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    (original / ".git").mkdir(parents=True)
+    (original / ".git" / "config").write_text('[remote "o"]\n\turl = x')  # no final newline
+    (original / ".git" / "config").chmod(0o444)
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    text = (copy / ".git" / "config").read_text()
+    assert stat.S_IMODE((copy / ".git" / "config").stat().st_mode) == 0o444
+    assert text.startswith('[remote "o"]\n\turl = x\n# eris')  # a newline was supplied
+    assert _core_values(text, "fsmonitor") == ["false"]
 
 
 def test_a_copy_with_read_only_directories_is_still_removable(tmp_path: Path) -> None:
