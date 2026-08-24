@@ -1309,6 +1309,93 @@ def test_a_scratch_entry_appearing_after_the_precheck_refuses_before_any_ledger(
     assert entry.is_dir() and (entry / "not-ours").read_text() == "planted"  # untouched
 
 
+def test_a_writer_open_failure_reports_a_scratch_it_could_not_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer refuses (the run already has a ledger) and the reservation is
+    handed back - but the removal FAILS. No ledger is open, so there is no
+    ``run.error`` to carry it: the failure must appear in BOTH remaining
+    channels, the structured stderr line naming the scratch AND the returned
+    outcome, which stops being a clean refusal (worker-visible files remain)."""
+    import eval.run as run_module
+
+    w = world(tmp_path)
+    (w["runs"] / "taken").mkdir(parents=True)
+    (w["runs"] / "taken" / "events.jsonl").write_bytes(b"")  # RunExists without --resume
+
+    def broken_rmtree(path: Any, *a: Any, **k: Any) -> None:
+        raise OSError(f"EBUSY {path}")
+
+    monkeypatch.setattr(run_module.shutil, "rmtree", broken_rmtree)
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="taken", panel="grok"),
+        out=out,
+        err=err,
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    scratch = tmp_path / "cache" / "scratch" / "taken"
+    summary = json.loads(out.getvalue())
+    # channel 1: the outcome. The writer's own reason is still named, and the
+    # exit code is the run error, not the clean EXIT_CONFIG refusal it was.
+    assert rc == EXIT_RUN_ERROR, summary
+    assert summary["status"] == "exists"
+    assert "exists; pass resume=True" in summary["error"]
+    assert "scratch cleanup failed" in summary["error"] and "EBUSY" in summary["error"]
+    # channel 2: the structured stderr line, naming the path of the leftover
+    lines = [json.loads(x) for x in err.getvalue().splitlines() if "scratch_cleanup_failed" in x]
+    assert lines == [
+        {
+            "status": "error",
+            "kind": "scratch_cleanup_failed",
+            "run_id": "taken",
+            "scratch": str(scratch),
+            "error": f"{scratch}: EBUSY {scratch}",
+        }
+    ]
+    assert scratch.is_dir()  # the leftover is real, and both channels say so
+
+
+def test_a_scratch_root_cleanup_failure_never_replaces_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_scratch_root`` removes the scratch in a ``finally``. Raising there
+    would DISCARD the exception already propagating - the refusal, the writer
+    error, the interrupt - and report a leftover directory in its place. With
+    something in flight the cleanup failure goes to stderr and the ORIGINAL
+    propagates; with nothing in flight it is raised, exactly as before."""
+    import eval.run as run_module
+
+    from eris.writer import RunExists
+
+    def broken_rmtree(path: Any, *a: Any, **k: Any) -> None:
+        raise OSError(f"EBUSY {path}")
+
+    monkeypatch.setattr(run_module.shutil, "rmtree", broken_rmtree)
+    (tmp_path / "scratch").mkdir()
+    in_flight, err = tmp_path / "scratch" / "r1", io.StringIO()
+    with pytest.raises(RunExists, match="the writer refused"):  # the REASON, not the cleanup
+        with run_module._scratch_root(in_flight, err):
+            raise RunExists("the writer refused")
+    assert [json.loads(x) for x in err.getvalue().splitlines()] == [
+        {
+            "status": "error",
+            "kind": "scratch_cleanup_failed",
+            "run_id": "r1",
+            "scratch": str(in_flight),
+            "error": f"EBUSY {in_flight}",
+        }
+    ]
+    assert in_flight.is_dir()  # named, not silently leaked
+    # nothing in flight: the cleanup failure IS the failure, and still raises
+    clean, err2 = tmp_path / "scratch" / "r2", io.StringIO()
+    with pytest.raises(OSError, match="EBUSY"), run_module._scratch_root(clean, err2):
+        pass
+    assert err2.getvalue() == ""
+
+
 def test_a_post_scan_failure_is_durable_in_the_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
