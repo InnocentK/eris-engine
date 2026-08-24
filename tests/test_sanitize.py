@@ -1144,3 +1144,64 @@ def test_the_original_is_byte_identical_whatever_the_copy_does(tmp_path: Path, s
         assert (original / ".git" / "config").read_bytes() == before_config
         assert (original / ".git" / "objects" / "info" / "alternates").is_file()
         assert (original / ".git" / "config.worktree").is_file()
+
+
+@pytest.mark.parametrize(
+    ("shape", "rel"),
+    [
+        ("dir", "sub/.git"),  # a legacy EMBEDDED repository (no gitlink file)
+        ("file", "sub/.git"),  # a submodule/worktree gitlink
+        ("dir", "a/b/c/.git"),  # at depth, not just one level down
+        ("link", "sub/.git"),  # an in-tree symlink the copier legitimately keeps
+    ],
+)
+def test_a_nested_repository_anywhere_in_the_copy_is_refused(
+    tmp_path: Path, shape: str, rel: str
+) -> None:
+    """M2c follow-up 5, advisor round. The config allowlist rewrites exactly
+    ONE file - the copy's own `.git/config`. A nested repository has its own,
+    Eris never rewrites it, and it may point outside the snapshot entirely
+    (measured: `test_verify_real_git.py::
+    test_a_nested_repository_pointing_outside_the_snapshot_refuses_the_copy`).
+
+    So ANY `.git` below the root refuses the copy, whatever its shape and at
+    whatever depth - a legacy embedded repository, a gitlink FILE, or a
+    symlink the copier would otherwise keep. Recursive sanitisation is not
+    attempted: refusing is the honest scope."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    nested = original / rel
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    (nested.parent / "keep.txt").write_text("k\n")
+    if shape == "dir":
+        nested.mkdir()
+        (nested / "HEAD").write_text("ref: refs/heads/main\n")
+        (nested / "config").write_text("[diff]\n\texternal = /tmp/evil.sh\n")
+    elif shape == "file":
+        nested.write_text("gitdir: ../../elsewhere/.git\n")
+    else:
+        (nested.parent / "real").mkdir()
+        os.symlink("real", nested)
+
+    with pytest.raises(SanitizeError, match=rel.replace(".", r"\.") + ": a NESTED repository"):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+def test_the_roots_own_git_is_not_a_nested_repository(tmp_path: Path) -> None:
+    """The other half: the guard must not refuse the repository it exists to
+    protect. The copy root's own `.git` is skipped, and a file merely NAMED
+    like one (`.gitignore`, `sub/.gitmodules`) is not a repository."""
+    from eris.sanitize import VERIFICATION_PROFILE, assert_no_nested_repositories
+
+    original = _mkgit(tmp_path / "o")
+    (original / ".gitignore").write_text("*.pyc\n")
+    (original / ".gitattributes").write_text("* text\n")
+    (original / "sub").mkdir()
+    (original / "sub" / ".gitmodules").write_text('[submodule "x"]\n')
+    (original / "sub" / ".gitkeep").write_text("")
+
+    copy = tmp_path / "c"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="v")
+    assert_no_nested_repositories(copy)  # no raise
+    assert (copy / "sub" / ".gitmodules").is_file()

@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.3.10 - nested repositories are refused (advisor round) (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched).
+The cross-family advisor BLOCKED 0.3.9 with a finding the coordinator then
+reproduced independently, and so did I before writing any of this.
+
+**The config allowlist rewrites exactly ONE file: the copy's own
+`.git/config`. A NESTED repository has its own, and Eris never sees it.**
+Measured 2026-08-24, git 2.50.1: an outer repository whose `sub/.git` is a
+FILE reading `gitdir: <outside the snapshot>`, with that external config
+carrying `diff.external`:
+
+| state of `sub` | `status --porcelain` | `diff HEAD` | `status --porcelain=v2` |
+|---|---|---|---|
+| not in the index | no execution | no execution | no execution |
+| registered as a gitlink (mode 160000) | **EXECUTED** | **EXECUTED** | **EXECUTED** |
+
+No `.gitmodules` was involved, and `GIT_MODULES` only covered top-level
+`.git/modules`. Nothing Eris rewrites, deletes or hashes could have helped:
+the config that executes belongs to a repository outside the copy.
+
+Fixed
+* **`sanitize.assert_no_nested_repositories` refuses any `.git` below the copy
+  root** - whatever its shape (directory, gitlink file, symlink) and at
+  whatever depth. The root's own `.git` is skipped; a file merely named like
+  one (`.gitignore`, `.gitmodules`) is not a repository. Recursive
+  sanitisation is NOT attempted: it would mean rewriting a config tree of
+  unbounded depth, some of it outside the snapshot, and getting that wrong is
+  this bug again. Refusing is the honest scope.
+* **A gitlink in the INDEX refuses the verification run**, taken on the
+  guard's baseline from the `ls-files -s -v -f` output the tripwire already
+  spawns (`-s` prints the mode, so the signal is free - no new command, and
+  `GIT_INDEX_DIGEST_ARGS` is unchanged). This is the half the copier cannot
+  see: a submodule that is registered but NOT checked out leaves nothing on
+  disk, which is exactly what a non-recursive clone produces - and
+  `eris.snapshot` clones non-recursively, so a superproject would otherwise
+  arrive looking like an ordinary repository. Nothing can execute in that
+  state, so it is a SCOPE refusal, not a containment one, and it says so.
+* `git_index_prober` now returns `IndexProbeResult(digest, gitlinks)` instead
+  of a bare digest string. The digest, the argv and the `bytes_fallback`
+  behaviour are unchanged.
+
+Behaviour change an operator will notice
+* **A repository that uses submodules can no longer be verified at all** -
+  checked out or not. This is the largest scope reduction in the M2c
+  follow-ups and the one most likely to be felt: it shows up as a clean
+  refusal naming the path, never as a quiet half-verification.
+
 ## 0.3.9 - the verification copy's `.git` is contained: config by allowlist (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The

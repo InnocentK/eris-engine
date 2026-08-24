@@ -59,6 +59,7 @@ import pytest
 
 from eris.evidence import (
     PACK_COMMANDS,
+    NestedRepositoryRefused,
     SnapshotGuard,
     TaskSpec,
     VerifyEnv,
@@ -67,7 +68,7 @@ from eris.evidence import (
 )
 from eris.policy import Policy
 from eris.redact import Redactor
-from eris.sanitize import VERIFICATION_PROFILE, sanitize_snapshot
+from eris.sanitize import VERIFICATION_PROFILE, SanitizeError, sanitize_snapshot
 from eris.schemas import EvidenceKind
 from eris.writer import RunWriter
 
@@ -703,7 +704,8 @@ def test_the_index_digest_does_not_cover_the_index_extensions(
     assert (change.reason if change is not None else None) == reason
     # whatever the tree hash saw, it was never the extension: the digest is flat
     assert env.guard.probe is not None
-    assert env.guard.probe(repo) == env.guard.index_digest
+    probed = env.guard.probe(repo)
+    assert probed is not None and probed.digest == env.guard.index_digest
     changed_paths = {rel for rel, sha in _files(repo).items() if files_before.get(rel) != sha} | (
         files_before.keys() - _files(repo).keys()
     )
@@ -1126,3 +1128,120 @@ def test_the_object_format_extension_survives_the_rewrite(tmp_path: Path) -> Non
     head = _git(repo, git, "rev-parse", "HEAD").stdout.decode().strip()
     assert len(head) == 64  # a sha256 repository that still opens and answers
     assert _git(repo, git, "status", "--porcelain").stdout == b""
+
+
+# ------------- M2c follow-up 5, advisor round: NESTED repositories
+#
+# The config allowlist rewrites exactly ONE file: the copy's own `.git/config`.
+# A nested repository has its own, and Eris never sees it - it may not even be
+# inside the snapshot. Measured 2026-08-24 on git 2.50.1 and reproduced below.
+
+
+def _external_repo_with_an_evil_config(tmp_path: Path, git: Path, marker: Path) -> tuple[Path, str]:
+    """A repository OUTSIDE the snapshot whose config executes something.
+    Returns its root and its HEAD sha."""
+    ext = tmp_path / "elsewhere" / "work"
+    _evil_script(ext / "tools" / "evil", marker)
+    (ext / "n.txt").write_text("n\n")
+    _git(ext, git, "init", "-q", "-b", "main", ".")
+    _git(ext, git, "add", "-A")
+    _git(ext, git, "commit", "-qm", "n1")
+    _git(ext, git, "config", "diff.external", str(ext / "tools" / "evil"))
+    _git(ext, git, "config", "core.fsmonitor", str(ext / "tools" / "evil"))
+    return ext, _git(ext, git, "rev-parse", "HEAD").stdout.decode().strip()
+
+
+def test_a_nested_repository_pointing_outside_the_snapshot_refuses_the_copy(
+    tmp_path: Path,
+) -> None:
+    """The advisor's lead finding, measured 2026-08-24 on git 2.50.1 and the
+    reason the copy is refused rather than patched.
+
+    An outer repository whose `sub/.git` is a FILE reading
+    `gitdir: <somewhere else>`, with that EXTERNAL config carrying
+    `diff.external`:
+
+    * `sub` NOT registered in the index -> nothing executes;
+    * `sub` registered as a GITLINK (`update-index --add --cacheinfo
+      160000,<sha>,sub`) -> `status --porcelain`, `diff HEAD` and
+      `status --porcelain=v2` ALL EXECUTE the external program.
+
+    No `.gitmodules` is involved and `GIT_MODULES` only covers top-level
+    `.git/modules`, so nothing in the config allowlist can help: the config
+    that executes belongs to a repository Eris never copies. `sanitize_snapshot`
+    therefore REFUSES, before any verification command exists to be run."""
+    git = _git_executable()
+    marker = tmp_path / "EXECUTED"
+    ext, nested_head = _external_repo_with_an_evil_config(tmp_path, git, marker)
+
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    (source / "sub").mkdir()
+    (source / "sub" / "keep.txt").write_text("k\n")
+    (source / "sub" / ".git").write_text(f"gitdir: {ext / '.git'}\n")
+    _git(source, git, "update-index", "--add", "--cacheinfo", f"160000,{nested_head},sub")
+
+    # the vector is REAL: in the untouched ORIGINAL every one of these executes
+    for argv in (
+        ["--no-optional-locks", "status", "--porcelain"],
+        ["--no-optional-locks", "diff", "HEAD"],
+        ["--no-optional-locks", "status", "--porcelain=v2"],
+    ):
+        marker.unlink(missing_ok=True)
+        _git(source, git, *argv, check=False)
+        assert marker.exists(), argv
+    marker.unlink(missing_ok=True)
+
+    # ... and the copy is refused, so no verification command is ever built
+    copy = tmp_path / "verify-copy"
+    with pytest.raises(SanitizeError, match=r"sub/\.git: a NESTED repository"):
+        sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+    assert not marker.exists()  # nothing ran during the refusal either
+    assert (source / "sub" / ".git").is_file()  # the ORIGINAL is untouched
+    assert (ext / ".git" / "config").read_text().count("diff") == 1
+
+
+def test_a_gitlink_with_no_checkout_refuses_the_verification_run(tmp_path: Path) -> None:
+    """The other half of the same scope rule, and the only half git can answer.
+
+    A superproject whose submodule is NOT checked out has a gitlink in the
+    index and NOTHING on disk for the copier to find - which is exactly what a
+    non-recursive clone produces, and `eris.snapshot` clones non-recursively.
+    Nothing can execute in that state, so this is a SCOPE refusal, not a
+    containment one; it is taken on the guard's baseline, from the `ls-files -s
+    -v -f` output the tripwire already spawns, with no extra command."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    # any real object name works; git does not require the submodule to exist
+    head = _git(source, git, "rev-parse", "HEAD").stdout.decode().strip()
+    _git(source, git, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    assert not (source / "sub").exists()  # registered, never checked out
+
+    # the copier has nothing to refuse: there is no nested `.git` on disk
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    policy = _policy(tmp_path, git)
+    with pytest.raises(NestedRepositoryRefused, match=r"sub: the index registers 1 submodule"):
+        SnapshotGuard.over(repo, probe=git_index_prober(policy, tmp_path / "verify-home"))
+
+
+def test_the_gitlink_scan_reads_the_mode_out_of_the_digest_output(tmp_path: Path) -> None:
+    """The gitlink signal is free: `-s` already prints the mode, so it comes
+    out of the SAME spawn the digest needs. This pins that the probe reports
+    both, and that an ordinary repository reports no gitlinks at all."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    policy = _policy(tmp_path, git)
+    probe = git_index_prober(policy, tmp_path / "verify-home")
+
+    plain = probe(source)
+    assert plain is not None and plain.gitlinks == () and len(plain.digest) == 64
+
+    head = _git(source, git, "rev-parse", "HEAD").stdout.decode().strip()
+    _git(source, git, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    linked = probe(source)
+    assert linked is not None and linked.gitlinks == ("sub",)
+    assert linked.digest != plain.digest  # the digest still moves, as before

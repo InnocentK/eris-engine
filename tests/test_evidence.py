@@ -20,6 +20,7 @@ from eris.evidence import (
     ITEM_TAIL_BYTES,
     EvidenceCleanupError,
     EvidenceStopped,
+    IndexProbeResult,
     RequestState,
     TaskSpec,
     VerifyEnv,
@@ -598,17 +599,21 @@ def test_the_guard_still_trips_on_everything_but_the_git_index(
 
 
 class FakeIndexProbe:
-    """Stands in for `git ls-files -s -v`. The hermetic suite may not spawn
+    """Stands in for `git ls-files -s -v -f`. The hermetic suite may not spawn
     git, so the STAGED CONTENT is whatever this holder says it is; rewriting
-    ``digest`` is a staging change, leaving it alone is a stat refresh."""
+    ``digest`` is a staging change, leaving it alone is a stat refresh.
+    ``gitlinks`` stands in for submodule entries in the same output."""
 
-    def __init__(self, digest: str | None = "stage-0") -> None:
+    def __init__(self, digest: str | None = "stage-0", gitlinks: tuple[str, ...] = ()) -> None:
         self.digest = digest
+        self.gitlinks = gitlinks
         self.calls = 0
 
-    def __call__(self, root: Path) -> str | None:
+    def __call__(self, root: Path) -> IndexProbeResult | None:
         self.calls += 1
-        return self.digest
+        if self.digest is None:
+            return None
+        return IndexProbeResult(self.digest, self.gitlinks)
 
 
 def test_the_guard_trips_on_a_changed_index_digest_but_not_on_a_stat_refresh(
@@ -720,9 +725,12 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
     root = make_snapshot(tmp_path)
     policy = make_policy(tmp_path)
     popen = ScriptedPopen({"ls-files": b"H 100644 abc 0\tcalc.py\n"})
-    digest = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
+    result = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
         root
     )
+    assert result is not None
+    digest = result.digest
+    assert result.gitlinks == ()  # a plain file entry is not a submodule
     assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v", "-f")
     argv, kw = popen.calls[0]
     assert argv == [
@@ -955,3 +963,43 @@ def test_verify_scratch_is_private_removed_and_cleanup_failure_is_a_run_error(
     assert ev[-1]["kind"] == "run.error"
     assert ev[-1]["payload"]["kind"] == "verify_scratch_cleanup_failed"
     w.close()
+
+
+def test_a_gitlink_in_the_index_refuses_the_verification_run(tmp_path: Path) -> None:
+    """M2c follow-up 5, advisor round, the hermetic half. A gitlink entry means
+    the snapshot is a SUPERPROJECT; its submodules carry configs Eris never
+    rewrites. The guard refuses at BASELINE - before any verification command
+    exists - and names the paths. The signal costs no extra spawn: `-s` already
+    prints the mode in the digest output."""
+    from eris.evidence import INDEX_CHECK_SEMANTIC, NestedRepositoryRefused, SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    with pytest.raises(NestedRepositoryRefused, match=r"vendor/a, vendor/b: the index registers 2"):
+        SnapshotGuard.over(root, probe=FakeIndexProbe(gitlinks=("vendor/a", "vendor/b")))
+    # ... and an ordinary repository is not refused
+    assert SnapshotGuard.over(root, probe=FakeIndexProbe()).index_check == INDEX_CHECK_SEMANTIC
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        (b"H 100644 abc 0\tcalc.py\n", ()),
+        (b"H 160000 abc 0\tsub\n", ("sub",)),
+        (b"H 100644 abc 0\ta\nH 160000 def 0\tvendor/x\n", ("vendor/x",)),
+        (b"S 160000 abc 0\tsub\n", ("sub",)),  # any status letter
+        (b"h 160000 abc 0\tsub with spaces\n", ("sub with spaces",)),
+        (b"H 120000 abc 0\tlink\n", ()),  # a symlink entry is not a gitlink
+        (b"", ()),
+        (b"garbage\n", ()),  # a line that is not an entry is ignored
+        (b"H 160000 abc 0 no-tab\n", ()),  # ... and so is one with no path
+    ],
+)
+def test_the_gitlink_scan_reads_only_well_formed_entries(
+    stdout: bytes, expected: tuple[str, ...]
+) -> None:
+    """The scan is a SCOPE signal read off the digest output, so it is
+    deliberately conservative: only a `<letter> <mode> <sha> <stage>\\t<path>`
+    line counts. The DIGEST, not this, is what the tripwire relies on."""
+    from eris.evidence import _gitlink_paths
+
+    assert _gitlink_paths(stdout) == expected

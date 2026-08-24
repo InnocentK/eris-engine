@@ -376,6 +376,7 @@ def sanitize_snapshot(
         dropped.append(outcome.replaced_symlink)  # the link is gone from the copy
     assert_git_layout_sane(dest)  # nothing under `.git` is a shape Eris cannot reason about
     assert_no_repo_escapes(dest)  # ... and the copy is ONE self-contained repository
+    assert_no_nested_repositories(dest)  # ... with no OTHER repository inside it
     drop_git_repo_escapes(dest)  # alternates + per-worktree config never reach a worker
     # deepest first: a directory's mode may forbid writing, so it is applied
     # only once everything below it exists (fidelity, cond 4)
@@ -816,6 +817,55 @@ def assert_no_repo_escapes(copy_root: Path) -> None:
                 continue
             raise SanitizeError(f"{rel}: cannot be checked in the copy ({exc}); refusing") from exc
         raise SanitizeError(f"{rel}: is present in the copy; refusing the copy ({why})")
+
+
+def assert_no_nested_repositories(copy_root: Path) -> None:
+    """Refuse the copy when ANOTHER repository lives inside it: any ``.git``
+    below the copy root, whatever its shape.
+
+    M2c follow-up 5, advisor round. The config allowlist rewrites exactly ONE
+    file - the copy's own ``.git/config``. A nested repository has its own, and
+    Eris never sees it. Measured 2026-08-24 on git 2.50.1, with an outer repo
+    whose ``sub/.git`` is a FILE reading ``gitdir: /elsewhere/ext/work/.git``
+    and that EXTERNAL config carrying ``diff.external``:
+
+    * ``sub`` NOT registered in the outer index -> nothing executed;
+    * ``sub`` registered as a GITLINK (``update-index --add --cacheinfo
+      160000,<sha>,sub``) -> ``git --no-optional-locks status --porcelain``,
+      ``git diff HEAD`` and ``status --porcelain=v2`` ALL EXECUTED the external
+      program.
+
+    No ``.gitmodules`` was involved, and the gitdir was outside the copy
+    entirely, so nothing Eris rewrites, deletes or hashes could have helped.
+    The honest answer is to refuse: recursive sanitisation would mean rewriting
+    a config tree of unbounded depth, some of it outside the snapshot, and
+    getting it wrong is exactly this bug again.
+
+    The root's own ``.git`` is not a nested repository and is skipped; a
+    gitdir under it (``.git/modules/``) is refused by
+    :func:`assert_no_repo_escapes`. The INDEX side of the same scope rule - a
+    gitlink entry with no checked-out ``.git`` to find - is checked where git
+    is already running, on the verification guard's baseline
+    (``evidence.git_index_prober``): it is a superproject either way, but with
+    nothing to execute it is a scope refusal rather than a containment one."""
+    root = Path(copy_root)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        if base == root:
+            # the copy's OWN `.git` is the repository being verified
+            dirnames[:] = [d for d in dirnames if d != GIT_DIR]
+            names = [f for f in filenames if f != GIT_DIR]
+        else:
+            names = list(filenames)
+        for name in (*dirnames, *names):
+            if name == GIT_DIR:
+                rel = _rel(base / name, root).as_posix()
+                raise SanitizeError(
+                    f"{rel}: a NESTED repository is present in the copy; refusing the copy "
+                    "(Eris does not copy submodule or worktree repositories - their `.git` "
+                    "holds a config Eris never rewrites, and it may point outside the "
+                    "snapshot entirely)"
+                )
 
 
 def drop_git_repo_escapes(copy_root: Path) -> tuple[str, ...]:
