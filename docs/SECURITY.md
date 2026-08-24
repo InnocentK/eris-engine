@@ -282,7 +282,9 @@ directory, or a symlink named `AGENTS.md`). Files get new inodes (never
 hardlinks); symlinks are kept only when relative, resolving inside the tree
 and not into a stripped entry (every other link is dropped and recorded);
 `.git` is copied without `hooks` and with `core.fsmonitor`/`core.untrackedCache`
-neutralised in the COPY's `.git/config` (see the verification-copy section).
+neutralised in the COPY's `.git/config` (see the verification-copy section), a
+control that fails CLOSED (a non-regular config is replaced or refused, never
+skipped).
 `SnapshotSanitization` records the
 profile hash, the original's tree hash, the copy's tree hash, every stripped
 file (relpath, size, sha256) and every dropped link.
@@ -363,7 +365,10 @@ is not copied (our allowlist runs `git`, so a repository hook would fire on
 the first invocation); the COPY's `.git/config` has `core.fsmonitor` and
 `core.untrackedCache` removed and explicitly set to `false`; and a symlink
 that is absolute, dangling or resolves outside the tree is dropped and
-recorded. File set, bytes, FILE AND DIRECTORY modes (the copy root
+recorded
+An in-copy `.git/config` symlink is REPLACED by the neutralised regular file
+and recorded there too, and any other non-regular shape at a `.git` path Eris
+depends on refuses the copy (`assert_git_layout_sane`). File set, bytes, FILE AND DIRECTORY modes (the copy root
 included), kept symlink targets and the rest of `.git`
 are identical; a preserved read-only directory cannot wedge cleanup
 (owner write is restored on retry). `evidence.SnapshotGuard` compares the
@@ -391,6 +396,42 @@ a live monitor marks index entries fsmonitor-valid BY ITSELF on the second
 refresh of a fresh copy, which the index digest reports as a violation no
 verification command caused (verification would halt for the run); and a stale
 cache lets a command answer from data the working tree no longer supports.
+
+**And the neutralisation cannot be aliased away** (M2c follow-up 4, the FIFTH
+consecutive stop-time finding against this same control). `.git/config` that was
+not a regular file used to be skipped SILENTLY: a symlinked config bypassed
+every rule above, because git follows the link and honours `core.fsmonitor` from
+its target while Eris `lstat`ed and gave up. It now fails CLOSED. A link
+resolving INSIDE the copy to a regular file is read, unlinked and REPLACED by a
+regular file holding the neutralised bytes - the target is never written
+through: containment is decided on the REALPATH, the read carries
+`O_NOFOLLOW|O_NONBLOCK` (a link to a fifo fails the type check instead of
+blocking the run), the link is re-`lstat`ed and must still be the same dev+inode
+immediately before the `unlink`, and the replacement is created
+`O_CREAT|O_EXCL|O_NOFOLLOW`, so no pre-existing path anywhere is ever opened for
+writing. The replacement is recorded in `dropped_symlinks`. Every other shape -
+a link escaping the copy root, a dangling link, a link to a directory or fifo, a
+fifo, a directory - REFUSES the copy, naming the path and the reason. A link
+that escapes or dangles in the ORIGINAL is dropped by the copier before any of
+this, which legitimately leaves no config and nothing to inherit; that case
+still proceeds.
+
+**The general assertion (`sanitize.assert_git_layout_sane`).** Four of the five
+findings against this control were different KINDS of hole, so the fix is a
+guard, not another patch. After sanitisation, every path in `GIT_REQUIRED_KINDS`
+that Eris depends on must be the kind Eris assumes, or absent: `.git` a
+directory or a regular file (a worktree/submodule gitlink IS a file),
+`.git/config` a regular file, `.git/index` a regular file, `.git/hooks` a
+directory. Every check is an `lstat`, so a symlink is never followed and is
+never accepted for a path on the list; ABSENT is always allowed (no `.git`, no
+index yet, the `hooks` Eris deliberately does not copy). Anything else refuses
+the copy. Adding a path Eris comes to depend on is one line there and one row in
+the test table, and the test asserts the two sets are EQUAL - a new path with no
+row fails. **What it does not cover, stated:** it is a TYPE check on a fixed
+list, not a semantic one. It says nothing about the CONTENT of those files, says
+nothing about `.git` paths not on the list (`HEAD`, `refs/`, `objects/`,
+`info/`, `modules/`, `commondir`, `objects/info/alternates`), and nothing about
+a path outside `.git`. In-tree symlinks elsewhere are still kept by design.
 
 The guard has two halves, because one cannot do the job.
 

@@ -22,7 +22,11 @@ Rules (each has a test in tests/test_sanitize.py):
   neutralised by the launcher's git hardening) and, in the COPY's
   ``.git/config`` only, ``core.fsmonitor`` and ``core.untrackedCache``
   disabled (:func:`neutralise_git_config`). A snapshot without ``.git`` is
-  fine.
+  fine. That control FAILS CLOSED: a ``.git/config`` that is a symlink
+  resolving inside the copy is read, unlinked and replaced by a regular
+  neutralised file (recorded in ``dropped_symlinks``); any other shape refuses
+  the copy; and :func:`assert_git_layout_sane` then re-checks every ``.git``
+  path Eris depends on (:data:`GIT_REQUIRED_KINDS`).
 * The copy lives in a ``make_private_dir`` under the run's scratch dir and
   is deleted in ``finally``; a cleanup failure raises
   :class:`SanitizeCleanupError` (the caller records a ``run.error``).
@@ -36,6 +40,7 @@ CLIs load AUTOMATICALLY; it does not make a repository trustworthy.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -76,6 +81,35 @@ GIT_CONFIG_NEUTRALISED_BLOCK = (
     "\tfsmonitor = false\n"
     "\tuntrackedCache = false\n"
 )
+
+#: What each path under the copy's ``.git`` that Eris DEPENDS ON must be after
+#: sanitisation: ``"file"`` a regular file, ``"dir"`` a directory,
+#: ``"file_or_dir"`` either (``.git`` itself is a directory in a normal clone
+#: and a regular file - the gitlink - in a worktree or submodule). ABSENT is
+#: always allowed: a snapshot with no ``.git``, a repository with no ``index``
+#: yet, the ``hooks`` directory Eris deliberately never copies.
+#:
+#: Anything else - a symlink, a fifo, a socket, a device, a file where a
+#: directory belongs - REFUSES the copy (:func:`assert_git_layout_sane`).
+#: A symlink is the case that matters: git follows one, Eris's own checks
+#: ``lstat`` and do not, and that gap is exactly how a neutralisation or a
+#: tripwire gets bypassed. Adding a path Eris comes to depend on is ONE LINE
+#: here plus one row in ``test_sanitize.py::test_the_git_layout_assertion_
+#: refuses_every_non_regular_shape``. The bar for adding one: Eris (or the
+#: guard) reads it AND a normal repository can only ever have it as that type.
+GIT_REQUIRED_KINDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    ((GIT_DIR,), "file_or_dir"),
+    (GIT_CONFIG, "file"),
+    ((GIT_DIR, "index"), "file"),
+    (GIT_HOOKS, "dir"),
+)
+
+_KIND_TEST: dict[str, Callable[[int], bool]] = {
+    "file": stat.S_ISREG,
+    "dir": stat.S_ISDIR,
+    "file_or_dir": lambda m: stat.S_ISREG(m) or stat.S_ISDIR(m),
+}
+_KIND_NAME = {"file": "a regular file", "dir": "a directory", "file_or_dir": "a file or directory"}
 
 
 class SanitizeError(RuntimeError):
@@ -251,7 +285,10 @@ def sanitize_snapshot(
     # BEFORE the directory modes are restored (a read-only `.git` would forbid
     # the write) and before anything is handed to a caller, so the copy is
     # already neutralised when the first command runs against it
-    neutralise_git_config(dest)
+    outcome = neutralise_git_config(dest)
+    if outcome.replaced_symlink is not None:
+        dropped.append(outcome.replaced_symlink)  # the link is gone from the copy
+    assert_git_layout_sane(dest)  # nothing under `.git` is a shape Eris cannot reason about
     # deepest first: a directory's mode may forbid writing, so it is applied
     # only once everything below it exists (fidelity, cond 4)
     for src_dir, copy_dir in reversed(made_dirs):
@@ -266,12 +303,166 @@ def sanitize_snapshot(
     )
 
 
-def neutralise_git_config(copy_root: Path) -> bool:
+@dataclass(frozen=True)
+class ConfigNeutralisation:
+    """What :func:`neutralise_git_config` did to the copy's ``.git/config``."""
+
+    rewritten: bool
+    #: The relpath of a SYMLINK that was replaced by the neutralised regular
+    #: file (``.git/config``), or None. Recorded in
+    #: ``SnapshotSanitization.dropped_symlinks``: the link is no longer in the
+    #: copy, and the run must be able to see that it was there.
+    replaced_symlink: str | None = None
+
+
+def _neutralised_bytes(raw: bytes) -> bytes:
+    """The neutralised content of a git config: matching ``[core]`` entries
+    (including a backslash-continued value) removed, the explicit block
+    appended. Bytes in, bytes out - never decoded, so a non-UTF-8 or CRLF
+    config round-trips unchanged apart from the removed lines."""
+    kept: list[bytes] = []
+    in_core = False
+    dropping = False
+    for line in raw.splitlines(keepends=True):
+        body = line.strip()
+        if dropping:  # a continued value belongs to the key that was dropped
+            dropping = body.endswith(b"\\")
+            continue
+        if body.startswith(b"["):
+            # `[core]`, `[ CORE ]`; `[core "sub"]` is a different section
+            in_core = body[1:].split(b"]", 1)[0].strip().lower() == b"core"
+        elif in_core and not body.startswith((b"#", b";")):
+            key = body.split(b"=", 1)[0].strip().lower()
+            if key in tuple(k.encode("ascii") for k in NEUTRALISED_GIT_CONFIG_KEYS):
+                dropping = body.endswith(b"\\")
+                continue
+        kept.append(line)
+    out = b"".join(kept)
+    if out and not out.endswith((b"\n", b"\r")):
+        out += b"\n"
+    return out + GIT_CONFIG_NEUTRALISED_BLOCK.encode("ascii")
+
+
+def _read_config_symlink_target(copy_root: Path, cfg: Path, link_st: os.stat_result) -> bytes:
+    """Bytes of the file a ``.git/config`` SYMLINK points at, refusing unless
+    the target resolves to a regular file INSIDE the copy root.
+
+    This is the only place a config that is not a regular file is read, and it
+    is where the docstring promise ("the original is never opened for writing")
+    is enforced for the replacement path: containment is decided on the
+    REALPATH, and the open carries ``O_NOFOLLOW`` so a component swapped for a
+    symlink between the resolve and the open fails instead of escaping. The
+    caller re-``lstat``s the link before unlinking it (identity unchanged) and
+    creates the replacement with ``O_CREAT | O_EXCL | O_NOFOLLOW``, so no
+    pre-existing path - here or anywhere - is ever opened for writing."""
+    rel = "/".join(GIT_CONFIG)
+    try:
+        target = cfg.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:  # dangling, or a symlink loop
+        raise SanitizeError(
+            f"{rel}: is a symlink that does not resolve ({exc}); refusing the copy"
+        ) from exc
+    root = Path(os.path.realpath(copy_root))
+    if target == root or not _is_under(target, root):
+        raise SanitizeError(
+            f"{rel}: is a symlink resolving to {target}, OUTSIDE the copy root {root}; "
+            "refusing the copy (the original is never written through)"
+        )
+    # O_NONBLOCK so a link to a FIFO fails the S_ISREG check below instead of
+    # blocking the whole run on a reader; it is a no-op for a regular file.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:  # ENXIO (a fifo with no writer), ELOOP, EACCES...
+        raise SanitizeError(
+            f"{rel}: is a symlink to {target}, which could not be read ({exc}); refusing the copy"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SanitizeError(
+                f"{rel}: is a symlink to {target}, which is {_describe(st.st_mode)}, "
+                "not a regular file; refusing the copy"
+            )
+        data = _read_all(fd)
+    finally:
+        os.close(fd)
+    now = cfg.lstat()  # the link must not have moved under us before we unlink
+    if not stat.S_ISLNK(now.st_mode) or (now.st_dev, now.st_ino) != (
+        link_st.st_dev,
+        link_st.st_ino,
+    ):
+        raise SanitizeError(f"{rel}: changed while it was being replaced; refusing the copy")
+    return data
+
+
+def _read_all(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _describe(mode: int) -> str:
+    for test, name in (
+        (stat.S_ISLNK, "a symlink"),
+        (stat.S_ISDIR, "a directory"),
+        (stat.S_ISFIFO, "a fifo"),
+        (stat.S_ISSOCK, "a socket"),
+        (stat.S_ISCHR, "a character device"),
+        (stat.S_ISBLK, "a block device"),
+        (stat.S_ISREG, "a regular file"),
+    ):
+        if test(mode):
+            return name
+    return "of an unknown type"  # pragma: no cover - no other POSIX file type exists
+
+
+def assert_git_layout_sane(copy_root: Path) -> None:
+    """Refuse the copy unless every path in :data:`GIT_REQUIRED_KINDS` is the
+    kind Eris assumes it is, or absent.
+
+    This is the GENERAL form of the same finding four times over (an excluded
+    `.git/index`, a missing semantic index check, missing index flag bits, the
+    fsmonitor-valid bit, a symlinked `.git/config`): a path Eris reasons about
+    is not the thing git actually reads. Every check is an ``lstat`` - a
+    symlink is never followed - and every failure names the path and the
+    reason."""
+    root = Path(copy_root)
+    for parts, kind in GIT_REQUIRED_KINDS:
+        rel = "/".join(parts)
+        try:
+            st = root.joinpath(*parts).lstat()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                continue  # absent (or under a gitlink FILE): nothing to reason about
+            raise SanitizeError(f"{rel}: cannot be checked in the copy ({exc}); refusing") from exc
+        if not _KIND_TEST[kind](st.st_mode):
+            raise SanitizeError(
+                f"{rel}: is {_describe(st.st_mode)} in the copy, expected {_KIND_NAME[kind]} "
+                "or nothing; refusing the copy"
+            )
+
+
+def neutralise_git_config(copy_root: Path) -> ConfigNeutralisation:
     """Disable the inherited filesystem-monitor caches in the COPY's
-    ``.git/config``. Returns True when the file was rewritten.
+    ``.git/config``.
 
     **The original is never opened for writing here** - the argument is the
     copy's root, and every path used is under it.
+
+    The control FAILS CLOSED. A ``.git/config`` that exists but is not a
+    regular file used to be skipped silently while git followed it happily:
+    a symlinked config is a complete bypass of everything below. Now, an
+    in-copy symlink to a regular file is READ, UNLINKED and REPLACED by a
+    regular file holding the neutralised bytes (never written through, and
+    recorded in ``dropped_symlinks``); every other shape - a symlink escaping
+    the copy, a dangling one, a fifo, a device, a directory - RAISES
+    :class:`SanitizeError`. A link that escapes or dangles in the ORIGINAL is
+    dropped by the copier before this runs, which legitimately leaves no config
+    and nothing to inherit.
 
     `core.fsmonitor` and `core.untrackedCache` are the two settings that make
     git answer from a cache instead of from the working tree. Inherited by a
@@ -291,36 +482,43 @@ def neutralise_git_config(copy_root: Path) -> bool:
     Bytes in, bytes out: the file is never decoded, so a non-UTF-8 or CRLF
     config round-trips unchanged apart from the removed lines.
     """
+    rel = "/".join(GIT_CONFIG)
     cfg = Path(copy_root).joinpath(*GIT_CONFIG)
-    if cfg.is_symlink() or not cfg.is_file():
-        return False
-    kept: list[bytes] = []
-    in_core = False
-    dropping = False
-    for line in cfg.read_bytes().splitlines(keepends=True):
-        body = line.strip()
-        if dropping:  # a continued value belongs to the key that was dropped
-            dropping = body.endswith(b"\\")
-            continue
-        if body.startswith(b"["):
-            # `[core]`, `[ CORE ]`; `[core "sub"]` is a different section
-            in_core = body[1:].split(b"]", 1)[0].strip().lower() == b"core"
-        elif in_core and not body.startswith((b"#", b";")):
-            key = body.split(b"=", 1)[0].strip().lower()
-            if key in tuple(k.encode("ascii") for k in NEUTRALISED_GIT_CONFIG_KEYS):
-                dropping = body.endswith(b"\\")
-                continue
-        kept.append(line)
-    out = b"".join(kept)
-    if out and not out.endswith((b"\n", b"\r")):
-        out += b"\n"
-    out += GIT_CONFIG_NEUTRALISED_BLOCK.encode("ascii")
-    mode = cfg.stat().st_mode
+    try:
+        st = cfg.lstat()  # never stat(): a symlink must not be followed
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return ConfigNeutralisation(False)  # no repository, or a gitlink
+        raise SanitizeError(f"{rel}: cannot be checked in the copy ({exc}); refusing") from exc
+    replaced: str | None = None
+    if stat.S_ISLNK(st.st_mode):
+        raw = _read_config_symlink_target(copy_root, cfg, st)
+        mode = 0o644  # a fresh regular file: the LINK's mode says nothing
+        os.unlink(cfg)  # unlink never follows: the target keeps its bytes
+        replaced = rel
+    elif not stat.S_ISREG(st.st_mode):
+        raise SanitizeError(
+            f"{rel}: is {_describe(st.st_mode)} in the copy, not a regular file; "
+            "refusing the copy (git would still read it)"
+        )
+    else:
+        raw = cfg.read_bytes()
+        mode = stat.S_IMODE(st.st_mode)
+    out = _neutralised_bytes(raw)
+    # O_EXCL for the replacement (there is nothing at the path), O_NOFOLLOW
+    # everywhere: no pre-existing file and no symlink is ever opened for
+    # writing, so the write cannot leave the copy.
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_EXCL if replaced is not None else os.O_TRUNC
     if not mode & stat.S_IWUSR:  # a read-only config in the copy is still ours
-        cfg.chmod(stat.S_IMODE(mode) | stat.S_IWUSR)
-    cfg.write_bytes(out)
-    cfg.chmod(stat.S_IMODE(mode))  # the copy keeps the original's file mode
-    return True
+        cfg.chmod(mode | stat.S_IWUSR)
+    fd = os.open(cfg, flags, mode | stat.S_IWUSR)
+    try:
+        os.write(fd, out)
+    finally:
+        os.close(fd)
+    cfg.chmod(mode)  # the copy keeps the original's file mode
+    return ConfigNeutralisation(True, replaced)
 
 
 def _collect(path: Path, original: Path) -> list[StrippedEntry]:
@@ -375,7 +573,11 @@ inherited from :func:`sanitize_snapshot` and all deliberate:
    command, and before the guard takes its baseline.
 3. A symlink that is absolute, dangling, or resolves outside the tree is
    dropped and recorded in ``dropped_symlinks``; links that stay inside are
-   copied with their target string intact.
+   copied with their target string intact - except an in-copy ``.git/config``
+   link, which is replaced by the neutralised regular file (item 2 must not be
+   bypassable by an alias) and recorded there too. Any other non-regular
+   ``.git`` path Eris depends on refuses the copy
+   (:func:`assert_git_layout_sane`).
 
 Everything else - the file set, the bytes, the modes, the rest of `.git` - is
 identical to the original (``test_sanitize.py::test_verification_copy_
