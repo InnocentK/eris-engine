@@ -40,11 +40,39 @@ right.
 
 ## How work is done
 
-**Trivial changes** (docs typos, a pinned version bump with a green gate):
-read the files, make the change, run `task ci`, report.
+Match the process to the change. Assurance is not free: the full loop below
+costs roughly half a million tokens in review overhead alone, so spending it
+on a contained change buys polish at the price of work not done elsewhere.
+Pick the tier honestly — and when the tier is unclear, say which one you chose
+and why before starting.
 
-**Non-trivial work** (new module, protocol change, anything touching the
-launcher, redactor, writer, allowlist, snapshot builder, or policy):
+| Tier | What it covers | Process |
+|---|---|---|
+| **Trivial** | docs, comments, a pinned version bump, a golden regenerated for an already-approved schema change | Read the files, change them, run the gate, report. No agents. |
+| **Contained** | one module, no new trust boundary, no protocol or schema change — e.g. adding a worker adapter, a new allowlist entry, a scorer metric | Write a short spec (selected design + rejected alternatives + the tests it needs), implement in one worktree, run **one** advisor pass, gate, decision record. **No planner fan-out.** |
+| **Structural** | a new trust boundary, a protocol or schema change, anything touching the launcher, redactor, writer, allowlist, snapshot builder, policy, or the adversarial protocol itself | The full six-step loop below. |
+
+Two rules that apply to every tier:
+
+- **Advisor iteration is capped at two rounds** (one deep review → fix
+  everything → one confirmation). After that, merge and file the remainder as
+  a follow-up milestone — unless a finding is a safety regression, which
+  always blocks. Rounds three and four have historically returned real but
+  narrow findings at full cost; that trade is not worth making by default.
+- **Evidence before process.** A cheap experiment that settles a question
+  (running a CLI's real flags, one live plumbing run) comes BEFORE any
+  planning that would assume the answer. Twice now an experiment has
+  overturned a plan that four agents had already reviewed.
+
+Planner and reviewer output is capped at ~1,200 words: findings and
+disagreements only, no restating the brief and no re-verifying facts the brief
+already establishes with evidence. Never use a context-inheriting fork for
+critique — a fresh agent with a written brief gets the same adversarial value
+for a fraction of the cost. Mechanical sub-steps (capturing fixtures, writing
+docs from an approved spec, boilerplate scaffolding) may be delegated to a
+cheaper model.
+
+**The structural loop:**
 
 1. Obtain independent plans from four roles, run in parallel and blind to each
    other: an architecture planner, a security critic, a reliability/
