@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.3.5 - the verification tripwire now sees git index mutations (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; `snapshot.violated` is an
+EVENT, and `Event.payload` is a free-form `dict[str, Any]` - no golden is
+touched). A cross-family review of `920262d` found the gap the 0.3.4 fix left
+behind: `evidence.GUARD_EXCLUDED_RELPATHS` keeps `.git/index` out of the
+tripwire's hash, but the index is not inert. `git ls-files` reads it directly
+and `git diff`/`git status` compare against it, so a command that mutates it
+changes what LATER evidence reports - and the guard would not notice. The
+current allowlist cannot reach `git add`/`git rm`; the guard is defence in
+depth for the day it is wrong or is widened.
+
+Measured (this machine, git 2.50.1, 2026-08-24; `tests/test_verify_real_git.py`
+re-measures it in CI) - the exclusion cannot simply be removed. With
+`--no-optional-locks` on every invocation, `status --porcelain`, `ls-files`,
+`ls-files --stage`, `log --oneline`, `grep`, `blame`, `show` and `rev-parse`
+leave `.git/index` byte-identical, but the first command that reads the working
+tree against the index (`diff`, and `diff HEAD` too - the spec had this as bare
+`diff` only) refreshes it, flag or no flag. Hashing those bytes would trip the
+guard on a legitimate allowlisted command on every run. Meanwhile the digest of
+`git ls-files --stage` is stable across all of that and moves on `git add` and
+`git rm --cached` - and `git rm --cached` changes nothing else in the tree, so
+the byte hash alone cannot see it at all.
+
+Fixed
+* **`SnapshotGuard` gains a semantic git-index digest.** Whenever the
+  verification copy has a `.git` DIRECTORY, the guard digests
+  `git --no-optional-locks ls-files --stage` (`evidence.GIT_INDEX_DIGEST_ARGS`)
+  alongside the tree hash and compares it after every command. Either half
+  moving is `snapshot.violated` and stops verification. The event payload now
+  carries `reason` (`"tree"` or `"git_index"`; the index wins when both moved,
+  as it does for `git add`, which writes a loose object AND stages it),
+  `index_check`, and `git_index_digest_before` / `_after` next to the tree
+  hashes.
+* **The digest is an Eris-internal invocation.** Fixed argv, the POLICY-PINNED
+  `git` (hash re-checked at call time; unpinned, missing or since-changed
+  yields no digest and is never spawned), the hardened verify env. It does NOT
+  go through `check_command`: it is neither proposed nor influenced by a model,
+  and the allowlist would refuse `--stage` anyway.
+* **Fail closed.** A copy with a `.git` directory and no usable digest (git
+  unavailable, non-zero exit, timeout, truncated output, or a probe that stops
+  working part way through the run) drops the byte exclusion for that run,
+  hashes `.git/index` like any other file, and records
+  `index_check: "bytes_fallback"`. A copy with no `.git` directory records
+  `index_check: "none"`. The check is never silently skipped.
+* `GUARD_EXCLUDED_RELPATHS` is UNCHANGED - still exactly `.git/index` and
+  `.git/index.lock`, still pinned by
+  `test_evidence.py::test_the_guard_excluded_set_is_exactly_the_git_index`, and
+  now commented with both the reason it exists and the digest that covers it.
+
+`tests/test_verify_real_git.py` grows the real-git half: the default battery
+plus a bare `git diff` and `git diff HEAD` run clean with the semantic check
+armed, and a real `git add` of a modified file and a real `git rm --cached`
+both trip the guard with `reason: "git_index"`. Removing the semantic check
+makes both staging tests fail (the `rm --cached` case does not trip at all).
+
 ## 0.3.4 - first live plumbing run: two defects fixed (2026-08-23)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; every committed golden is

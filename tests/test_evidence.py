@@ -589,11 +589,237 @@ def test_the_guard_still_trips_on_everything_but_the_git_index(
     from eris.evidence import SnapshotGuard
 
     root = make_snapshot(tmp_path)
-    guard = SnapshotGuard.over(root)
+    # a WORKING semantic index check: that is what licenses the byte exclusion
+    guard = SnapshotGuard.over(root, probe=FakeIndexProbe())
     target = root / written
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("changed by a verification command\n")
     assert (guard.changed() is not None) is trips
+
+
+class FakeIndexProbe:
+    """Stands in for `git ls-files --stage`. The hermetic suite may not spawn
+    git, so the STAGED CONTENT is whatever this holder says it is; rewriting
+    ``digest`` is a staging change, leaving it alone is a stat refresh."""
+
+    def __init__(self, digest: str | None = "stage-0") -> None:
+        self.digest = digest
+        self.calls = 0
+
+    def __call__(self, root: Path) -> str | None:
+        self.calls += 1
+        return self.digest
+
+
+def test_the_guard_trips_on_a_changed_index_digest_but_not_on_a_stat_refresh(
+    tmp_path: Path,
+) -> None:
+    """M2c item 1: `.git/index` is excluded BY BYTES because a read-only git
+    rewrites it, and covered SEMANTICALLY so a staging change is still seen."""
+    from eris.evidence import INDEX_CHECK_SEMANTIC, SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    probe = FakeIndexProbe()
+    guard = SnapshotGuard.over(root, probe=probe)
+    assert guard.index_check == INDEX_CHECK_SEMANTIC and guard.index_digest == "stage-0"
+
+    (root / ".git" / "index").write_bytes(b"a refreshed stat cache")  # legitimate churn
+    assert guard.changed() is None
+
+    probe.digest = "stage-1"  # the staged content itself moved (git add / rm --cached)
+    change = guard.changed()
+    assert change is not None
+    assert change.reason == "git_index" and change.index_digest_after == "stage-1"
+
+
+def test_an_index_change_that_also_moves_the_tree_is_reported_as_git_index(
+    tmp_path: Path,
+) -> None:
+    """`git add` writes a loose object AND stages it, so both halves move.
+    The reason must name the index: it is the specific, security-relevant
+    half, and `test_verify_real_git.py` asserts exactly that against a real
+    `git add`."""
+    from eris.evidence import SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    probe = FakeIndexProbe()
+    guard = SnapshotGuard.over(root, probe=probe)
+    obj = root / ".git" / "objects" / "ab" / "cdef0123"
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(b"a new loose object")
+    probe.digest = "stage-1"
+    change = guard.changed()
+    assert change is not None and change.reason == "git_index"
+
+
+def test_a_guard_without_a_usable_git_falls_back_to_hashing_the_index_bytes(
+    tmp_path: Path,
+) -> None:
+    """M2c item 2: FAIL CLOSED. No semantic digest means the byte exclusion is
+    dropped for that run - never a silently skipped check."""
+    from eris.evidence import INDEX_CHECK_BYTES_FALLBACK, SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    (root / ".git" / "index").write_bytes(b"stat cache v1")
+    for guard in (
+        SnapshotGuard.over(root),  # no probe at all
+        SnapshotGuard.over(root, probe=FakeIndexProbe(None)),  # git unavailable/failed
+    ):
+        assert guard.index_check == INDEX_CHECK_BYTES_FALLBACK and guard.index_digest is None
+        assert guard.changed() is None
+        (root / ".git" / "index").write_bytes(b"stat cache v2")
+        change = guard.changed()
+        assert change is not None and change.reason == "tree"  # the bytes ARE hashed now
+        (root / ".git" / "index").write_bytes(b"stat cache v1")
+
+
+def test_a_probe_that_stops_working_mid_run_trips_the_guard(tmp_path: Path) -> None:
+    """Fail closed the other way too: a digest that can no longer be taken is
+    a change, not a pass."""
+    from eris.evidence import SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    probe = FakeIndexProbe()
+    guard = SnapshotGuard.over(root, probe=probe)
+    probe.digest = None
+    change = guard.changed()
+    assert change is not None and change.reason == "git_index"
+    assert change.index_digest_after is None
+
+
+def test_a_copy_without_a_git_directory_needs_no_index_check(tmp_path: Path) -> None:
+    """M2c item 1: the digest is taken only when the copy has a `.git` dir -
+    there is no index to guard otherwise, and no fallback to justify."""
+    from eris.evidence import INDEX_CHECK_NONE, SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    shutil.rmtree(root / ".git")
+    probe = FakeIndexProbe()
+    guard = SnapshotGuard.over(root, probe=probe)
+    assert guard.index_check == INDEX_CHECK_NONE and guard.probe is None and probe.calls == 0
+    assert guard.changed() is None
+    (root / "PLANTED").write_text("x")
+    change = guard.changed()
+    assert change is not None and change.reason == "tree"
+
+
+def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
+    tmp_path: Path,
+) -> None:
+    """M2c item 4: fixed Eris-internal argv on the POLICY-PINNED git with the
+    Eris git globals - and deliberately NOT through `check_command`, which
+    refuses `--stage` (it is not an allowlisted flag)."""
+    from eris.evidence import GIT_ERIS_GLOBALS, GIT_INDEX_DIGEST_ARGS, git_index_prober
+    from eris.verify import check_command
+
+    root = make_snapshot(tmp_path)
+    policy = make_policy(tmp_path)
+    popen = ScriptedPopen({"ls-files": b"100644 abc 0\tcalc.py\n"})
+    digest = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
+        root
+    )
+    assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "--stage")
+    argv, kw = popen.calls[0]
+    assert argv == [
+        str(Path(policy.verify.commands["git"].executable).resolve()),
+        "--no-optional-locks",
+        "ls-files",
+        "--stage",
+    ]
+    assert kw["cwd"] == str(root.resolve())
+    assert digest == hashlib.sha256(b"100644 abc 0\tcalc.py\n").hexdigest()
+    # the same argv as a MODEL request would be refused - hence "not the allowlist"
+    assert not check_command(["git", "ls-files", "--stage"], policy, root).allowed
+
+
+@pytest.mark.parametrize("why", ["unpinned", "swapped-since-the-pin", "missing"])
+def test_the_index_prober_refuses_an_unpinned_or_changed_git(tmp_path: Path, why: str) -> None:
+    """M2c item 1: POLICY-PINNED. An unpinned, swapped or missing git yields
+    no digest (and is never spawned), which the guard turns into
+    `bytes_fallback`."""
+    from eris.evidence import INDEX_CHECK_BYTES_FALLBACK, SnapshotGuard, git_index_prober
+
+    root = make_snapshot(tmp_path)
+    policy = make_policy(tmp_path, pinned=why != "unpinned")
+    if why == "swapped-since-the-pin":
+        (tmp_path / "bin" / "git").write_bytes(b"#!/bin/sh\n# swapped\n")
+    if why == "missing":
+        (tmp_path / "bin" / "git").unlink()
+    popen = ScriptedPopen()
+    probe = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)
+    assert probe(root) is None, why
+    assert popen.calls == []
+    assert SnapshotGuard.over(root, probe=probe).index_check == INDEX_CHECK_BYTES_FALLBACK
+
+
+@pytest.mark.parametrize("failure", ["exit-code", "truncated-output", "spawn-raises"])
+def test_the_index_prober_yields_nothing_when_the_digest_command_fails(
+    tmp_path: Path, failure: str
+) -> None:
+    """A non-zero `ls-files --stage` (not a repository, broken index), output
+    the cap truncated, or a spawn that raises, is a failure to CHECK - never a
+    digest that would compare equal on the next call."""
+    from eris.evidence import git_index_prober
+
+    root = make_snapshot(tmp_path)
+    policy = make_policy(tmp_path, max_output_bytes=8)
+    popen: Any = ScriptedPopen(returncode=128 if failure == "exit-code" else 0)
+    if failure == "truncated-output":
+        popen = ScriptedPopen({"ls-files": b"x" * 4096})
+    if failure == "spawn-raises":
+
+        def popen(*_a: Any, **_kw: Any) -> Any:
+            raise OSError("no such executable")
+
+    probe = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)
+    assert probe(root) is None
+
+
+def test_snapshot_violated_names_the_half_that_moved_and_records_both_digests(
+    tmp_path: Path,
+) -> None:
+    """M2c item 1: the event says WHICH tripwire moved (`reason`), how the
+    index was checked (`index_check`), and carries both digests."""
+    from eris.evidence import SnapshotGuard
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = make_snapshot(tmp_path)
+    copy = tmp_path / "scratch" / "pristine"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+    probe = FakeIndexProbe()
+
+    class StagingPopen(ScriptedPopen):
+        def __call__(self, args: Any, **kw: Any) -> FakeProcess:
+            proc = super().__call__(args, **kw)
+            if "ls-files" in [os.fsdecode(a) for a in args]:
+                probe.digest = "stage-1"  # the command staged something
+            return proc
+
+    popen = StagingPopen()
+    env = make_env(tmp_path, copy, popen, make_policy(tmp_path))
+    env.guard = SnapshotGuard.over(copy, probe=probe)
+    w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
+    items = execute_evidence_requests(
+        [
+            EvidenceRequest(argv=["git", "ls-files"]),
+            EvidenceRequest(argv=["git", "rev-parse", "H"]),
+        ],
+        source="P1",
+        env=env,
+        writer=w,
+        state=RequestState(),
+        task_id="t_01",
+        stop_check=lambda: False,
+    )
+    w.close()
+    assert [i.violated for i in items] == [True]
+    payload = next(e["payload"] for e in events(w) if e["kind"] == "snapshot.violated")
+    assert payload["reason"] == "git_index"
+    assert payload["index_check"] == "semantic"
+    assert payload["git_index_digest_before"] == "stage-0"
+    assert payload["git_index_digest_after"] == "stage-1"
+    assert payload["tree_sha256_before"] == payload["tree_sha256_after"]  # only the index moved
+    assert len(popen.calls) == 1  # the second command never spawned
 
 
 def test_request_key_ignores_the_options_eris_appends(tmp_path: Path) -> None:
