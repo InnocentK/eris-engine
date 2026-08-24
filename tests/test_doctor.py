@@ -202,7 +202,7 @@ def test_bad_policy_and_env_file_states(tmp_path: Path) -> None:
     bad.write_text("workers: 1\n")
     report = run_doctor(policy_path=bad, env_file=tmp_path / ".env", home=tmp_path)
     assert not report.ok and by_name(report.render(), "policy").startswith("FAIL")
-    assert len(report.checks) == 2  # python + policy, then stop
+    assert len(report.checks) == 3  # python + user + policy, then stop
 
     exe = fake_exe(tmp_path)
     policy = write_policy(tmp_path, exe, pinned=True)
@@ -352,3 +352,48 @@ def test_cli_doctor(
     out = capsys.readouterr().out
     assert rc == 0 and "doctor: " in out and PLANTED not in out
     assert os.path.basename(str(exe)) in out
+
+
+def test_doctor_warns_when_the_account_name_cannot_be_resolved(tmp_path: Path) -> None:
+    """M2c defect A: CLI workers run with USER in their environment; claude
+    reports a valid login as "Not logged in" without it. An unresolvable
+    account is a WARN naming that symptom, never a silent omission."""
+    exe = fake_exe(tmp_path)
+    policy = write_policy(tmp_path, exe, pinned=True)
+    report = run_doctor(
+        policy_path=policy,
+        env_file=tmp_path / ".env",
+        home=tmp_path,
+        user_resolver=lambda: None,
+    )
+    line = by_name(report.render(), "user")
+    assert line.startswith("WARN") and "Not logged in" in line
+
+    report = run_doctor(
+        policy_path=policy,
+        env_file=tmp_path / ".env",
+        home=tmp_path,
+        user_resolver=lambda: "alice",
+    )
+    line = by_name(report.render(), "user")
+    assert line.startswith("OK") and "USER=alice" in line
+
+
+def test_doctor_probe_env_carries_the_resolved_user(tmp_path: Path) -> None:
+    exe = fake_exe(tmp_path)
+    policy = write_policy(tmp_path, exe, pinned=True)
+    seen: list[dict[str, str]] = []
+
+    def runner(argv: list[str], env: dict[str, str]) -> str | None:
+        seen.append(env)
+        return "1.0.0"
+
+    run_doctor(
+        policy_path=policy,
+        env_file=tmp_path / ".env",
+        home=tmp_path,
+        probe=True,
+        runner=runner,
+        user_resolver=lambda: "alice",
+    )
+    assert seen and seen[0]["USER"] == "alice"

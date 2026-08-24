@@ -12,6 +12,7 @@ import pytest
 import yaml
 from eval.run import default_run_id, main, run_dir_for, validate_run_id
 
+from eris.launch import resolve_user
 from eris.policy import UNPINNED
 from eris.validate import validate_events
 from tests.conftest import FakeProcessFactory
@@ -163,6 +164,10 @@ def test_invoke_full_path_is_hermetic_and_redacted(
     )
     assert inv["invocation_id"] == f"inv-{inv['idempotency_key'][:16]}-a1"  # F2: per attempt
     assert inv["env_names"] == sorted(inv["env_names"]) and "XAI_API_KEY" in inv["env_names"]
+    # M2c defect A: USER is part of the from-{} environment and is the
+    # harness's OWN resolved account (never a filtered os.environ read).
+    assert "USER" in inv["env_names"]
+    assert factory.instances[0].popen_kwargs["env"]["USER"] == resolve_user()
     # the worker saw the secret VALUE; the ledger never does
     assert factory.instances[0].popen_kwargs["env"]["XAI_API_KEY"] == PLANTED
     for path in run_dir.rglob("*"):

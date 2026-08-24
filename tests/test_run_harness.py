@@ -29,6 +29,7 @@ from eval.run import (
     sweep_scratch,
 )
 
+from eris.launch import resolve_user
 from eris.ledger import LedgerView
 from eris.schemas import Stage
 from tests.conftest import FakeProcess
@@ -328,6 +329,10 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
     assert grok_calls and all(
         kw["cwd"] != str(w["snapshot"]) and "sanitized-grok" in kw["cwd"] for kw in grok_calls
     )
+    # M2c defect A: every CLI worker spawned by the harness carries USER (the
+    # harness's own resolved account). Without it claude reports a valid login
+    # as "Not logged in"; the harness path must thread it, not just `invoke`.
+    assert all(kw["env"].get("USER") == resolve_user() for kw in grok_calls)
     verify_copy = str(
         (tmp_path / "cache" / "scratch" / "t_01-r0-indep_verify" / "verify-copy").resolve()
     )
@@ -979,6 +984,7 @@ def test_judge_workspace_is_fresh_per_iteration_and_checked_at_spawn(tmp_path: P
         stage=Stage.ADJUDICATE,
         repeat_index=0,
         policy_sha256="0" * 64,
+        user="testuser",
     )
     with pytest.raises(LaunchRefused, match="not empty"):
         assert_judge_workspace_empty(call)

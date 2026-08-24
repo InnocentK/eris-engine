@@ -24,7 +24,8 @@ tests/fixtures/envelopes/*/*.meta.json and docs/EVAL-PLAN.md):
   --output-format json [--json-schema S]``.
 
 Process hygiene: argv list, ``shell=False``, env built from ``{}`` (never a
-filtered ``os.environ``), ``stdin=DEVNULL``, ``cwd`` = snapshot realpath,
+filtered ``os.environ``; HOME/TMPDIR/USER are passed in explicitly - see
+:func:`build_env` for why ``USER`` is required), ``stdin=DEVNULL``, ``cwd`` = snapshot realpath,
 ``start_new_session=True``, process-group SIGTERM then SIGKILL on timeout,
 stdout AND stderr byte caps drained concurrently, ANSI stripped in the
 parsed text, pinned executable path + sha256 checked before spawn.
@@ -35,6 +36,7 @@ never a substitution. ``run_worker`` does not raise.
 
 from __future__ import annotations
 
+import getpass
 import json
 import math
 import os
@@ -371,6 +373,36 @@ PER_CLI_ENV: dict[str, dict[str, str]] = {
 }
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# A plausible account name: printable, no control characters, bounded.
+_USER_VALUE_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
+
+
+def _passwd_user() -> str:
+    """The account name from the POSIX passwd database. No environment is
+    consulted. Raises on Windows (no ``pwd``, no ``os.getuid``)."""
+    import pwd  # POSIX only; the caller falls back on ImportError/AttributeError
+
+    return str(pwd.getpwuid(os.getuid()).pw_name)
+
+
+def resolve_user() -> str | None:
+    """The account name Eris itself runs as, or ``None`` when it cannot be
+    determined.
+
+    Resolved from the OS, never from a filtered ``os.environ``: the passwd
+    database first, then :func:`getpass.getuser` as the portable fallback
+    (Windows has no ``pwd`` module; ``getpass`` reads ``USERNAME`` there).
+    A name with a control character or over 64 bytes is discarded rather than
+    smuggled into a subprocess environment.
+    """
+    for source in (_passwd_user, getpass.getuser):
+        try:
+            name = source()
+        except Exception:  # noqa: BLE001 - any failure just means "try the next source"
+            continue
+        if name and _USER_VALUE_RE.fullmatch(name):
+            return name
+    return None
 
 
 def assert_env_safe(env: Mapping[str, str]) -> None:
@@ -391,16 +423,31 @@ def build_env(
     path_env: str,
     home: str,
     tmpdir: str,
+    user: str | None,
     policy_env: Mapping[str, str] | None = None,
     secrets: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build the subprocess environment from ``{}``. ``os.environ`` is never
-    consulted; the caller passes HOME/TMPDIR explicitly."""
+    """Build the CLI-worker subprocess environment from ``{}``. ``os.environ``
+    is never consulted; the caller passes HOME/TMPDIR/USER explicitly.
+
+    ``USER`` is load-bearing, not cosmetic: the first live run (2026-08-23,
+    M2c) showed ``claude`` reporting "Not logged in - Please run /login" from
+    an environment that had HOME, PATH and TMPDIR but no ``USER``, while
+    ``claude auth status`` said ``loggedIn: true``. Adding ``USER`` alone
+    fixed it; ``LOGNAME`` and ``SHELL`` did not. It is an account name, not a
+    secret, and is on no NEVER list. ``None`` (unresolvable account) omits it
+    rather than inventing a value - ``eris doctor`` warns instead.
+
+    API workers do NOT get this environment: they are HTTP calls with no
+    subprocess, so there is nothing to authenticate by account name.
+    """
     env: dict[str, str] = {}
     env.update(BASE_ENV)
     env["PATH"] = path_env
     env["HOME"] = home
     env["TMPDIR"] = tmpdir
+    if user:
+        env["USER"] = user
     env.update(PER_CLI_ENV.get(cli, {}))
     for name, value in dict(policy_env or {}).items():
         env[name] = value
@@ -974,6 +1021,9 @@ class WorkerCall:
     stage: Stage
     repeat_index: int
     policy_sha256: str
+    # No default: every caller must decide what account the CLI runs as (see
+    # build_env; a silently missing USER presents as a bogus auth failure).
+    user: str | None
     schema: Mapping[str, Any] | None = None
     scratch_dir: Path | None = None
     home: str = "/nonexistent"
@@ -1086,6 +1136,7 @@ def plan_call(call: WorkerCall) -> Plan:
         path_env=call.path_env,
         home=call.home,
         tmpdir=call.tmpdir,
+        user=call.user,
         policy_env=w.env,
         secrets=secrets,
     )

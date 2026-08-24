@@ -620,6 +620,9 @@ class StageContext:
     scratch_dir: Path
     home: str
     path_env: str
+    # The account name CLI workers run as (eris.launch.resolve_user()); None
+    # when it cannot be resolved. No default: see launch.build_env.
+    user: str | None
     secrets: Mapping[str, str] = field(default_factory=dict)
     runner: WorkerRunner = run_worker
     judge_iteration: int = 0  # set by run_adjudicate; part of the judge's cwd
@@ -703,6 +706,7 @@ def build_call(ctx: StageContext, worker_id: str, role: str, prompt: RenderedPro
         scratch_dir=ctx.scratch_dir,
         home=ctx.home,
         tmpdir=str(ctx.scratch_dir / "tmp"),
+        user=ctx.user,
         path_env=ctx.path_env,
         secrets={k: v for k, v in ctx.secrets.items() if k in w.env_allow},
         snapshot_sha=ctx.snapshot_sha,
