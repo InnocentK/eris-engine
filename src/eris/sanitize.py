@@ -4,8 +4,11 @@ repository's instruction files removed.
 agy injects a declared workspace's ``AGENTS.md``/``GEMINI.md`` rules (A15)
 and grok was observed following repo instructions once (E1). Workers whose
 policy says ``sanitize_snapshot: true`` run their proposer/critic roles on a
-COPY built here; mechanical verification ALWAYS runs on the ORIGINAL
-(``eris.evidence`` takes the original root explicitly).
+COPY built here. Mechanical verification never runs in one of those STRIPPED
+copies, and it does not run in the original either: it runs in a separate
+private VERIFICATION copy, also built here (:data:`VERIFICATION_PROFILE`),
+which strips nothing from the working tree. ``eris.evidence`` takes whatever
+root it is given; the harness gives it that copy.
 
 Rules (each has a test in tests/test_sanitize.py):
 
@@ -25,8 +28,9 @@ Rules (each has a test in tests/test_sanitize.py):
   its ``http-`` twin and ``.git/config.worktree`` are deleted
   (:func:`drop_git_repo_escapes`); and a copy that is not ONE self-contained
   repository - a gitlink ``.git`` FILE, ``.git/commondir``,
-  ``.git/worktrees/``, ``.git/modules/`` - is REFUSED
-  (:func:`assert_no_repo_escapes`, :func:`assert_git_layout_sane`). A snapshot
+  ``.git/worktrees/``, ``.git/modules/``, or ANY nested ``.git`` below the root
+  - is REFUSED (:func:`assert_no_repo_escapes`,
+  :func:`assert_no_nested_repositories`, :func:`assert_git_layout_sane`). A snapshot
   without ``.git`` is fine. The config control FAILS CLOSED: a ``.git/config``
   that is a symlink resolving inside the copy is read, unlinked and replaced
   by a regular rewritten file (recorded in ``dropped_symlinks``); any other

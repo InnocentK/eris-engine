@@ -106,6 +106,35 @@ Fixed - a refusal now behaves like one, end to end
   `SanitizeCleanupError`, a SUBCLASS, is caught first and stays
   `EXIT_RUN_ERROR`: it is a failure, not a refusal.
 
+Fixed - docs that had drifted from the code
+* `docs/INVARIANTS.md` cited five tests that this milestone renamed
+  (`test_neutralise_refuses_every_config_shape_it_cannot_reason_about`,
+  `test_a_copy_with_nothing_to_neutralise_is_left_alone`,
+  `test_the_copy_disables_an_inherited_fsmonitor_and_untracked_cache`,
+  `test_the_config_neutralisation_survives_odd_spellings_includes_and_continuations`,
+  `test_the_neutralised_config_keeps_a_read_only_file_mode`). All corrected.
+  Found mechanically, by collecting the suite and checking every `::test_`
+  citation in the docs; the only remaining "misses" are two `*` globs and the
+  historical 0.3.8 entry, which is left alone on purpose - a changelog records
+  what was true then.
+* `docs/INVARIANTS.md` still said "verification commands run on the ORIGINAL",
+  and `sanitize.py`'s module docstring said "mechanical verification ALWAYS
+  runs on the ORIGINAL". Both are wrong and have been since the verification
+  copy was introduced: verification runs in a private VERIFICATION copy -
+  never in a stripped worker copy, and never in the original. (The unit test
+  named `test_pack_commands_run_on_the_original_not_the_sanitized_copy` passes
+  the original directly as `snapshot_root`; that is what its name refers to,
+  and the row now says so.)
+* `docs/INVARIANTS.md` still described the old neutraliser (`removes
+  core.fsmonitor/core.untrackedCache and appends [core] fsmonitor=false`) and
+  a "regular neutralised file". Both now describe the allowlist rewrite.
+* `docs/SECURITY.md` said `extensions.worktreeConfig` is dropped while also
+  saying the whole `extensions` section is retained - contradictory even
+  before item 2. Both statements are now the same one.
+* New `docs/INVARIANTS.md` rows for all five items of this round, and a
+  `docs/SECURITY.md` section for nested repositories with the measurement
+  table.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c

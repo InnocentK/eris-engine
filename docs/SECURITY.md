@@ -373,7 +373,8 @@ configuration:
 3. `.git/objects/info/alternates`, `.git/objects/info/http-alternates` and
    `.git/config.worktree` are deleted, and a copy that is not ONE
    self-contained repository is REFUSED (`.git` as a gitlink FILE,
-   `.git/commondir`, `.git/worktrees/`, `.git/modules/`).
+   `.git/commondir`, `.git/worktrees/`, `.git/modules/`, or any NESTED
+   `.git` below the root - see the nested-repository section below).
 4. A symlink that is absolute, dangling or resolves outside the tree is
    dropped and recorded; an in-copy `.git/config` symlink is REPLACED by the
    rewritten regular file and recorded there too, and any other non-regular
@@ -412,11 +413,28 @@ the repository chose the program, not the model.
 **What survives in the copy** (`GIT_CONFIG_ALLOWED_CORE_KEYS`,
 `GIT_CONFIG_ALLOWED_SECTIONS`): `core.repositoryformatversion`,
 `core.filemode`, `core.bare`, `core.symlinks`, `core.ignorecase`,
-`core.precomposeunicode`, `core.logallrefupdates`, and the whole `extensions`
-section. That is the repository FORMAT and the filesystem capability flags -
-`git init` writes them from what the filesystem supports, and a sha256
+`core.precomposeunicode`, `core.logallrefupdates`, and - from `extensions` -
+only `objectformat` and `compatobjectformat`, and only with a value in
+`{sha1, sha256}`. That is the repository FORMAT and the filesystem capability
+flags: `git init` writes them from what the filesystem supports, and a sha256
 repository does not open at all without `extensions.objectformat`. None of them
 names a command or a path git will act on.
+
+**Any OTHER `extensions.*` REFUSES the copy**, naming the key (0.3.10;
+`extensions.worktreeConfig` is the one exception, DROPPED rather than refused
+because Eris deletes the `.git/config.worktree` it enables, so its absence
+changes nothing). Keeping the whole section was the 0.3.9 design and it was not
+evidence-backed - it asserted that no `extensions` value names anything
+dangerous, over a key set git is free to grow. Refusing rather than dropping is
+deliberate: an extension declares how the repository is STORED, so a copy with
+one silently dropped is a repository git OPENS and then misreads. Measured
+2026-08-24 on git 2.50.1, `git init --ref-format=reftable` really does write
+`extensions.refstorage = reftable` at `repositoryformatversion = 1`, and a copy
+without it has no `refs/` files to fall back on. Known false refusal, also
+measured: at `repositoryformatversion = 0` git IGNORES `extensions.*` entirely,
+so a v0 repository carrying a stray extension is refused although git would
+open it happily; `git init` never writes extensions at v0, and the rule is kept
+unconditional because a version-dependent one is harder to audit.
 
 **What is dropped**: everything else. Every `diff.*`, `filter.*`, `merge.*`,
 `gpg.*`, `credential.*`, `url.*`, `http.*`, `uploadpack.*`, `include.*`,
@@ -514,6 +532,41 @@ The config is not the only part of `.git` git treats as instructions.
   checkout that is itself a linked worktree can no longer be verified at all,
   and that shows up as a refusal, never as a quiet pass.
 
+#### Nested repositories are refused (advisor round)
+
+The config allowlist rewrites exactly ONE file: the copy's own `.git/config`.
+A NESTED repository has its own, and Eris never sees it. Measured 2026-08-24,
+git 2.50.1, on an outer repository whose `sub/.git` is a FILE reading
+`gitdir: <outside the snapshot>`, with that external config carrying
+`diff.external`:
+
+| state of `sub` | `status --porcelain` | `diff HEAD` | `status --porcelain=v2` |
+|---|---|---|---|
+| not in the index | no execution | no execution | no execution |
+| registered as a gitlink (mode 160000) | **EXECUTED** | **EXECUTED** | **EXECUTED** |
+
+No `.gitmodules` was involved, and the gitdir was outside the copy entirely, so
+nothing Eris rewrites, deletes or hashes could have helped.
+
+* `sanitize.assert_no_nested_repositories` refuses ANY `.git` below the copy
+  root - directory, gitlink file or symlink, at any depth. The root's own
+  `.git` is skipped; a file merely NAMED like one (`.gitignore`,
+  `.gitmodules`) is not a repository.
+* A GITLINK in the index refuses the verification run, taken on the guard's
+  baseline out of the `ls-files -s -v -f` output the tripwire already spawns
+  (`-s` prints the mode, so it costs no extra command). This is the half the
+  copier cannot see: a registered but un-checked-out submodule leaves nothing
+  on disk, which is exactly what a non-recursive clone produces - and
+  `eris.snapshot` clones non-recursively. Nothing can execute in that state, so
+  it is a SCOPE refusal and says so.
+* **Recursive sanitisation is not attempted.** It would mean rewriting a config
+  tree of unbounded depth, some of it outside the snapshot, and getting that
+  wrong is this bug again.
+* **Cost, stated plainly: a repository that uses submodules cannot be verified
+  at all**, checked out or not. This is the largest scope reduction in the M2c
+  follow-ups. It shows up as a clean refusal naming the path, never as a quiet
+  half-verification.
+
 #### What is still open after M2c follow-up 5
 
 Stated, not implied:
@@ -546,10 +599,10 @@ Stated, not implied:
   re-checks it between verification commands. A command that rewrote
   `.git/config` mid-run would be caught by the guard's tree hash (`.git/config`
   is inside it), not by the rewriter.
-* **The `extensions` section is kept whole.** Its values name no command, but
-  `extensions.partialclone` names a REMOTE; every `remote.*` section is
-  dropped, so it resolves to nothing. An extension git does not know refuses
-  the repository, which is a refusal rather than an escape.
+* **Only two `extensions.*` keys are supported at all.** Everything else -
+  `refstorage`, `partialclone`, `preciousObjects`, anything git adds later -
+  REFUSES the copy rather than being dropped. That is a scope reduction, not a
+  gap: a reftable or partial-clone repository cannot be verified.
 * **Config Eris does not own is out of scope here.** System and global config
   are excluded by the launcher's `GIT_CONFIG_NOSYSTEM=1` /
   `GIT_CONFIG_GLOBAL=/dev/null` hardening and a scratch `HOME`, not by this
