@@ -190,6 +190,28 @@ Fixed (final round) - a repository config is not only a git problem
   produced with only argv[0] swapped, so what is proved is the flag Eris really
   emits.
 
+Fixed (final round) - two fail-closed corrections
+* **No semantic index digest now REFUSES the run, it does not degrade.** The
+  guard used to fall back to byte-hashing `.git/index` when git was unusable
+  (`index_check: "bytes_fallback"`). That was a hole rather than a fallback:
+  without the digest the GITLINK scan never runs, so a superproject sailed
+  straight through exactly when the tripwire was weakest. `IndexScopeUnknown`
+  now refuses and names the reason, and `INDEX_CHECK_BYTES_FALLBACK` is gone.
+  Nothing real is lost - every command in the default battery IS git, so a
+  copy whose pinned git cannot be run has no verification to produce. A copy
+  with NO `.git` still needs no digest (`index_check: "none"`) and is not
+  refused. `VerificationRefused` is the new common base that `eval/run.py`
+  catches, so a future refusal cannot forget to be one.
+* **Cleanup ownership is the successful `mkdir`, never a prior existence
+  check.** `sanitized_copy` checked `dest.exists()` BEFORE calling
+  `make_private_dir`, so a directory appearing in that window would be refused
+  by the reservation (correctly) and then DELETED by the cleanup
+  (catastrophically) - "it did not exist when I looked" was being used as "I
+  created it". The reservation now happens in `sanitized_copy` itself and
+  nothing is removed unless that `mkdir(exist_ok=False)` returned normally;
+  `sanitize_snapshot` takes `dest_reserved=True` so it does not reserve twice.
+  Confirmed by reverting: the planted directory was deleted.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c

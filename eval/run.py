@@ -58,9 +58,9 @@ from eris.arms import (
 from eris.cache import Cache, CacheUnsupported
 from eris.doctor import run_doctor
 from eris.evidence import (
-    NestedRepositoryRefused,
     SnapshotGuard,
     TaskSpec,
+    VerificationRefused,
     VerifyEnv,
     git_index_prober,
     verify_scratch,
@@ -1064,9 +1064,9 @@ def run_cell(
         LedgerCorrupt,
         PolicyError,
         SanitizeError,
-        NestedRepositoryRefused,
+        VerificationRefused,
     ) as exc:
-        # `SanitizeError` and `NestedRepositoryRefused` are DELIBERATE refusals
+        # `SanitizeError` and `VerificationRefused` are DELIBERATE refusals
         # of a snapshot Eris will not verify (a nested repository, an
         # unsupported `extensions.*`, a `.git` shape it cannot reason about).
         # They used to escape `run_cell` as an unhandled traceback; they are

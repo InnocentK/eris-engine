@@ -95,10 +95,26 @@ class EvidenceCleanupError(EvidenceError):
     """The verification scratch dir could not be removed (run.error written)."""
 
 
-class NestedRepositoryRefused(EvidenceError):
+class VerificationRefused(EvidenceError):
+    """Eris will not verify this snapshot. A deliberate refusal, not a failure
+    - the harness reports it as ``refused`` with ``EXIT_CONFIG``."""
+
+
+class NestedRepositoryRefused(VerificationRefused):
     """The copy's index registers a SUBMODULE: it is a superproject, and Eris
-    verifies one self-contained repository or none. A deliberate refusal, not a
-    failure - the harness reports it as ``refused``."""
+    verifies one self-contained repository or none."""
+
+
+class IndexScopeUnknown(VerificationRefused):
+    """The semantic index digest could not be taken, so whether this snapshot
+    is a SUPERPROJECT cannot be established.
+
+    Advisor round: the guard used to fall back to byte-hashing `.git/index`
+    here and carry on, which meant that with git unusable a run proceeded
+    against a copy that might carry an un-checked-out gitlink - the exact case
+    the gitlink scan exists for. Refusing loses nothing real: every command in
+    the default battery IS git, so a copy whose git cannot be run has no
+    verification to produce anyway."""
 
 
 # --------------------------------------------------------------------------- task.json
@@ -314,7 +330,6 @@ GIT_INDEX_DIGEST_ARGS: tuple[str, ...] = (*GIT_ERIS_GLOBALS, "ls-files", "-s", "
 
 # What the guard is doing about `.git/index` for a given run.
 INDEX_CHECK_SEMANTIC = "semantic"
-INDEX_CHECK_BYTES_FALLBACK = "bytes_fallback"
 INDEX_CHECK_NONE = "none"  # the copy has no `.git` directory: no index to guard
 
 #: The octal mode `git ls-files -s` prints for a GITLINK - a submodule entry.
@@ -430,10 +445,10 @@ class SnapshotGuard:
       an index mutation changes what LATER evidence says.
 
     Either one moving is a violation. With no usable git the guard FAILS
-    CLOSED: it drops the byte exclusion instead (``index_check ==
-    "bytes_fallback"``) and hashes `.git/index` like any other file, which
-    costs false positives on the stat refresh but never silently skips the
-    check."""
+    CLOSED by REFUSING the run (:class:`IndexScopeUnknown`) rather than
+    degrading to a byte hash: without the digest, the gitlink scan below never
+    runs and a superproject would sail through. Nothing real is lost - every
+    command in the default battery is git."""
 
     root: Path
     baseline: str
@@ -447,8 +462,17 @@ class SnapshotGuard:
         if not (root / ".git").is_dir():
             return cls(root, tree_sha256(root, skip=_guard_skip), None, INDEX_CHECK_NONE)
         result = probe(root) if probe is not None else None
-        if result is None:  # fail closed: no semantic cover -> hash the bytes
-            return cls(root, tree_sha256(root), None, INDEX_CHECK_BYTES_FALLBACK)
+        if result is None:
+            # FAIL CLOSED. There used to be a byte-hash fallback here; it was a
+            # hole, because without the digest the gitlink scan below never
+            # runs and a superproject sails through. Nothing real is lost:
+            # every command in the default battery is git, so a copy whose
+            # pinned git cannot be run has no verification to produce.
+            raise IndexScopeUnknown(
+                "the semantic index digest could not be taken (no pinned git, a changed binary, "
+                "a non-zero exit, a timeout or truncated output), so whether this snapshot "
+                "registers submodules cannot be established; refusing to verify"
+            )
         if result.gitlinks:
             # The copier already refuses a nested `.git` that is PRESENT
             # (`sanitize.assert_no_nested_repositories`). This is the other
@@ -469,7 +493,7 @@ class SnapshotGuard:
 
     @property
     def _skip(self) -> Callable[[PurePosixPath], bool] | None:
-        return None if self.index_check == INDEX_CHECK_BYTES_FALLBACK else _guard_skip
+        return _guard_skip
 
     def changed(self) -> GuardChange | None:
         # A probe that stops working mid-run reads as a change, not as a pass.
@@ -572,7 +596,7 @@ def _run_recorded(
                 "argv": outcome.argv,
                 "source": source,
                 # which half of the tripwire moved, and what it is doing about
-                # `.git/index` this run (semantic / bytes_fallback / none)
+                # `.git/index` this run (semantic / none)
                 "reason": outcome.violation_reason,
                 "index_check": env.guard.index_check if env.guard else None,
                 "tree_sha256_before": env.guard.baseline if env.guard else None,

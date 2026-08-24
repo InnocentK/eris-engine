@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from eris.evidence import (
     EXCERPT_MAX_LINES,
+    INDEX_CHECK_NONE,
     ITEM_HEAD_BYTES,
     ITEM_TAIL_BYTES,
     EvidenceCleanupError,
@@ -516,7 +517,8 @@ def test_verification_guard_trips_on_a_changed_copy_and_stops_verification(
 
     popen = WritingPopen()
     env = make_env(tmp_path, copy, popen, make_policy(tmp_path))
-    env.guard = SnapshotGuard.over(copy)
+    # a working probe: without one the guard now refuses outright (item 3)
+    env.guard = SnapshotGuard.over(copy, probe=FakeIndexProbe())
     w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
     items = execute_evidence_requests(
         [
@@ -657,25 +659,53 @@ def test_an_index_change_that_also_moves_the_tree_is_reported_as_git_index(
     assert change is not None and change.reason == "git_index"
 
 
-def test_a_guard_without_a_usable_git_falls_back_to_hashing_the_index_bytes(
+def test_a_guard_without_a_usable_git_refuses_instead_of_hashing_the_bytes(
     tmp_path: Path,
 ) -> None:
-    """M2c item 2: FAIL CLOSED. No semantic digest means the byte exclusion is
-    dropped for that run - never a silently skipped check."""
-    from eris.evidence import INDEX_CHECK_BYTES_FALLBACK, SnapshotGuard
+    """M2c follow-up 5, advisor round, item 3. This USED to fall back to
+    byte-hashing `.git/index` and carry on. That was a hole: without the
+    semantic digest the gitlink scan never runs, so with git unusable a run
+    proceeded against a copy that might carry an un-checked-out submodule -
+    the exact case the scan exists for.
+
+    It now FAILS CLOSED by refusing, and the message says why. Nothing real is
+    lost: every command in the default battery IS git, so a copy whose pinned
+    git cannot be run has no verification to produce anyway.
+
+    Both branches: no probe supplied at all, and a probe that cannot answer."""
+    from eris.evidence import IndexScopeUnknown, SnapshotGuard
 
     root = make_snapshot(tmp_path)
     (root / ".git" / "index").write_bytes(b"stat cache v1")
-    for guard in (
-        SnapshotGuard.over(root),  # no probe at all
-        SnapshotGuard.over(root, probe=FakeIndexProbe(None)),  # git unavailable/failed
-    ):
-        assert guard.index_check == INDEX_CHECK_BYTES_FALLBACK and guard.index_digest is None
-        assert guard.changed() is None
-        (root / ".git" / "index").write_bytes(b"stat cache v2")
-        change = guard.changed()
-        assert change is not None and change.reason == "tree"  # the bytes ARE hashed now
-        (root / ".git" / "index").write_bytes(b"stat cache v1")
+    for probe in (None, FakeIndexProbe(None)):
+        with pytest.raises(IndexScopeUnknown, match="cannot be established; refusing to verify"):
+            SnapshotGuard.over(root, probe=probe)
+
+    # ... and a copy with NO `.git` needs no digest and is not refused: there is
+    # no index, so there can be no gitlink
+    bare = tmp_path / "no-git"
+    bare.mkdir()
+    (bare / "a.py").write_text("x = 1\n")
+    guard = SnapshotGuard.over(bare)
+    assert guard.index_check == INDEX_CHECK_NONE and guard.index_digest is None
+    assert guard.changed() is None
+
+
+def test_the_refusal_is_the_one_the_harness_reports_as_refused() -> None:
+    """`IndexScopeUnknown` and `NestedRepositoryRefused` are both
+    `VerificationRefused`, which is the single type `eval/run.py` catches to
+    turn a deliberate refusal into EXIT_CONFIG / `refused` rather than a
+    traceback. A new refusal must inherit from it or it will crash the run."""
+    from eris.evidence import (
+        EvidenceError,
+        IndexScopeUnknown,
+        NestedRepositoryRefused,
+        VerificationRefused,
+    )
+
+    assert issubclass(IndexScopeUnknown, VerificationRefused)
+    assert issubclass(NestedRepositoryRefused, VerificationRefused)
+    assert issubclass(VerificationRefused, EvidenceError)
 
 
 def test_a_probe_that_stops_working_mid_run_trips_the_guard(tmp_path: Path) -> None:
@@ -752,9 +782,9 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
 @pytest.mark.parametrize("why", ["unpinned", "swapped-since-the-pin", "missing"])
 def test_the_index_prober_refuses_an_unpinned_or_changed_git(tmp_path: Path, why: str) -> None:
     """M2c item 1: POLICY-PINNED. An unpinned, swapped or missing git yields
-    no digest (and is never spawned), which the guard turns into
-    `bytes_fallback`."""
-    from eris.evidence import INDEX_CHECK_BYTES_FALLBACK, SnapshotGuard, git_index_prober
+    no digest (and is never spawned), which the guard now turns into a REFUSAL
+    (advisor round, item 3) rather than a byte-hash fallback."""
+    from eris.evidence import IndexScopeUnknown, SnapshotGuard, git_index_prober
 
     root = make_snapshot(tmp_path)
     policy = make_policy(tmp_path, pinned=why != "unpinned")
@@ -766,7 +796,8 @@ def test_the_index_prober_refuses_an_unpinned_or_changed_git(tmp_path: Path, why
     probe = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)
     assert probe(root) is None, why
     assert popen.calls == []
-    assert SnapshotGuard.over(root, probe=probe).index_check == INDEX_CHECK_BYTES_FALLBACK
+    with pytest.raises(IndexScopeUnknown):
+        SnapshotGuard.over(root, probe=probe)
 
 
 @pytest.mark.parametrize("failure", ["exit-code", "truncated-output", "spawn-raises"])
