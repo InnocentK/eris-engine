@@ -42,6 +42,29 @@ Fixed
   of a bare digest string. The digest, the argv and the `bytes_fallback`
   behaviour are unchanged.
 
+Fixed - `extensions.*` is a known-key allowlist with validated values
+* 0.3.9 kept the WHOLE `extensions` section on the claim that no value there
+  names anything dangerous. That was an assertion about a key set git is free
+  to grow, with no evidence behind it. Now only
+  `extensions.objectformat` / `extensions.compatobjectformat` survive, and only
+  with a value in `{sha1, sha256}`; `extensions.worktreeConfig` is DROPPED
+  (Eris deletes the `.git/config.worktree` it enables, so its absence changes
+  nothing, and refusing it would be a false refusal on any checkout where
+  someone has run `git config --worktree`); **anything else REFUSES the copy,
+  naming the key**.
+* Refusing rather than dropping is the point. An extension declares how the
+  repository is STORED, so a copy with one silently dropped is a repository git
+  OPENS and then misreads. Measured 2026-08-24 on git 2.50.1: `git init
+  --ref-format=reftable` really does write `extensions.refstorage = reftable`
+  with `repositoryformatversion = 1`, and a copy without it has no `refs/`
+  files to fall back on. Loud beats quietly wrong.
+* Known false refusal, measured and stated: at `repositoryformatversion = 0`
+  git IGNORES `extensions.*` entirely (`exit 0`, no warning), so a v0
+  repository carrying a stray extension is refused although git would open it
+  happily. `git init` never writes extensions at v0, so this is not expected in
+  practice; the refusal is unconditional because a version-dependent rule is
+  harder to audit than a flat one.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c

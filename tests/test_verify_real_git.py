@@ -1062,7 +1062,7 @@ def test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports(
 
     This is also the differential test for the parser: if Eris read the file
     differently from the way git reads it, the two lists would disagree."""
-    from eris.sanitize import GIT_CONFIG_ALLOWED_CORE_KEYS, GIT_CONFIG_ALLOWED_SECTIONS
+    from eris.sanitize import GIT_CONFIG_ALLOWED_CORE_KEYS, GIT_CONFIG_EXTENSIONS_KEPT
 
     git = _git_executable()
     source = tmp_path / "snapshot"
@@ -1092,9 +1092,9 @@ def test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports(
     def allowed(line: str) -> bool:
         name = line.split("=", 1)[0]
         section, _, key = name.partition(".")
-        return section in GIT_CONFIG_ALLOWED_SECTIONS or (
-            section == "core" and key in GIT_CONFIG_ALLOWED_CORE_KEYS
-        )
+        if section == "extensions":
+            return key in GIT_CONFIG_EXTENSIONS_KEPT
+        return section == "core" and key in GIT_CONFIG_ALLOWED_CORE_KEYS
 
     copy_list = _config_list(repo, git)
     assert copy_list == [line for line in original_list if allowed(line)]
@@ -1245,3 +1245,67 @@ def test_the_gitlink_scan_reads_the_mode_out_of_the_digest_output(tmp_path: Path
     linked = probe(source)
     assert linked is not None and linked.gitlinks == ("sub",)
     assert linked.digest != plain.digest  # the digest still moves, as before
+
+
+@pytest.mark.parametrize(
+    ("flags", "key"),
+    [
+        (["--ref-format=reftable"], "refstorage"),
+        (["--object-format=sha256"], None),  # supported: must NOT refuse
+    ],
+)
+def test_a_repository_extension_eris_cannot_vouch_for_refuses_the_copy(
+    tmp_path: Path, flags: list[str], key: str | None
+) -> None:
+    """M2c follow-up 5, advisor round, item 2. `extensions.*` declares how the
+    repository is STORED, so a copy that silently DROPS one is a repository git
+    opens and then misreads. Measured 2026-08-24 on git 2.50.1: `git init
+    --ref-format=reftable` really does write `extensions.refstorage = reftable`
+    with `repositoryformatversion = 1`, and there are no `refs/` files for a
+    copy without it to fall back on. A loud refusal naming the key is honest.
+
+    The sha256 row is the control: the one extension Eris DOES support must not
+    refuse."""
+    from eris.sanitize import UnsupportedRepositoryExtension
+
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    made = _git(source, git, "init", "-q", *flags, ".", check=False)
+    if made.returncode != 0:  # pragma: no cover - an older git
+        pytest.skip(f"this git cannot build {flags}: {made.stderr.decode()[:120]}")
+    (source / "f.txt").write_text("x\n")
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c1")
+
+    copy = tmp_path / "verify-copy"
+    if key is None:
+        sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+        assert _git(copy, git, "status", "--porcelain").stdout == b""
+        return
+    assert f"extensions.{key}" in "\n".join(_config_list(source, git))
+    with pytest.raises(
+        UnsupportedRepositoryExtension, match=rf"extensions\.{key}: this repository"
+    ):
+        sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+
+def test_the_worktree_config_extension_is_dropped_not_refused(tmp_path: Path) -> None:
+    """The one `extensions.*` Eris drops instead of refusing: it enables
+    `.git/config.worktree`, which Eris deletes, so its absence changes nothing.
+    Refusing it would be a false refusal on any checkout where someone has run
+    `git config --worktree` - measured 2026-08-24: git accepts the key at
+    format version 0 and 1 alike."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    _git(source, git, "config", "core.repositoryformatversion", "1")
+    _git(source, git, "config", "extensions.worktreeConfig", "true")
+    (source / ".git" / "config.worktree").write_text("[diff]\n\texternal = tools/evil\n")
+
+    copy = tmp_path / "verify-copy"
+    sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    assert not (copy / ".git" / "config.worktree").exists()
+    assert "extensions.worktreeconfig" not in "\n".join(_config_list(copy, git)).lower()
+    assert _git(copy, git, "status", "--porcelain").stdout == b""  # still a working repo

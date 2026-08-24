@@ -1205,3 +1205,81 @@ def test_the_roots_own_git_is_not_a_nested_repository(tmp_path: Path) -> None:
     sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="v")
     assert_no_nested_repositories(copy)  # no raise
     assert (copy / "sub" / ".gitmodules").is_file()
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (b"[extensions]\n\trefstorage = reftable\n", "extensions.refstorage: this repository"),
+        (b"[extensions]\n\tpartialclone = origin\n", "extensions.partialclone: this repository"),
+        (b"[extensions]\n\tfrobnicate = yes\n", "extensions.frobnicate: this repository"),
+        (b"[extensions]\n\tpreciousObjects = true\n", "extensions.preciousobjects: this repo"),
+        (b"[extensions]\n\tobjectFormat = md5\n", "extensions.objectformat: value 'md5'"),
+        (b"[extensions]\n\tobjectFormat\n", "extensions.objectformat: value ''"),
+        (b"[extensions]\n\tcompatObjectFormat = blake3\n", "extensions.compatobjectformat: val"),
+    ],
+)
+def test_an_extension_eris_cannot_vouch_for_refuses_the_copy(
+    tmp_path: Path, body: bytes, reason: str
+) -> None:
+    """M2c follow-up 5, advisor round, item 2. 0.3.9 kept the WHOLE
+    `extensions` section on the assertion that no value there names anything
+    dangerous - an assertion about a key set git is free to grow, with no
+    evidence behind it. It is now a known-key allowlist with VALIDATED values,
+    and anything else REFUSES.
+
+    Refusing rather than dropping is the point: an extension declares how the
+    repository is STORED. Measured 2026-08-24 on git 2.50.1, a reftable
+    repository really exists (`git init --ref-format=reftable`), and a copy
+    with `refstorage` dropped is one whose refs git looks for in the wrong
+    place - it opens, then reports nothing. Loud beats quietly wrong."""
+    from eris.sanitize import (
+        VERIFICATION_PROFILE,
+        UnsupportedRepositoryExtension,
+    )
+
+    original = _mkgit(tmp_path / "o")
+    (original / ".git" / "config").write_bytes(b"[core]\n\trepositoryformatversion = 1\n" + body)
+    with pytest.raises(UnsupportedRepositoryExtension, match=reason.replace(".", r"\.")):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+    # the refusal names the path too, so an operator can find the file
+    with pytest.raises(UnsupportedRepositoryExtension, match=r"^\.git/config: "):
+        sanitize_snapshot(original, tmp_path / "c2", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+@pytest.mark.parametrize(
+    ("body", "kept"),
+    [
+        (b"[extensions]\n\tobjectFormat = sha256\n", ("extensions.objectformat",)),
+        (b"[extensions]\n\tobjectFormat = sha1\n", ("extensions.objectformat",)),
+        (b"[extensions]\n\tOBJECTFORMAT = SHA256\n", ("extensions.objectformat",)),  # case
+        (b"[extensions]\n\tcompatObjectFormat = sha1\n", ("extensions.compatobjectformat",)),
+        (b"[extensions]\n\tworktreeConfig = true\n", ()),  # dropped, never refused
+    ],
+)
+def test_the_supported_extensions_survive_and_worktree_config_is_dropped(
+    body: bytes, kept: tuple[str, ...]
+) -> None:
+    """The other half of the table. `objectformat` is the one extension whose
+    absence makes the repository fail to OPEN, so it is kept (values validated
+    against the two hash algorithms git has). `worktreeConfig` is DROPPED
+    rather than refused: it enables `.git/config.worktree`, which Eris deletes,
+    so its absence changes nothing - and refusing it would be a false refusal
+    on any checkout where someone has run `git config --worktree`."""
+    from eris.sanitize import allowlist_git_config
+
+    _out, got, _dropped = allowlist_git_config(body)
+    assert got == kept
+
+
+def test_dropping_an_unsupported_extension_would_have_been_the_wrong_answer() -> None:
+    """Why item 2 refuses instead of dropping, pinned as an assertion about
+    the CODE rather than as a comment: no `extensions` key is silently
+    droppable except the ones Eris has explicitly neutralised elsewhere."""
+    from eris.sanitize import GIT_CONFIG_EXTENSIONS_DROPPED, GIT_CONFIG_EXTENSIONS_KEPT
+
+    assert GIT_CONFIG_EXTENSIONS_DROPPED == {"worktreeconfig"}  # and Eris deletes that file
+    assert set(GIT_CONFIG_EXTENSIONS_KEPT) == {"objectformat", "compatobjectformat"}
+    assert not GIT_CONFIG_EXTENSIONS_DROPPED & set(GIT_CONFIG_EXTENSIONS_KEPT)
+    for allowed in GIT_CONFIG_EXTENSIONS_KEPT.values():
+        assert allowed == {"sha1", "sha256"}

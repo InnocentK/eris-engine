@@ -101,13 +101,27 @@ GIT_CONFIG_ALLOWED_CORE_KEYS: frozenset[str] = frozenset(
     }
 )
 
-#: Whole config SECTIONS kept verbatim (no subsection; see
-#: :func:`allowlist_git_config`). ``extensions`` is the repository FORMAT:
-#: a sha256 repository does not open at all without ``extensions.objectformat``,
-#: and a reftable repository needs ``extensions.refstorage``. No ``extensions.*``
-#: value names a command; ``extensions.partialclone`` names a REMOTE, and every
-#: ``remote.*`` section is dropped, so it can resolve to nothing.
-GIT_CONFIG_ALLOWED_SECTIONS: frozenset[str] = frozenset({"extensions"})
+#: ``extensions.*`` keys KEPT, mapped to the exact values each may take
+#: (compared lower-cased). Keeping the WHOLE section was the 0.3.9 design and
+#: it was not evidence-backed: it asserted that no ``extensions`` value names
+#: anything dangerous, over a set of keys git is free to grow.
+#:
+#: Only the object format is kept, because it is the one extension whose
+#: absence makes the repository fail to OPEN: measured 2026-08-24 on git
+#: 2.50.1, ``git init --object-format=sha256`` writes
+#: ``extensions.objectformat = sha256`` with ``repositoryformatversion = 1``,
+#: and an invalid value is ``fatal: bad config line``.
+GIT_CONFIG_EXTENSIONS_KEPT: dict[str, frozenset[str]] = {
+    "objectformat": frozenset({"sha1", "sha256"}),
+    "compatobjectformat": frozenset({"sha1", "sha256"}),
+}
+
+#: ``extensions.*`` keys DROPPED rather than refused, because Eris has already
+#: removed the only thing they enable and their absence therefore changes
+#: nothing. ``worktreeConfig`` enables ``.git/config.worktree``, which
+#: :func:`drop_git_repo_escapes` deletes; keeping the key would point git at a
+#: file that is no longer there.
+GIT_CONFIG_EXTENSIONS_DROPPED: frozenset[str] = frozenset({"worktreeconfig"})
 
 #: Written at the top of every rewritten config so an operator reading the copy
 #: knows it is not the original's file.
@@ -438,6 +452,18 @@ class GitConfigParseError(SanitizeError):
     """The copy's ``.git/config`` is not a config file git would accept."""
 
 
+class UnsupportedRepositoryExtension(SanitizeError):
+    """The repository declares an ``extensions.*`` Eris cannot vouch for.
+
+    REFUSING rather than dropping is deliberate. An extension declares how the
+    repository is STORED, so silently dropping one leaves a copy git opens and
+    then misreads: measured 2026-08-24 on git 2.50.1, ``git init
+    --ref-format=reftable`` writes ``extensions.refstorage = reftable``, and a
+    copy without it is a repository whose refs git looks for in the wrong
+    place. A loud refusal naming the key is honest; a quietly broken copy that
+    then reports "no such ref" is not."""
+
+
 @dataclass(frozen=True)
 class GitConfigEntry:
     """One ``section[.subsection].key = value`` entry, exactly as git sees it.
@@ -645,26 +671,45 @@ def _quote_config_value(value: bytes, name: str) -> bytes:
     return bytes(out)
 
 
-def _allowlisted(entry: GitConfigEntry) -> bool:
-    """An entry survives only with NO subsection and either an allowlisted
-    ``[core]`` key or a wholly allowlisted section. A subsection is always
-    dropped: ``[core "x"] filemode`` is ``core.x.filemode``, which is not a key
-    git acts on, and ``[extensions "x"] y`` makes a v1 repository refuse to
-    open ("unknown repository extension")."""
+def _keep_entry(entry: GitConfigEntry) -> bool:
+    """Whether one parsed entry survives the allowlist.
+
+    A subsection is always dropped: ``[core "x"] filemode`` is
+    ``core.x.filemode``, which is not a key git acts on, and
+    ``[extensions "x"] y`` makes a v1 repository refuse to open ("unknown
+    repository extension"). ``[extensions]`` is the one section that can
+    RAISE: see :class:`UnsupportedRepositoryExtension`."""
     if entry.subsection is not None:
         return False
     section = entry.section.decode("ascii", errors="replace")
-    if section in GIT_CONFIG_ALLOWED_SECTIONS:
-        return True
-    return section == "core" and entry.key.decode("ascii", errors="replace") in (
-        GIT_CONFIG_ALLOWED_CORE_KEYS
-    )
+    key = entry.key.decode("ascii", errors="replace")
+    if section == "core":
+        return key in GIT_CONFIG_ALLOWED_CORE_KEYS
+    if section != "extensions":
+        return False
+    if key in GIT_CONFIG_EXTENSIONS_DROPPED:
+        return False
+    allowed = GIT_CONFIG_EXTENSIONS_KEPT.get(key)
+    if allowed is None:
+        raise UnsupportedRepositoryExtension(
+            f"extensions.{key}: this repository declares an extension Eris does not support, "
+            "so the copy would not be the same repository; refusing the copy "
+            f"(supported: {', '.join(sorted(GIT_CONFIG_EXTENSIONS_KEPT))})"
+        )
+    value = (entry.value or b"").decode("utf-8", errors="replace").lower()
+    if value not in allowed:
+        raise UnsupportedRepositoryExtension(
+            f"extensions.{key}: value {value!r} is not one Eris can vouch for; "
+            f"refusing the copy (expected one of: {', '.join(sorted(allowed))})"
+        )
+    return True
 
 
 def allowlist_git_config(raw: bytes) -> tuple[bytes, tuple[str, ...], tuple[str, ...]]:
     """Rewrite a git config from the ALLOWLIST: parse it the way git does, keep
-    only :data:`GIT_CONFIG_ALLOWED_CORE_KEYS` and
-    :data:`GIT_CONFIG_ALLOWED_SECTIONS`, and RE-SERIALISE.
+    only :data:`GIT_CONFIG_ALLOWED_CORE_KEYS` and the validated
+    :data:`GIT_CONFIG_EXTENSIONS_KEPT`, and RE-SERIALISE. An ``extensions.*``
+    Eris cannot vouch for raises :class:`UnsupportedRepositoryExtension`.
 
     Nothing is copied verbatim. The output is generated from the parsed
     ``(section, key, value)`` triples, with every value re-quoted, so a line
@@ -676,7 +721,7 @@ def allowlist_git_config(raw: bytes) -> tuple[bytes, tuple[str, ...], tuple[str,
     dropped: list[str] = []
     current: bytes | None = None
     for entry in entries:
-        if not _allowlisted(entry):
+        if not _keep_entry(entry):
             dropped.append(entry.name)
             continue
         if entry.section != current:
@@ -972,8 +1017,10 @@ def rewrite_git_config(copy_root: Path) -> ConfigRewrite:
         mode = stat.S_IMODE(st.st_mode)
     try:
         out, kept, dropped = allowlist_git_config(raw)
-    except GitConfigParseError as exc:
-        raise GitConfigParseError(f"{rel}: {exc}; refusing the copy") from exc
+    except (GitConfigParseError, UnsupportedRepositoryExtension) as exc:
+        # same type, relpath-prefixed: the caller distinguishes "not a config
+        # git would accept" from "a repository Eris does not support"
+        raise type(exc)(f"{rel}: {exc}") from exc
     # O_EXCL for the replacement (there is nothing at the path), O_NOFOLLOW
     # everywhere: no pre-existing file and no symlink is ever opened for
     # writing, so the write cannot leave the copy.
