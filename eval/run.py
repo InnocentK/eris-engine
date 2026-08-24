@@ -60,6 +60,7 @@ from eris.doctor import run_doctor
 from eris.evidence import (
     SnapshotGuard,
     TaskSpec,
+    VerificationRefused,
     VerifyEnv,
     git_index_prober,
     verify_scratch,
@@ -84,6 +85,7 @@ from eris.retry import BudgetLedger, stop_requested, worst_case_call_reservation
 from eris.sanitize import (
     VERIFICATION_PROFILE,
     SanitizeCleanupError,
+    SanitizeError,
     SanitizeProfile,
     sanitized_copy,
     tree_sha256,
@@ -1050,11 +1052,29 @@ def run_cell(
     except KeyboardInterrupt:
         outcome.exit_code, outcome.status = EXIT_SIGINT, "interrupted"
         return outcome
-    except (LaunchRefused, ResumeRefused, LedgerCorrupt, PolicyError) as exc:
+    except SanitizeCleanupError as exc:
+        # a SUBCLASS of SanitizeError, and it must NOT be read as a refusal:
+        # worker-visible files may remain, which is a run error
+        _record_run_error(writer, h, type(exc).__name__, str(exc))
+        outcome.exit_code, outcome.status, outcome.error = EXIT_RUN_ERROR, "run_error", str(exc)
+        return outcome
+    except (
+        LaunchRefused,
+        ResumeRefused,
+        LedgerCorrupt,
+        PolicyError,
+        SanitizeError,
+        VerificationRefused,
+    ) as exc:
+        # `SanitizeError` and `VerificationRefused` are DELIBERATE refusals
+        # of a snapshot Eris will not verify (a nested repository, an
+        # unsupported `extensions.*`, a `.git` shape it cannot reason about).
+        # They used to escape `run_cell` as an unhandled traceback; they are
+        # refusals like any other, and exit EXIT_CONFIG with status "refused".
         _record_run_error(writer, h, type(exc).__name__, str(exc))
         outcome.exit_code, outcome.status, outcome.error = EXIT_CONFIG, "refused", str(exc)
         return outcome
-    except (SanitizeCleanupError, OSError, WriterError) as exc:
+    except (OSError, WriterError) as exc:
         _record_run_error(writer, h, type(exc).__name__, str(exc))
         outcome.exit_code, outcome.status, outcome.error = EXIT_RUN_ERROR, "run_error", str(exc)
         return outcome

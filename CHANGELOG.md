@@ -1,5 +1,351 @@
 # Changelog
 
+## 0.3.10 - nested repositories are refused (advisor round) (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched).
+The cross-family advisor BLOCKED 0.3.9 with a finding the coordinator then
+reproduced independently, and so did I before writing any of this.
+
+**The config allowlist rewrites exactly ONE file: the copy's own
+`.git/config`. A NESTED repository has its own, and Eris never sees it.**
+Measured 2026-08-24, git 2.50.1: an outer repository whose `sub/.git` is a
+FILE reading `gitdir: <outside the snapshot>`, with that external config
+carrying `diff.external`:
+
+| state of `sub` | `status --porcelain` | `diff HEAD` | `status --porcelain=v2` |
+|---|---|---|---|
+| not in the index | no execution | no execution | no execution |
+| registered as a gitlink (mode 160000) | **EXECUTED** | **EXECUTED** | **EXECUTED** |
+
+No `.gitmodules` was involved, and `GIT_MODULES` only covered top-level
+`.git/modules`. Nothing Eris rewrites, deletes or hashes could have helped:
+the config that executes belongs to a repository outside the copy.
+
+Fixed
+* **`sanitize.assert_no_nested_repositories` refuses any `.git` below the copy
+  root** - whatever its shape (directory, gitlink file, symlink) and at
+  whatever depth. The root's own `.git` is skipped; a file merely named like
+  one (`.gitignore`, `.gitmodules`) is not a repository. Recursive
+  sanitisation is NOT attempted: it would mean rewriting a config tree of
+  unbounded depth, some of it outside the snapshot, and getting that wrong is
+  this bug again. Refusing is the honest scope.
+* **A gitlink in the INDEX refuses the verification run**, taken on the
+  guard's baseline from the `ls-files -s -v -f` output the tripwire already
+  spawns (`-s` prints the mode, so the signal is free - no new command, and
+  `GIT_INDEX_DIGEST_ARGS` is unchanged). This is the half the copier cannot
+  see: a submodule that is registered but NOT checked out leaves nothing on
+  disk, which is exactly what a non-recursive clone produces - and
+  `eris.snapshot` clones non-recursively, so a superproject would otherwise
+  arrive looking like an ordinary repository. Nothing can execute in that
+  state, so it is a SCOPE refusal, not a containment one, and it says so.
+* `git_index_prober` now returns `IndexProbeResult(digest, gitlinks)` instead
+  of a bare digest string. The digest, the argv and the `bytes_fallback`
+  behaviour are unchanged.
+
+Fixed - `extensions.*` is a known-key allowlist with validated values
+* 0.3.9 kept the WHOLE `extensions` section on the claim that no value there
+  names anything dangerous. That was an assertion about a key set git is free
+  to grow, with no evidence behind it. Now only
+  `extensions.objectformat` / `extensions.compatobjectformat` survive, and only
+  with a value in `{sha1, sha256}`; `extensions.worktreeConfig` is DROPPED
+  (Eris deletes the `.git/config.worktree` it enables, so its absence changes
+  nothing, and refusing it would be a false refusal on any checkout where
+  someone has run `git config --worktree`); **anything else REFUSES the copy,
+  naming the key**.
+* Refusing rather than dropping is the point. An extension declares how the
+  repository is STORED, so a copy with one silently dropped is a repository git
+  OPENS and then misreads. Measured 2026-08-24 on git 2.50.1: `git init
+  --ref-format=reftable` really does write `extensions.refstorage = reftable`
+  with `repositoryformatversion = 1`, and a copy without it has no `refs/`
+  files to fall back on. Loud beats quietly wrong.
+* Known false refusal, measured and stated: at `repositoryformatversion = 0`
+  git IGNORES `extensions.*` entirely (`exit 0`, no warning), so a v0
+  repository carrying a stray extension is refused although git would open it
+  happily. `git init` never writes extensions at v0, so this is not expected in
+  practice; the refusal is unconditional because a version-dependent rule is
+  harder to audit than a flat one.
+
+Fixed - the parser claim is now measured rather than asserted
+* `parse_git_config` accepted `[]`, which real git REFUSES: git builds
+  `section[.subsection]` into one buffer and rejects the line when it is empty
+  (`config.c`, `var->len < 1`). Measured 2026-08-24 on git 2.50.1: `[]` is
+  `fatal: bad config line`, while `[ "x"]` - an empty section with a NON-empty
+  subsection - is accepted. Eris now refuses exactly the first.
+* The grammar table is a shared constant (`GRAMMAR_ROWS`) and is now replayed
+  through a REAL git, row by row, comparing Eris's entries with
+  `git config --list -z` record for record (NUL-separated `key\nvalue`, which
+  is unambiguous where `--list` is not because a value may contain a newline).
+  The hand-written expectations pinned what I believed git does; this pins what
+  git does.
+* The refusal table (`UNPARSEABLE_ROWS`) gets the same treatment, and the
+  measurement corrected a guess in the process: git refuses EVERY row in it
+  except "a key outside any section". So Eris refuses a superset of what git
+  refuses - stricter in exactly one place, identical everywhere else. That
+  direction costs a copy and never an escape; the reverse cannot occur, because
+  refusal is the only outcome for that table.
+* The module comment no longer claims equivalence with git's parser. It states
+  what is verified - a correspondence pinned by two tables - and says plainly
+  that a construction in neither table is unverified.
+
+Fixed - a refusal now behaves like one, end to end
+* `sanitized_copy` called `sanitize_snapshot` BEFORE entering its
+  `try`/`finally`, so any failure while the copy was being built left a
+  half-built copy in the scratch dir for the orphan sweep to find hours later.
+  This milestone added a lot of refusals, so that mattered a lot more than it
+  used to. The copy is now removed on the build path too - but only when THIS
+  call created it: a `dest` that already existed is refused by
+  `make_private_dir` and left exactly as found, the rule the run-scratch
+  reservation already follows. If the removal ALSO fails, the cleanup error is
+  raised (worker-visible files may remain, which is a run error, not a
+  refusal) with the original refusal as its `__cause__` - neither fact is lost.
+* `SanitizeError` was not caught by `run_cell`, so every deliberate refusal
+  would have surfaced as an unhandled traceback with no ledger entry and no
+  documented exit code. `SanitizeError` and `NestedRepositoryRefused` now exit
+  `EXIT_CONFIG` with status `refused`, the reason in the summary and a
+  `run.error` event on the ledger - like every other refusal.
+  `SanitizeCleanupError`, a SUBCLASS, is caught first and stays
+  `EXIT_RUN_ERROR`: it is a failure, not a refusal.
+
+Fixed - docs that had drifted from the code
+* `docs/INVARIANTS.md` cited five tests that this milestone renamed
+  (`test_neutralise_refuses_every_config_shape_it_cannot_reason_about`,
+  `test_a_copy_with_nothing_to_neutralise_is_left_alone`,
+  `test_the_copy_disables_an_inherited_fsmonitor_and_untracked_cache`,
+  `test_the_config_neutralisation_survives_odd_spellings_includes_and_continuations`,
+  `test_the_neutralised_config_keeps_a_read_only_file_mode`). All corrected.
+  Found mechanically, by collecting the suite and checking every `::test_`
+  citation in the docs; the only remaining "misses" are two `*` globs and the
+  historical 0.3.8 entry, which is left alone on purpose - a changelog records
+  what was true then.
+* `docs/INVARIANTS.md` still said "verification commands run on the ORIGINAL",
+  and `sanitize.py`'s module docstring said "mechanical verification ALWAYS
+  runs on the ORIGINAL". Both are wrong and have been since the verification
+  copy was introduced: verification runs in a private VERIFICATION copy -
+  never in a stripped worker copy, and never in the original. (The unit test
+  named `test_pack_commands_run_on_the_original_not_the_sanitized_copy` passes
+  the original directly as `snapshot_root`; that is what its name refers to,
+  and the row now says so.)
+* `docs/INVARIANTS.md` still described the old neutraliser (`removes
+  core.fsmonitor/core.untrackedCache and appends [core] fsmonitor=false`) and
+  a "regular neutralised file". Both now describe the allowlist rewrite.
+* `docs/SECURITY.md` said `extensions.worktreeConfig` is dropped while also
+  saying the whole `extensions` section is retained - contradictory even
+  before item 2. Both statements are now the same one.
+* New `docs/INVARIANTS.md` rows for all five items of this round, and a
+  `docs/SECURITY.md` section for nested repositories with the measurement
+  table.
+
+Fixed (final round) - `.GIT` evaded the nested-repo walk
+* The "ANY `.git`, any shape, any depth" promise was FALSE as written.
+  Measured 2026-08-24 on macOS/APFS: a directory created as `sub/.GIT` is
+  reported by `os.walk` under that literal name, while `Path("sub/.git")
+  .exists()` is True and git resolves it - so the exact `name == ".git"` test
+  missed a nested repository the kernel hands straight to git.
+* Names are now compared FOLDED (`_fold`: NFC then casefold), and the same
+  fold guards the copier's `.git/hooks` skip and its in-git test. That second
+  one was a hole in its own right, found by the fix: **`.GIT/HOOKS` was being
+  COPIED into the verification copy**, where our allowlisted git would have
+  run a repository hook on the first invocation.
+* Honest limits, both measured. NFC is a **no-op** for `.git`: it is pure
+  ASCII, so NFC/NFD/NFKC/NFKD all return it unchanged and there is no
+  decomposed spelling to defend against - the step is kept only so the helper
+  survives a future non-ASCII marker name, not because `.git` needs it, and
+  the "NFD-composed variant" the round asked for a test for does not exist.
+  Compatibility lookalikes are deliberately NOT folded: a fullwidth `.gｉt` is
+  a genuinely different file (creating it leaves `.git` non-existent), so
+  matching it would be a false refusal.
+* On a case-SENSITIVE filesystem `.GIT` is a distinct directory git never
+  reads, so folding costs a refused copy there and never an escape.
+
+Fixed (final round) - a repository config is not only a git problem
+* Measured 2026-08-24 against the other two allowlisted tools, and both were
+  already true before any of the M2c config work - nothing in it introduced
+  these, and nothing in it would have caught them either:
+
+  | tool | what a repository config did | Eris's flag |
+  |---|---|---|
+  | `mypy` | `mypy.ini` with `plugins = ./evil_plugin.py` **EXECUTED the plugin** - arbitrary code execution, the same class as `[diff] external` | `--config-file <os.devnull>` |
+  | `ruff` | `ruff.toml` with `[lint] select = []` made `ruff check` report "All checks passed!" on a file with an unused import - **evidence manipulation**, not execution | `--isolated` |
+
+* Eris appends these itself (`verify.ERIS_ISOLATION_FLAGS`) on exactly the
+  contract `--no-optional-locks` already had: FIRST in argv, before any
+  subcommand or positional. Every one of them is also HARD-DENIED to a model,
+  so a proposal can neither double the flag nor point it somewhere else, and a
+  test asserts the two halves cannot drift apart. `--isolated` was removed from
+  the default policy's ruff `literal_flags`, since Eris now supplies it.
+* The ruff case is not execution, but for an engine whose one job is deciding
+  whether an answer is defensible *given the evidence*, a repository that gets
+  to choose which findings exist is its own kind of serious.
+* `os.devnull` rather than a literal `/dev/null`: Windows spells it `nul`, and
+  whether mypy accepts `--config-file nul` there is UNKNOWN and untested. mypy
+  also prints `<devnull>: No [mypy] section in config file` on stderr, which
+  lands in the recorded evidence; that noise is accepted for the isolation.
+* **`pytest` gets no isolation flag because none exists**, and that is now
+  stated in `docs/SECURITY.md` rather than implied: `conftest.py` IS repository
+  code that pytest imports and executes by design, which is exactly why pytest
+  carries `requires_trusted`.
+* The end-to-end tests live in a new `tests/test_verify_isolation.py`. It needs
+  no addition to the hermeticity allow-list: every command runs as
+  `sys.executable -m <tool>`, and the argv is the one `check_command` actually
+  produced with only argv[0] swapped, so what is proved is the flag Eris really
+  emits.
+
+Fixed (final round) - two fail-closed corrections
+* **No semantic index digest now REFUSES the run, it does not degrade.** The
+  guard used to fall back to byte-hashing `.git/index` when git was unusable
+  (`index_check: "bytes_fallback"`). That was a hole rather than a fallback:
+  without the digest the GITLINK scan never runs, so a superproject sailed
+  straight through exactly when the tripwire was weakest. `IndexScopeUnknown`
+  now refuses and names the reason, and `INDEX_CHECK_BYTES_FALLBACK` is gone.
+  Nothing real is lost - every command in the default battery IS git, so a
+  copy whose pinned git cannot be run has no verification to produce. A copy
+  with NO `.git` still needs no digest (`index_check: "none"`) and is not
+  refused. `VerificationRefused` is the new common base that `eval/run.py`
+  catches, so a future refusal cannot forget to be one.
+* **Cleanup ownership is the successful `mkdir`, never a prior existence
+  check.** `sanitized_copy` checked `dest.exists()` BEFORE calling
+  `make_private_dir`, so a directory appearing in that window would be refused
+  by the reservation (correctly) and then DELETED by the cleanup
+  (catastrophically) - "it did not exist when I looked" was being used as "I
+  created it". The reservation now happens in `sanitized_copy` itself and
+  nothing is removed unless that `mkdir(exist_ok=False)` returned normally;
+  `sanitize_snapshot` takes `dest_reserved=True` so it does not reserve twice.
+  Confirmed by reverting: the planted directory was deleted.
+
+Behaviour change an operator will notice
+* **A repository that uses submodules can no longer be verified at all** -
+  checked out or not. This is the largest scope reduction in the M2c
+  follow-ups and the one most likely to be felt: it shows up as a clean
+  refusal naming the path, never as a quiet half-verification.
+
+## 0.3.9 - the verification copy's `.git` is contained: config by allowlist (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
+cross-family stop-time review of `b271b87` found the SIXTH consecutive hole in
+this control, and the first that is ARBITRARY CODE EXECUTION rather than an
+observation gap: "the new fail-closed control still permits Git to escape the
+verification copy."
+
+Measured on this machine, git 2.50.1, 2026-08-24, against the ALLOWLISTED
+verification command `git --no-optional-locks diff HEAD`:
+
+| vector | observed before this change |
+|---|---|
+| `[diff] external = <path>` in the copy's `.git/config` | the named program **EXECUTED** |
+| `[diff "evil"] textconv = <path>` + `f.txt diff=evil` in a TRACKED `.gitattributes` | **EXECUTED** |
+| `.git/objects/info/alternates` -> another object store, in a history-truncated snapshot | a commit `eris.snapshot` removed went from `cat-file -e` FAILING to SUCCEEDING; its blob read out in full |
+
+The repository chose the program, not the model, so the executable pin, the
+subcommand lists and the `--ext-diff`/`--textconv` hard-denies were all
+irrelevant. The previous control neutralised the two keys we happened to know
+about (`core.fsmonitor`, `core.untrackedCache`) and left everything else. That
+was the wrong SHAPE, so this replaces the denylist with an allowlist rather
+than adding a seventh patch.
+
+Fixed
+* **The copy's `.git/config` is rewritten from an ALLOWLIST**
+  (`sanitize.rewrite_git_config`, replacing `neutralise_git_config`). Only
+  `core.repositoryformatversion`, `core.filemode`, `core.bare`, `core.symlinks`,
+  `core.ignorecase`, `core.precomposeunicode`, `core.logallrefupdates` and the
+  whole un-subsectioned `extensions` section survive - the repository FORMAT
+  and the filesystem capability flags. Every `diff.*`, `filter.*`, `merge.*`,
+  `gpg.*`, `credential.*`, `url.*`, `http.*`, `uploadpack.*`, `include.*`,
+  `includeIf.*`, `alias.*`, `remote.*`, `branch.*`, `user.*` and every other
+  `core.*` is dropped. `core.fsmonitor`/`core.untrackedCache` are no longer set
+  to `false`; they are simply absent, which is stronger. With no driver
+  DEFINED, a `.gitattributes` naming `diff=evil` is inert - verified end to end
+  against a real git, not assumed.
+* **The rewrite is a re-serialisation, not a line filter.**
+  `sanitize.parse_git_config` is a port of git's `config.c`; the output is
+  generated from the parsed `(section, key, value)` triples with every value
+  re-quoted. Every previous version of this control scanned LINES, and git's
+  grammar is not line-oriented: measured the same day, `[core] filemode = true`
+  is a header AND a variable on one line, and `[core][diff] external = x` puts
+  the variable in `diff` - which a line filter looking for `[core]` would have
+  kept. A config Eris cannot parse REFUSES the copy; git refuses to open such a
+  repository too. One divergence found by re-measuring rather than by reading:
+  git's `get_next_char` reports EOF AS a newline, so a config whose last value
+  ends in a trailing backslash with no final newline ENDS the value
+  (`core.filemode=tru`) instead of being a bad escape - refusing it would have
+  been a false refusal, and the parser and a test row now match git.
+* **The repository-level escapes are removed or refused.** The copy deletes
+  `.git/objects/info/alternates`, `.git/objects/info/http-alternates` and
+  `.git/config.worktree` (`drop_git_repo_escapes`), and REFUSES a copy that is
+  not ONE self-contained repository (`assert_no_repo_escapes` +
+  `assert_git_layout_sane`): `.git` present as a gitlink FILE,
+  `.git/commondir`, `.git/worktrees/`, `.git/modules/`. Each refusal names the
+  path and why.
+* `GIT_REQUIRED_KINDS` gained the six paths this change names and a third
+  column (WHY, appended to the refusal message); `.git` tightened from
+  "file or dir" to "dir". `GIT_REFUSED_IF_PRESENT` and `GIT_DROPPED_RELPATHS`
+  are new tables beside it, and `LAYOUT_ROWS` still has to match
+  `GIT_REQUIRED_KINDS` exactly.
+* `neutralise_git_config` -> `rewrite_git_config`; `ConfigNeutralisation` ->
+  `ConfigRewrite`, which now also reports the entry names kept and dropped.
+
+Behaviour changes an operator will notice
+* **A snapshot with submodules (`.git/modules/`), one that hosts linked
+  worktrees (`.git/worktrees/`), one that IS a linked worktree
+  (`.git/commondir`), or one whose `.git` is a gitlink FILE is now REFUSED.**
+  That is a deliberate scope reduction: those repositories keep config and
+  objects in a `.git` Eris has not copied, has not rewritten and does not
+  guard. It shows up as a refusal, never as a quiet half-verification.
+* The copy's `.git/config` no longer resembles the original's. Anything reading
+  it for the repository's remotes, user or aliases will find none.
+
+Not a regression
+* The ORIGINAL is still never opened for writing, in every path including the
+  refusals, and that is now pinned across the refusing cases too.
+* The race guards (`lstat`, `O_NOFOLLOW`, `O_EXCL`, the dev+inode re-check
+  before the `unlink`), `GUARD_EXCLUDED_RELPATHS`, `GIT_INDEX_DIGEST_ARGS`, the
+  model-facing allowlist and the `bytes_fallback` are untouched.
+* An ordinary checkout - two remotes, a user, aliases, tracking config, several
+  branches - still runs the WHOLE default battery clean. That test exists
+  because a guard that rejects ordinary repositories gets deleted by the next
+  person.
+
+Honest limits (not fixed, stated)
+* The working TREE is still the repository's, `.gitattributes` included. It is
+  inert only for as long as nothing DEFINES the driver it names, so widening
+  the allowlist is the thing to watch.
+* Objects, refs, commit messages, tags and notes are copied verbatim and remain
+  in-band instruction channels.
+* The allowlist is applied ONCE, during sanitisation. Nothing re-applies it
+  between verification commands; a command that rewrote `.git/config` mid-run
+  would be caught by the guard's tree hash, not by the rewriter.
+* This contains git's reading of the copy. It is not a container, and it does
+  not stop a worker or a trusted `pytest` from reading outside the snapshot.
+
+Tests
+* `test_verify_real_git.py::test_a_repository_diff_external_cannot_execute_in_the_verification_copy`,
+  `::test_a_repository_textconv_driver_cannot_execute_in_the_verification_copy`,
+  `::test_a_planted_alternates_cannot_reach_a_truncated_away_object` - the three
+  measured vectors, end to end through `sanitize_snapshot` and a real
+  verification command. Each also proves the vector is REAL by running the same
+  thing in the untouched original.
+* `::test_a_git_info_attributes_driver_cannot_execute_in_the_verification_copy` -
+  the same vector one level down, through `.git/info/attributes` (the
+  repository-LOCAL attributes file, not tracked, copied with the rest of
+  `.git`). Measured on git 2.50.1: with the driver defined it EXECUTES, with
+  the driver unset it is inert. The docs called this inert BY REASONING; it is
+  now pinned, and it is the test that fails first if the allowlist ever gains
+  a driver-defining key.
+* `::test_an_ordinary_repository_still_runs_the_whole_battery_after_the_rewrite`
+  (no false refusal), `::test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports`
+  (the round trip, judged by `git config --list` rather than by Eris's own
+  parser), `::test_the_object_format_extension_survives_the_rewrite` (a real
+  sha256 repository still opens).
+* `test_sanitize.py::test_the_copy_config_keeps_only_the_allowlisted_keys`,
+  `::test_the_config_parser_reads_gits_real_grammar`,
+  `::test_a_config_eris_cannot_parse_refuses_the_copy`,
+  `::test_an_allowlisted_value_is_requoted_and_a_control_byte_refuses`,
+  `::test_a_bare_allowlisted_key_stays_bare`,
+  `::test_a_subsectioned_core_or_extensions_entry_is_dropped`,
+  `::test_the_alternates_and_worktree_config_are_dropped_from_the_copy`,
+  `::test_a_copy_that_is_not_one_self_contained_repository_is_refused`,
+  `::test_the_repo_escape_checks_fail_closed_on_an_unreadable_path`,
+  `::test_the_original_is_byte_identical_whatever_the_copy_does`.
+
 ## 0.3.8 - the `.git/config` control fails closed, and a general layout guard (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The

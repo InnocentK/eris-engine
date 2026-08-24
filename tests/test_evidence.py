@@ -16,10 +16,12 @@ from pydantic import ValidationError
 
 from eris.evidence import (
     EXCERPT_MAX_LINES,
+    INDEX_CHECK_NONE,
     ITEM_HEAD_BYTES,
     ITEM_TAIL_BYTES,
     EvidenceCleanupError,
     EvidenceStopped,
+    IndexProbeResult,
     RequestState,
     TaskSpec,
     VerifyEnv,
@@ -515,7 +517,8 @@ def test_verification_guard_trips_on_a_changed_copy_and_stops_verification(
 
     popen = WritingPopen()
     env = make_env(tmp_path, copy, popen, make_policy(tmp_path))
-    env.guard = SnapshotGuard.over(copy)
+    # a working probe: without one the guard now refuses outright (item 3)
+    env.guard = SnapshotGuard.over(copy, probe=FakeIndexProbe())
     w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
     items = execute_evidence_requests(
         [
@@ -598,17 +601,21 @@ def test_the_guard_still_trips_on_everything_but_the_git_index(
 
 
 class FakeIndexProbe:
-    """Stands in for `git ls-files -s -v`. The hermetic suite may not spawn
+    """Stands in for `git ls-files -s -v -f`. The hermetic suite may not spawn
     git, so the STAGED CONTENT is whatever this holder says it is; rewriting
-    ``digest`` is a staging change, leaving it alone is a stat refresh."""
+    ``digest`` is a staging change, leaving it alone is a stat refresh.
+    ``gitlinks`` stands in for submodule entries in the same output."""
 
-    def __init__(self, digest: str | None = "stage-0") -> None:
+    def __init__(self, digest: str | None = "stage-0", gitlinks: tuple[str, ...] = ()) -> None:
         self.digest = digest
+        self.gitlinks = gitlinks
         self.calls = 0
 
-    def __call__(self, root: Path) -> str | None:
+    def __call__(self, root: Path) -> IndexProbeResult | None:
         self.calls += 1
-        return self.digest
+        if self.digest is None:
+            return None
+        return IndexProbeResult(self.digest, self.gitlinks)
 
 
 def test_the_guard_trips_on_a_changed_index_digest_but_not_on_a_stat_refresh(
@@ -652,25 +659,53 @@ def test_an_index_change_that_also_moves_the_tree_is_reported_as_git_index(
     assert change is not None and change.reason == "git_index"
 
 
-def test_a_guard_without_a_usable_git_falls_back_to_hashing_the_index_bytes(
+def test_a_guard_without_a_usable_git_refuses_instead_of_hashing_the_bytes(
     tmp_path: Path,
 ) -> None:
-    """M2c item 2: FAIL CLOSED. No semantic digest means the byte exclusion is
-    dropped for that run - never a silently skipped check."""
-    from eris.evidence import INDEX_CHECK_BYTES_FALLBACK, SnapshotGuard
+    """M2c follow-up 5, advisor round, item 3. This USED to fall back to
+    byte-hashing `.git/index` and carry on. That was a hole: without the
+    semantic digest the gitlink scan never runs, so with git unusable a run
+    proceeded against a copy that might carry an un-checked-out submodule -
+    the exact case the scan exists for.
+
+    It now FAILS CLOSED by refusing, and the message says why. Nothing real is
+    lost: every command in the default battery IS git, so a copy whose pinned
+    git cannot be run has no verification to produce anyway.
+
+    Both branches: no probe supplied at all, and a probe that cannot answer."""
+    from eris.evidence import IndexScopeUnknown, SnapshotGuard
 
     root = make_snapshot(tmp_path)
     (root / ".git" / "index").write_bytes(b"stat cache v1")
-    for guard in (
-        SnapshotGuard.over(root),  # no probe at all
-        SnapshotGuard.over(root, probe=FakeIndexProbe(None)),  # git unavailable/failed
-    ):
-        assert guard.index_check == INDEX_CHECK_BYTES_FALLBACK and guard.index_digest is None
-        assert guard.changed() is None
-        (root / ".git" / "index").write_bytes(b"stat cache v2")
-        change = guard.changed()
-        assert change is not None and change.reason == "tree"  # the bytes ARE hashed now
-        (root / ".git" / "index").write_bytes(b"stat cache v1")
+    for probe in (None, FakeIndexProbe(None)):
+        with pytest.raises(IndexScopeUnknown, match="cannot be established; refusing to verify"):
+            SnapshotGuard.over(root, probe=probe)
+
+    # ... and a copy with NO `.git` needs no digest and is not refused: there is
+    # no index, so there can be no gitlink
+    bare = tmp_path / "no-git"
+    bare.mkdir()
+    (bare / "a.py").write_text("x = 1\n")
+    guard = SnapshotGuard.over(bare)
+    assert guard.index_check == INDEX_CHECK_NONE and guard.index_digest is None
+    assert guard.changed() is None
+
+
+def test_the_refusal_is_the_one_the_harness_reports_as_refused() -> None:
+    """`IndexScopeUnknown` and `NestedRepositoryRefused` are both
+    `VerificationRefused`, which is the single type `eval/run.py` catches to
+    turn a deliberate refusal into EXIT_CONFIG / `refused` rather than a
+    traceback. A new refusal must inherit from it or it will crash the run."""
+    from eris.evidence import (
+        EvidenceError,
+        IndexScopeUnknown,
+        NestedRepositoryRefused,
+        VerificationRefused,
+    )
+
+    assert issubclass(IndexScopeUnknown, VerificationRefused)
+    assert issubclass(NestedRepositoryRefused, VerificationRefused)
+    assert issubclass(VerificationRefused, EvidenceError)
 
 
 def test_a_probe_that_stops_working_mid_run_trips_the_guard(tmp_path: Path) -> None:
@@ -720,9 +755,12 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
     root = make_snapshot(tmp_path)
     policy = make_policy(tmp_path)
     popen = ScriptedPopen({"ls-files": b"H 100644 abc 0\tcalc.py\n"})
-    digest = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
+    result = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)(
         root
     )
+    assert result is not None
+    digest = result.digest
+    assert result.gitlinks == ()  # a plain file entry is not a submodule
     assert GIT_INDEX_DIGEST_ARGS == (*GIT_ERIS_GLOBALS, "ls-files", "-s", "-v", "-f")
     argv, kw = popen.calls[0]
     assert argv == [
@@ -744,9 +782,9 @@ def test_the_index_digest_runs_the_pinned_git_and_never_the_model_allowlist(
 @pytest.mark.parametrize("why", ["unpinned", "swapped-since-the-pin", "missing"])
 def test_the_index_prober_refuses_an_unpinned_or_changed_git(tmp_path: Path, why: str) -> None:
     """M2c item 1: POLICY-PINNED. An unpinned, swapped or missing git yields
-    no digest (and is never spawned), which the guard turns into
-    `bytes_fallback`."""
-    from eris.evidence import INDEX_CHECK_BYTES_FALLBACK, SnapshotGuard, git_index_prober
+    no digest (and is never spawned), which the guard now turns into a REFUSAL
+    (advisor round, item 3) rather than a byte-hash fallback."""
+    from eris.evidence import IndexScopeUnknown, SnapshotGuard, git_index_prober
 
     root = make_snapshot(tmp_path)
     policy = make_policy(tmp_path, pinned=why != "unpinned")
@@ -758,7 +796,8 @@ def test_the_index_prober_refuses_an_unpinned_or_changed_git(tmp_path: Path, why
     probe = git_index_prober(policy, tmp_path / "probe-home", popen=popen, killpg=lambda *_: None)
     assert probe(root) is None, why
     assert popen.calls == []
-    assert SnapshotGuard.over(root, probe=probe).index_check == INDEX_CHECK_BYTES_FALLBACK
+    with pytest.raises(IndexScopeUnknown):
+        SnapshotGuard.over(root, probe=probe)
 
 
 @pytest.mark.parametrize("failure", ["exit-code", "truncated-output", "spawn-raises"])
@@ -955,3 +994,43 @@ def test_verify_scratch_is_private_removed_and_cleanup_failure_is_a_run_error(
     assert ev[-1]["kind"] == "run.error"
     assert ev[-1]["payload"]["kind"] == "verify_scratch_cleanup_failed"
     w.close()
+
+
+def test_a_gitlink_in_the_index_refuses_the_verification_run(tmp_path: Path) -> None:
+    """M2c follow-up 5, advisor round, the hermetic half. A gitlink entry means
+    the snapshot is a SUPERPROJECT; its submodules carry configs Eris never
+    rewrites. The guard refuses at BASELINE - before any verification command
+    exists - and names the paths. The signal costs no extra spawn: `-s` already
+    prints the mode in the digest output."""
+    from eris.evidence import INDEX_CHECK_SEMANTIC, NestedRepositoryRefused, SnapshotGuard
+
+    root = make_snapshot(tmp_path)
+    with pytest.raises(NestedRepositoryRefused, match=r"vendor/a, vendor/b: the index registers 2"):
+        SnapshotGuard.over(root, probe=FakeIndexProbe(gitlinks=("vendor/a", "vendor/b")))
+    # ... and an ordinary repository is not refused
+    assert SnapshotGuard.over(root, probe=FakeIndexProbe()).index_check == INDEX_CHECK_SEMANTIC
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        (b"H 100644 abc 0\tcalc.py\n", ()),
+        (b"H 160000 abc 0\tsub\n", ("sub",)),
+        (b"H 100644 abc 0\ta\nH 160000 def 0\tvendor/x\n", ("vendor/x",)),
+        (b"S 160000 abc 0\tsub\n", ("sub",)),  # any status letter
+        (b"h 160000 abc 0\tsub with spaces\n", ("sub with spaces",)),
+        (b"H 120000 abc 0\tlink\n", ()),  # a symlink entry is not a gitlink
+        (b"", ()),
+        (b"garbage\n", ()),  # a line that is not an entry is ignored
+        (b"H 160000 abc 0 no-tab\n", ()),  # ... and so is one with no path
+    ],
+)
+def test_the_gitlink_scan_reads_only_well_formed_entries(
+    stdout: bytes, expected: tuple[str, ...]
+) -> None:
+    """The scan is a SCOPE signal read off the digest output, so it is
+    deliberately conservative: only a `<letter> <mode> <sha> <stage>\\t<path>`
+    line counts. The DIGEST, not this, is what the tripwire relies on."""
+    from eris.evidence import _gitlink_paths
+
+    assert _gitlink_paths(stdout) == expected

@@ -4,8 +4,11 @@ repository's instruction files removed.
 agy injects a declared workspace's ``AGENTS.md``/``GEMINI.md`` rules (A15)
 and grok was observed following repo instructions once (E1). Workers whose
 policy says ``sanitize_snapshot: true`` run their proposer/critic roles on a
-COPY built here; mechanical verification ALWAYS runs on the ORIGINAL
-(``eris.evidence`` takes the original root explicitly).
+COPY built here. Mechanical verification never runs in one of those STRIPPED
+copies, and it does not run in the original either: it runs in a separate
+private VERIFICATION copy, also built here (:data:`VERIFICATION_PROFILE`),
+which strips nothing from the working tree. ``eris.evidence`` takes whatever
+root it is given; the harness gives it that copy.
 
 Rules (each has a test in tests/test_sanitize.py):
 
@@ -18,15 +21,21 @@ Rules (each has a test in tests/test_sanitize.py):
 * Files are copied (new inodes: never hardlinks); symlinks are kept only
   when relative, resolving inside the original tree and not into a stripped
   entry; every other symlink is DROPPED and recorded.
-* ``.git`` is copied with ``.git/hooks`` removed (``core.hooksPath`` is
-  neutralised by the launcher's git hardening) and, in the COPY's
-  ``.git/config`` only, ``core.fsmonitor`` and ``core.untrackedCache``
-  disabled (:func:`neutralise_git_config`). A snapshot without ``.git`` is
-  fine. That control FAILS CLOSED: a ``.git/config`` that is a symlink
-  resolving inside the copy is read, unlinked and replaced by a regular
-  neutralised file (recorded in ``dropped_symlinks``); any other shape refuses
-  the copy; and :func:`assert_git_layout_sane` then re-checks every ``.git``
-  path Eris depends on (:data:`GIT_REQUIRED_KINDS`).
+* ``.git`` is copied with ``.git/hooks`` removed, and the COPY is CONTAINED:
+  its ``.git/config`` is rewritten from an ALLOWLIST
+  (:func:`rewrite_git_config`) so no repository-supplied key can make git
+  execute a repository-supplied program; ``.git/objects/info/alternates``,
+  its ``http-`` twin and ``.git/config.worktree`` are deleted
+  (:func:`drop_git_repo_escapes`); and a copy that is not ONE self-contained
+  repository - a gitlink ``.git`` FILE, ``.git/commondir``,
+  ``.git/worktrees/``, ``.git/modules/``, or ANY nested ``.git`` below the root
+  - is REFUSED (:func:`assert_no_repo_escapes`,
+  :func:`assert_no_nested_repositories`, :func:`assert_git_layout_sane`). A snapshot
+  without ``.git`` is fine. The config control FAILS CLOSED: a ``.git/config``
+  that is a symlink resolving inside the copy is read, unlinked and replaced
+  by a regular rewritten file (recorded in ``dropped_symlinks``); any other
+  shape refuses the copy; and :func:`assert_git_layout_sane` then re-checks
+  every ``.git`` path Eris depends on (:data:`GIT_REQUIRED_KINDS`).
 * The copy lives in a ``make_private_dir`` under the run's scratch dir and
   is deleted in ``finally``; a cleanup failure raises
   :class:`SanitizeCleanupError` (the caller records a ``run.error``).
@@ -44,6 +53,7 @@ import errno
 import os
 import shutil
 import stat
+import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -61,33 +71,80 @@ from eris.schemas import (
 GIT_DIR = ".git"
 GIT_HOOKS = (GIT_DIR, "hooks")
 GIT_CONFIG = (GIT_DIR, "config")
+GIT_CONFIG_WORKTREE = (GIT_DIR, "config.worktree")
+GIT_ALTERNATES = (GIT_DIR, "objects", "info", "alternates")
+GIT_HTTP_ALTERNATES = (GIT_DIR, "objects", "info", "http-alternates")
+GIT_COMMONDIR = (GIT_DIR, "commondir")
+GIT_WORKTREES = (GIT_DIR, "worktrees")
+GIT_MODULES = (GIT_DIR, "modules")
 
-#: ``core.*`` keys neutralised in the COPY's ``.git/config`` (lower-cased; git
-#: config keys are case-insensitive). Both make git answer from a filesystem
-#: cache instead of from the working tree, and both are inherited verbatim by a
-#: `cp -a` of a repository that configures them.
-NEUTRALISED_GIT_CONFIG_KEYS: tuple[str, ...] = ("fsmonitor", "untrackedcache")
+#: The ONLY ``[core]`` keys kept in the copy's ``.git/config``, lower-cased (git
+#: config keys are case-insensitive). This is an ALLOWLIST, and the bar for
+#: adding one is: the REPOSITORY FORMAT needs it to open the copy correctly, and
+#: its value can name neither a command nor a path git will act on.
+#:
+#: * ``repositoryformatversion`` - without it git assumes 0, which would silently
+#:   ignore ``extensions.*`` on a version-1 repository.
+#: * ``filemode``, ``symlinks``, ``ignorecase``, ``precomposeunicode`` -
+#:   filesystem capability flags. Written by ``git init`` from what the
+#:   filesystem actually supports; dropping them makes git re-guess from the
+#:   SCRATCH filesystem the copy lives on, which can report every file as
+#:   modified (a false ``snapshot.violated``). Booleans; no path, no command.
+#: * ``bare`` - written by ``git init``; a wrong answer breaks every command.
+#: * ``logallrefupdates`` - boolean, whether ref updates write a reflog. Kept
+#:   because it is in every ``git init`` config and its absence changes what
+#:   ``git reflog`` reports.
+GIT_CONFIG_ALLOWED_CORE_KEYS: frozenset[str] = frozenset(
+    {
+        "repositoryformatversion",
+        "filemode",
+        "bare",
+        "symlinks",
+        "ignorecase",
+        "precomposeunicode",
+        "logallrefupdates",
+    }
+)
 
-#: Appended to the copy's ``.git/config`` after the matching entries are
-#: removed. Removal alone is not enough: `.git/config` may `include` another
-#: file, and a later section wins in git's config order, so an explicit
-#: trailing ``[core]`` block is what actually guarantees the value.
-GIT_CONFIG_NEUTRALISED_BLOCK = (
+#: ``extensions.*`` keys KEPT, mapped to the exact values each may take
+#: (compared lower-cased). Keeping the WHOLE section was the 0.3.9 design and
+#: it was not evidence-backed: it asserted that no ``extensions`` value names
+#: anything dangerous, over a set of keys git is free to grow.
+#:
+#: Only the object format is kept, because it is the one extension whose
+#: absence makes the repository fail to OPEN: measured 2026-08-24 on git
+#: 2.50.1, ``git init --object-format=sha256`` writes
+#: ``extensions.objectformat = sha256`` with ``repositoryformatversion = 1``,
+#: and an invalid value is ``fatal: bad config line``.
+GIT_CONFIG_EXTENSIONS_KEPT: dict[str, frozenset[str]] = {
+    "objectformat": frozenset({"sha1", "sha256"}),
+    "compatobjectformat": frozenset({"sha1", "sha256"}),
+}
+
+#: ``extensions.*`` keys DROPPED rather than refused, because Eris has already
+#: removed the only thing they enable and their absence therefore changes
+#: nothing. ``worktreeConfig`` enables ``.git/config.worktree``, which
+#: :func:`drop_git_repo_escapes` deletes; keeping the key would point git at a
+#: file that is no longer there.
+GIT_CONFIG_EXTENSIONS_DROPPED: frozenset[str] = frozenset({"worktreeconfig"})
+
+#: Written at the top of every rewritten config so an operator reading the copy
+#: knows it is not the original's file.
+GIT_CONFIG_HEADER = (
     "# eris: this is a private VERIFICATION/worker COPY, never the original.\n"
-    "# Filesystem-monitor caches are disabled here so that no daemon or hook\n"
-    "# can mark index entries valid mid-run and no stale cache can answer for\n"
-    "# the working tree. See docs/SECURITY.md.\n"
-    "[core]\n"
-    "\tfsmonitor = false\n"
-    "\tuntrackedCache = false\n"
+    "# The repository's own .git/config is NOT here. This file was rewritten\n"
+    "# from an ALLOWLIST: only the keys the repository FORMAT needs survive.\n"
+    "# Everything else - diff.*, filter.*, alias.*, remote.*, include.*, and\n"
+    "# every path-or-command core.* - is dropped, because a repository-supplied\n"
+    "# config can otherwise make git execute a repository-supplied program.\n"
+    "# See docs/SECURITY.md.\n"
 )
 
 #: What each path under the copy's ``.git`` that Eris DEPENDS ON must be after
-#: sanitisation: ``"file"`` a regular file, ``"dir"`` a directory,
-#: ``"file_or_dir"`` either (``.git`` itself is a directory in a normal clone
-#: and a regular file - the gitlink - in a worktree or submodule). ABSENT is
+#: sanitisation: ``"file"`` a regular file, ``"dir"`` a directory. ABSENT is
 #: always allowed: a snapshot with no ``.git``, a repository with no ``index``
-#: yet, the ``hooks`` directory Eris deliberately never copies.
+#: yet, the ``hooks`` directory Eris deliberately never copies, the paths Eris
+#: drops or refuses outright.
 #:
 #: Anything else - a symlink, a fifo, a socket, a device, a file where a
 #: directory belongs - REFUSES the copy (:func:`assert_git_layout_sane`).
@@ -97,19 +154,62 @@ GIT_CONFIG_NEUTRALISED_BLOCK = (
 #: here plus one row in ``test_sanitize.py::test_the_git_layout_assertion_
 #: refuses_every_non_regular_shape``. The bar for adding one: Eris (or the
 #: guard) reads it AND a normal repository can only ever have it as that type.
-GIT_REQUIRED_KINDS: tuple[tuple[tuple[str, ...], str], ...] = (
-    ((GIT_DIR,), "file_or_dir"),
-    (GIT_CONFIG, "file"),
-    ((GIT_DIR, "index"), "file"),
-    (GIT_HOOKS, "dir"),
+#: The third column is WHY, and it is appended to the refusal message.
+GIT_REQUIRED_KINDS: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    ((GIT_DIR,), "dir", "a `.git` FILE is a worktree/submodule gitlink, which Eris does not copy"),
+    (GIT_CONFIG, "file", "git reads it whatever shape it is, so Eris must be able to rewrite it"),
+    ((GIT_DIR, "index"), "file", "the verification tripwire hashes and digests it"),
+    (GIT_HOOKS, "dir", "Eris deliberately never copies it"),
+    (GIT_CONFIG_WORKTREE, "file", "Eris drops it: per-worktree config executes like `config`"),
+    (GIT_ALTERNATES, "file", "Eris drops it: it re-exposes another repository's object store"),
+    (GIT_HTTP_ALTERNATES, "file", "Eris drops it: the same escape over HTTP"),
+    (
+        GIT_COMMONDIR,
+        "file",
+        "Eris refuses it: a linked worktree is not a self-contained repository",
+    ),
+    (GIT_WORKTREES, "dir", "Eris refuses it: a worktree host snapshot is out of scope"),
+    (GIT_MODULES, "dir", "Eris refuses it: a submodule snapshot is out of scope"),
+)
+
+#: Paths whose mere PRESENCE in the copy refuses it, whatever their shape:
+#: they mean the snapshot is not one self-contained repository, so neither the
+#: config rewrite nor the tripwire covers everything git would read. Refusing is
+#: honest; silently verifying half a repository is not.
+GIT_REFUSED_IF_PRESENT: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        GIT_COMMONDIR,
+        "this is a LINKED WORKTREE: its refs, config and objects live in another "
+        "`.git` that Eris has not copied and cannot contain",
+    ),
+    (
+        GIT_WORKTREES,
+        "this repository HOSTS linked worktrees, each with its own "
+        "`config.worktree` and gitdir outside the paths Eris rewrites",
+    ),
+    (
+        GIT_MODULES,
+        "this repository has SUBMODULE gitdirs, each a repository with its own "
+        "config that Eris neither rewrites nor guards",
+    ),
+)
+
+#: Removed from the copy after :func:`assert_git_layout_sane` has confirmed each
+#: is a regular file or absent. ``alternates`` points git at another object
+#: store: in a history-truncated snapshot it makes the very commits
+#: ``eris.snapshot`` removed reachable again (measured 2026-08-24, git 2.50.1).
+#: ``config.worktree`` is a second config file with the same execution risk.
+GIT_DROPPED_RELPATHS: tuple[tuple[str, ...], ...] = (
+    GIT_ALTERNATES,
+    GIT_HTTP_ALTERNATES,
+    GIT_CONFIG_WORKTREE,
 )
 
 _KIND_TEST: dict[str, Callable[[int], bool]] = {
     "file": stat.S_ISREG,
     "dir": stat.S_ISDIR,
-    "file_or_dir": lambda m: stat.S_ISREG(m) or stat.S_ISDIR(m),
 }
-_KIND_NAME = {"file": "a regular file", "dir": "a directory", "file_or_dir": "a file or directory"}
+_KIND_NAME = {"file": "a regular file", "dir": "a directory"}
 
 
 class SanitizeError(RuntimeError):
@@ -157,6 +257,45 @@ class SanitizeProfile:
 
 
 # --------------------------------------------------------------------------- tree hash
+
+
+def _fold(name: str) -> str:
+    """One filesystem name, folded the way a CASE-INSENSITIVE filesystem
+    compares it: NFC-normalised, then case-folded.
+
+    Measured 2026-08-24 on macOS/APFS: a directory created as ``.GIT`` is
+    reported by ``os.walk``/``os.listdir`` under its literal name, while
+    ``Path("sub/.git").exists()`` is True and git resolves it - so an exact
+    ``name == ".git"`` test misses a nested repository the kernel happily
+    hands to git. That is the whole reason this exists.
+
+    The NFC step is a NO-OP for ``.git`` and is measured to be one: ``.git``
+    is pure ASCII, so NFC, NFD, NFKC and NFKD all return it unchanged, and
+    there is no decomposed spelling of it. It is kept so the helper stays
+    correct if a non-ASCII marker name is ever added, not because ``.git``
+    needs it. It deliberately does NOT fold compatibility lookalikes: a
+    fullwidth ``.gｉt`` is a DIFFERENT file on this filesystem (measured -
+    creating it leaves ``.git`` non-existent), so treating it as ``.git``
+    would be a false refusal.
+
+    On a case-SENSITIVE filesystem ``.GIT`` is a distinct, ordinary directory
+    that git never reads, so folding costs a refused copy there and never an
+    escape - the safe direction."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _is_git_name(name: str) -> bool:
+    """True when the filesystem may hand ``name`` to git as ``.git``."""
+    return _fold(name) == _fold(GIT_DIR)
+
+
+def _under_git_path(parts: tuple[str, ...], expected: tuple[str, ...]) -> bool:
+    """True when the relpath ``parts`` is at or below ``expected``, comparing
+    each component with :func:`_fold` - so ``.GIT/hooks`` is still the hooks
+    directory Eris refuses to copy."""
+    if len(parts) < len(expected):
+        return False
+    return all(_fold(a) == _fold(b) for a, b in zip(parts, expected, strict=False))
 
 
 def tree_sha256(root: Path, *, skip: Callable[[PurePosixPath], bool] | None = None) -> str:
@@ -226,15 +365,26 @@ def _symlink_keepable(
 
 
 def sanitize_snapshot(
-    original: Path, dest: Path, *, profile: SanitizeProfile, worker_id: str
+    original: Path,
+    dest: Path,
+    *,
+    profile: SanitizeProfile,
+    worker_id: str,
+    dest_reserved: bool = False,
 ) -> SnapshotSanitization:
     """Build ``dest`` (created fresh; refused if it exists or is a symlink)
-    as the sanitized copy of ``original``. Never writes to ``original``."""
+    as the sanitized copy of ``original``. Never writes to ``original``.
+
+    ``dest_reserved`` says the CALLER already made the ``make_private_dir``
+    call - that is, the caller holds the proof that the successful ``mkdir``
+    was its own. :func:`sanitized_copy` uses it so that its cleanup can never
+    delete a directory somebody else created (advisor round, item 4)."""
     original = Path(original).resolve()
     if not original.is_dir():
         raise SanitizeError(f"snapshot {original} is not a directory")
     dest = Path(dest)
-    make_private_dir(dest)
+    if not dest_reserved:
+        make_private_dir(dest)
     dest = dest.resolve()
     if dest == original or _is_under(dest, original) or _is_under(original, dest):
         raise SanitizeError("the copy must not live inside the original (or vice versa)")
@@ -246,13 +396,15 @@ def sanitize_snapshot(
     made_dirs: list[tuple[Path, Path]] = [(original, dest)]
     for dirpath, dirnames, filenames in os.walk(original, topdown=True, followlinks=False):
         base = Path(dirpath)
-        in_git = _rel(base, original).parts[:1] == (GIT_DIR,) if base != original else False
+        in_git = (
+            _under_git_path(_rel(base, original).parts, (GIT_DIR,)) if base != original else False
+        )
         keep_dirs: list[str] = []
         for d in sorted(dirnames):
             src = base / d
             rel = _rel(src, original)
-            if rel.parts[: len(GIT_HOOKS)] == GIT_HOOKS:
-                continue  # .git/hooks is never copied
+            if _under_git_path(rel.parts, GIT_HOOKS):
+                continue  # .git/hooks is never copied (`.GIT/HOOKS` too: see `_fold`)
             if not in_git and profile.matches(rel):
                 stripped.extend(_collect(src, original))
                 continue
@@ -284,11 +436,19 @@ def sanitize_snapshot(
             shutil.copy2(src, dest / rel, follow_symlinks=False)  # new inode, never a hardlink
     # BEFORE the directory modes are restored (a read-only `.git` would forbid
     # the write) and before anything is handed to a caller, so the copy is
-    # already neutralised when the first command runs against it
-    outcome = neutralise_git_config(dest)
+    # already contained when the first command runs against it. Order is
+    # load-bearing: the config rewrite is what turns a `.git/config` SYMLINK
+    # into the regular file the layout assertion then insists on, the layout
+    # assertion is what proves the dropped paths are regular files an `unlink`
+    # can safely remove, and nothing is deleted from a copy that is about to be
+    # refused outright.
+    outcome = rewrite_git_config(dest)
     if outcome.replaced_symlink is not None:
         dropped.append(outcome.replaced_symlink)  # the link is gone from the copy
     assert_git_layout_sane(dest)  # nothing under `.git` is a shape Eris cannot reason about
+    assert_no_repo_escapes(dest)  # ... and the copy is ONE self-contained repository
+    assert_no_nested_repositories(dest)  # ... with no OTHER repository inside it
+    drop_git_repo_escapes(dest)  # alternates + per-worktree config never reach a worker
     # deepest first: a directory's mode may forbid writing, so it is applied
     # only once everything below it exists (fidelity, cond 4)
     for src_dir, copy_dir in reversed(made_dirs):
@@ -304,43 +464,348 @@ def sanitize_snapshot(
 
 
 @dataclass(frozen=True)
-class ConfigNeutralisation:
-    """What :func:`neutralise_git_config` did to the copy's ``.git/config``."""
+class ConfigRewrite:
+    """What :func:`rewrite_git_config` did to the copy's ``.git/config``."""
 
     rewritten: bool
-    #: The relpath of a SYMLINK that was replaced by the neutralised regular
+    #: The relpath of a SYMLINK that was replaced by the rewritten regular
     #: file (``.git/config``), or None. Recorded in
     #: ``SnapshotSanitization.dropped_symlinks``: the link is no longer in the
     #: copy, and the run must be able to see that it was there.
     replaced_symlink: str | None = None
+    #: Fully-qualified names of the entries KEPT and DROPPED, in file order
+    #: (``core.filemode``, ``diff.external``, ``diff.evil.textconv``). Reported
+    #: for tests and operators; not a ledger record.
+    kept: tuple[str, ...] = ()
+    dropped: tuple[str, ...] = ()
 
 
-def _neutralised_bytes(raw: bytes) -> bytes:
-    """The neutralised content of a git config: matching ``[core]`` entries
-    (including a backslash-continued value) removed, the explicit block
-    appended. Bytes in, bytes out - never decoded, so a non-UTF-8 or CRLF
-    config round-trips unchanged apart from the removed lines."""
-    kept: list[bytes] = []
-    in_core = False
-    dropping = False
-    for line in raw.splitlines(keepends=True):
-        body = line.strip()
-        if dropping:  # a continued value belongs to the key that was dropped
-            dropping = body.endswith(b"\\")
+# ------------------------------------------------------- the git config parser
+#
+# A faithful port of git's `config.c` (`git_parse_source` / `get_base_var` /
+# `get_extended_base_var` / `get_value` / `parse_value`), byte for byte, because
+# every previous version of this control was a LINE-oriented approximation and
+# every previous version was bypassed. git's real grammar is not line-oriented:
+# measured 2026-08-24 on git 2.50.1, `[core] filemode = true` and
+# `[core]filemode=true` are both a section header AND a variable on ONE line,
+# `[core][user] name = x` puts the variable in `user`, a value continues across
+# lines with a trailing backslash, `\r\n` collapses to `\n`, a leading UTF-8 BOM
+# is skipped, and a `#`/`;` outside quotes starts a comment mid-value.
+#
+# Fail-closed direction: this parser decides only what to KEEP. If it
+# mis-parses in the direction of "this is not an allowlisted section", the entry
+# is dropped, which is safe. If it cannot parse the file at all it RAISES and
+# the copy is refused, which is also safe.
+#
+# What is actually VERIFIED about the correspondence with git, and no more:
+# every row of `test_sanitize.py::test_the_config_parser_reads_gits_real_grammar`
+# is replayed through a real git in
+# `test_verify_real_git.py::test_the_config_parser_agrees_with_git_on_every_
+# grammar_row`, which compares this parser's entries with `git config --list -z`
+# record for record. The refusal rows measured to be `fatal: bad config line`
+# in git are a bad escape, an unterminated quote and an EMPTY section header
+# (`[]`); the other refusals here are Eris being stricter than git, which costs
+# a copy and never an escape. This is a correspondence pinned by a table, not a
+# proof of equivalence: a construction in neither table is unverified.
+
+_CONFIG_SPACE = frozenset(b" \t\n\v\f\r")
+_CONFIG_KEYCHARS = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+_CONFIG_ALPHA = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_EOF = -1
+
+
+class GitConfigParseError(SanitizeError):
+    """The copy's ``.git/config`` is not a config file git would accept."""
+
+
+class UnsupportedRepositoryExtension(SanitizeError):
+    """The repository declares an ``extensions.*`` Eris cannot vouch for.
+
+    REFUSING rather than dropping is deliberate. An extension declares how the
+    repository is STORED, so silently dropping one leaves a copy git opens and
+    then misreads: measured 2026-08-24 on git 2.50.1, ``git init
+    --ref-format=reftable`` writes ``extensions.refstorage = reftable``, and a
+    copy without it is a repository whose refs git looks for in the wrong
+    place. A loud refusal naming the key is honest; a quietly broken copy that
+    then reports "no such ref" is not."""
+
+
+@dataclass(frozen=True)
+class GitConfigEntry:
+    """One ``section[.subsection].key = value`` entry, exactly as git sees it.
+
+    ``section`` and ``key`` are lower-cased (git does); ``subsection`` keeps its
+    case in the ``[section "sub"]`` form and is lower-cased in the deprecated
+    ``[section.sub]`` form, again as git does. ``value is None`` is a bare key,
+    which git reads as boolean true."""
+
+    section: bytes
+    subsection: bytes | None
+    key: bytes
+    value: bytes | None
+
+    @property
+    def name(self) -> str:
+        parts = [self.section, *([] if self.subsection is None else [self.subsection]), self.key]
+        return b".".join(parts).decode("utf-8", errors="replace")
+
+
+class _ConfigReader:
+    """git's ``get_next_char``: a UTF-8 BOM is skipped, ``\\r\\n`` becomes
+    ``\\n``, a lone ``\\r`` stays (git's ``ungetc`` of the peeked byte is a
+    one-byte look-ahead here), and EOF is reported as :data:`_EOF`."""
+
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+        self._i = 0
+
+    def next(self) -> int:
+        if self._i >= len(self._raw):
+            return _EOF
+        c = self._raw[self._i]
+        self._i += 1
+        if c == 0x0D and self._i < len(self._raw) and self._raw[self._i] == 0x0A:
+            self._i += 1
+            return 0x0A
+        return c
+
+
+def _skip_to_end_of_line(reader: _ConfigReader) -> None:
+    while True:
+        c = reader.next()
+        if c in (_EOF, 0x0A):
+            return
+
+
+def _read_section(reader: _ConfigReader) -> tuple[bytes, bytes | None]:
+    """git's ``get_base_var`` (+ ``get_extended_base_var``), called just after
+    the ``[``. Returns ``(section, subsection)``."""
+    name = bytearray()
+    while True:
+        c = reader.next()
+        if c == _EOF:
+            raise GitConfigParseError("unterminated section header")
+        if c == 0x5D:  # ]
+            base = bytes(name)
+            if not base:
+                # git builds `section[.subsection]` into one buffer and then
+                # rejects the line if it is EMPTY (`config.c`: `var->len < 1`).
+                # Measured 2026-08-24, git 2.50.1: `[]` is `fatal: bad config
+                # line`, while `[ "x"]` - empty section, non-empty subsection -
+                # is ACCEPTED. Eris refuses exactly the first.
+                raise GitConfigParseError("an empty section header")
+            head, dot, tail = base.partition(b".")
+            return head, (tail if dot else None)
+        if c in _CONFIG_SPACE:
+            return _read_extended_section(reader, bytes(name), c)
+        if c not in _CONFIG_KEYCHARS and c != 0x2E:  # keychar or '.'
+            raise GitConfigParseError("invalid character in a section header")
+        name.append(c | 0x20 if c in _CONFIG_ALPHA else c)  # tolower, ASCII only
+
+
+def _read_extended_section(
+    reader: _ConfigReader, section: bytes, c: int
+) -> tuple[bytes, bytes | None]:
+    """git's ``get_extended_base_var``: ``[section "subsection"]``. The
+    subsection keeps its case and only ``\\`` + newline is an error inside it."""
+    while c in _CONFIG_SPACE:
+        if c == 0x0A:
+            raise GitConfigParseError("newline inside a section header")
+        c = reader.next()
+    if c != 0x22:  # "
+        raise GitConfigParseError("expected a quoted subsection name")
+    sub = bytearray()
+    while True:
+        c = reader.next()
+        if c in (_EOF, 0x0A):
+            raise GitConfigParseError("unterminated subsection name")
+        if c == 0x22:
+            break
+        if c == 0x5C:  # backslash: the next char is taken literally
+            c = reader.next()
+            if c in (_EOF, 0x0A):
+                raise GitConfigParseError("unterminated subsection name")
+        sub.append(c)
+    if reader.next() != 0x5D:
+        raise GitConfigParseError("expected `]` after a subsection name")
+    return section, bytes(sub)
+
+
+def _read_value(reader: _ConfigReader) -> bytes:
+    """git's ``parse_value``: quotes toggle, ``\\`` escapes ``\\n``/``\\t``/
+    ``\\b``/``\\\\``/``\\"`` and continues the line, ``#``/``;`` outside quotes
+    start a comment, and unquoted leading/trailing whitespace is stripped."""
+    value = bytearray()
+    quote = False
+    comment = False
+    space = 0
+    while True:
+        c = reader.next()
+        if c in (_EOF, 0x0A):
+            if quote:
+                raise GitConfigParseError("missing closing quote in a value")
+            return bytes(value)
+        if comment:
             continue
-        if body.startswith(b"["):
-            # `[core]`, `[ CORE ]`; `[core "sub"]` is a different section
-            in_core = body[1:].split(b"]", 1)[0].strip().lower() == b"core"
-        elif in_core and not body.startswith((b"#", b";")):
-            key = body.split(b"=", 1)[0].strip().lower()
-            if key in tuple(k.encode("ascii") for k in NEUTRALISED_GIT_CONFIG_KEYS):
-                dropping = body.endswith(b"\\")
-                continue
-        kept.append(line)
-    out = b"".join(kept)
-    if out and not out.endswith((b"\n", b"\r")):
-        out += b"\n"
-    return out + GIT_CONFIG_NEUTRALISED_BLOCK.encode("ascii")
+        if c in _CONFIG_SPACE and not quote:
+            if value:
+                space += 1
+            continue
+        if not quote and c in (0x3B, 0x23):  # ; #
+            comment = True
+            continue
+        value += b" " * space
+        space = 0
+        if c == 0x5C:  # backslash
+            c = reader.next()
+            if c in (0x0A, _EOF):
+                continue  # a value continued on the next line (git reads EOF as one)
+            escaped = {0x74: 0x09, 0x62: 0x08, 0x6E: 0x0A, 0x5C: 0x5C, 0x22: 0x22}.get(c)
+            if escaped is None:
+                raise GitConfigParseError("bad escape in a value")
+            value.append(escaped)
+            continue
+        if c == 0x22:
+            quote = not quote
+            continue
+        value.append(c)
+
+
+def _read_variable(reader: _ConfigReader, first: int) -> tuple[bytes, bytes | None]:
+    """git's ``get_value``: the key (lower-cased), then either nothing (a bare
+    key, boolean true) or ``= value``."""
+    key = bytearray([first | 0x20])
+    while True:
+        c = reader.next()
+        if c == _EOF or c not in _CONFIG_KEYCHARS:
+            break
+        key.append(c | 0x20 if c in _CONFIG_ALPHA else c)
+    while c in (0x20, 0x09):
+        c = reader.next()
+    if c in (_EOF, 0x0A):
+        return bytes(key), None
+    if c != 0x3D:  # =
+        raise GitConfigParseError("expected `=` after a key")
+    return bytes(key), _read_value(reader)
+
+
+def parse_git_config(raw: bytes) -> list[GitConfigEntry]:
+    """Every entry git would read out of ``raw``, in file order. Raises
+    :class:`GitConfigParseError` on anything git would call a bad config line."""
+    reader = _ConfigReader(raw)
+    section: bytes | None = None
+    subsection: bytes | None = None
+    entries: list[GitConfigEntry] = []
+    while True:
+        c = reader.next()
+        if c == _EOF:
+            return entries
+        if c in _CONFIG_SPACE:
+            continue
+        if c in (0x23, 0x3B):  # # ;
+            _skip_to_end_of_line(reader)
+            continue
+        if c == 0x5B:  # [
+            section, subsection = _read_section(reader)
+            continue
+        if c not in _CONFIG_ALPHA:
+            raise GitConfigParseError("a key must start with a letter")
+        if section is None:
+            raise GitConfigParseError("a key outside any section")
+        key, value = _read_variable(reader, c)
+        entries.append(GitConfigEntry(section, subsection, key, value))
+
+
+def _quote_config_value(value: bytes, name: str) -> bytes:
+    """Serialise a value so git reads back exactly these bytes. Always quoted:
+    an unquoted value would have its whitespace stripped and a ``#`` in it would
+    start a comment. A control character git cannot represent in a quoted value
+    REFUSES the copy rather than being silently mangled."""
+    out = bytearray(b'"')
+    for byte in value:
+        if byte == 0x5C:
+            out += b"\\\\"
+        elif byte == 0x22:
+            out += b'\\"'
+        elif byte == 0x09:
+            out += b"\\t"
+        elif byte == 0x0A:
+            out += b"\\n"
+        elif byte == 0x08:
+            out += b"\\b"
+        elif byte < 0x20 or byte == 0x7F:
+            raise GitConfigParseError(
+                f"{name}: value contains a control byte 0x{byte:02x} that git config "
+                "cannot represent; refusing the copy"
+            )
+        else:
+            out.append(byte)
+    out += b'"'
+    return bytes(out)
+
+
+def _keep_entry(entry: GitConfigEntry) -> bool:
+    """Whether one parsed entry survives the allowlist.
+
+    A subsection is always dropped: ``[core "x"] filemode`` is
+    ``core.x.filemode``, which is not a key git acts on, and
+    ``[extensions "x"] y`` makes a v1 repository refuse to open ("unknown
+    repository extension"). ``[extensions]`` is the one section that can
+    RAISE: see :class:`UnsupportedRepositoryExtension`."""
+    if entry.subsection is not None:
+        return False
+    section = entry.section.decode("ascii", errors="replace")
+    key = entry.key.decode("ascii", errors="replace")
+    if section == "core":
+        return key in GIT_CONFIG_ALLOWED_CORE_KEYS
+    if section != "extensions":
+        return False
+    if key in GIT_CONFIG_EXTENSIONS_DROPPED:
+        return False
+    allowed = GIT_CONFIG_EXTENSIONS_KEPT.get(key)
+    if allowed is None:
+        raise UnsupportedRepositoryExtension(
+            f"extensions.{key}: this repository declares an extension Eris does not support, "
+            "so the copy would not be the same repository; refusing the copy "
+            f"(supported: {', '.join(sorted(GIT_CONFIG_EXTENSIONS_KEPT))})"
+        )
+    value = (entry.value or b"").decode("utf-8", errors="replace").lower()
+    if value not in allowed:
+        raise UnsupportedRepositoryExtension(
+            f"extensions.{key}: value {value!r} is not one Eris can vouch for; "
+            f"refusing the copy (expected one of: {', '.join(sorted(allowed))})"
+        )
+    return True
+
+
+def allowlist_git_config(raw: bytes) -> tuple[bytes, tuple[str, ...], tuple[str, ...]]:
+    """Rewrite a git config from the ALLOWLIST: parse it the way git does, keep
+    only :data:`GIT_CONFIG_ALLOWED_CORE_KEYS` and the validated
+    :data:`GIT_CONFIG_EXTENSIONS_KEPT`, and RE-SERIALISE. An ``extensions.*``
+    Eris cannot vouch for raises :class:`UnsupportedRepositoryExtension`.
+
+    Nothing is copied verbatim. The output is generated from the parsed
+    ``(section, key, value)`` triples, with every value re-quoted, so a line
+    that git would read differently from the way Eris read it cannot survive
+    into the copy. Returns ``(bytes, kept_names, dropped_names)``."""
+    entries = parse_git_config(raw)
+    out = bytearray(GIT_CONFIG_HEADER.encode("ascii"))
+    kept: list[str] = []
+    dropped: list[str] = []
+    current: bytes | None = None
+    for entry in entries:
+        if not _keep_entry(entry):
+            dropped.append(entry.name)
+            continue
+        if entry.section != current:
+            out += b"[" + entry.section + b"]\n"
+            current = entry.section
+        if entry.value is None:
+            out += b"\t" + entry.key + b"\n"
+        else:
+            out += b"\t" + entry.key + b" = " + _quote_config_value(entry.value, entry.name) + b"\n"
+        kept.append(entry.name)
+    return bytes(out), tuple(kept), tuple(dropped)
 
 
 def _read_config_symlink_target(copy_root: Path, cfg: Path, link_st: os.stat_result) -> bytes:
@@ -424,63 +889,188 @@ def assert_git_layout_sane(copy_root: Path) -> None:
     """Refuse the copy unless every path in :data:`GIT_REQUIRED_KINDS` is the
     kind Eris assumes it is, or absent.
 
-    This is the GENERAL form of the same finding four times over (an excluded
+    This is the GENERAL form of the same finding five times over (an excluded
     `.git/index`, a missing semantic index check, missing index flag bits, the
     fsmonitor-valid bit, a symlinked `.git/config`): a path Eris reasons about
     is not the thing git actually reads. Every check is an ``lstat`` - a
-    symlink is never followed - and every failure names the path and the
-    reason."""
+    symlink is never followed - and every failure names the path, the reason
+    and why Eris depends on that path."""
     root = Path(copy_root)
-    for parts, kind in GIT_REQUIRED_KINDS:
+    for parts, kind, why in GIT_REQUIRED_KINDS:
         rel = "/".join(parts)
         try:
             st = root.joinpath(*parts).lstat()
         except OSError as exc:
             if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-                continue  # absent (or under a gitlink FILE): nothing to reason about
+                continue  # absent (or under a non-directory parent): nothing to reason about
             raise SanitizeError(f"{rel}: cannot be checked in the copy ({exc}); refusing") from exc
         if not _KIND_TEST[kind](st.st_mode):
             raise SanitizeError(
                 f"{rel}: is {_describe(st.st_mode)} in the copy, expected {_KIND_NAME[kind]} "
-                "or nothing; refusing the copy"
+                f"or nothing; refusing the copy ({why})"
             )
 
 
-def neutralise_git_config(copy_root: Path) -> ConfigNeutralisation:
-    """Disable the inherited filesystem-monitor caches in the COPY's
-    ``.git/config``.
+def assert_no_repo_escapes(copy_root: Path) -> None:
+    """Refuse the copy when it is not ONE self-contained repository.
+
+    :data:`GIT_REFUSED_IF_PRESENT` names the structures whose presence means
+    part of the repository lives somewhere Eris has not copied, has not
+    rewritten and does not guard: a linked worktree (``.git/commondir``), a
+    worktree HOST (``.git/worktrees/``) and submodule gitdirs
+    (``.git/modules/``). A gitlink ``.git`` FILE is refused one step earlier by
+    :func:`assert_git_layout_sane`, because a file where a directory belongs is
+    a shape question.
+
+    Refusing is the honest answer: verifying the half of the repository Eris
+    can see, and reporting it as if it were the whole, is worse than saying no.
+    """
+    root = Path(copy_root)
+    for parts, why in GIT_REFUSED_IF_PRESENT:
+        rel = "/".join(parts)
+        try:
+            root.joinpath(*parts).lstat()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                continue
+            raise SanitizeError(f"{rel}: cannot be checked in the copy ({exc}); refusing") from exc
+        raise SanitizeError(f"{rel}: is present in the copy; refusing the copy ({why})")
+
+
+def assert_no_nested_repositories(copy_root: Path) -> None:
+    """Refuse the copy when ANOTHER repository lives inside it: any ``.git``
+    below the copy root, whatever its shape.
+
+    M2c follow-up 5, advisor round. The config allowlist rewrites exactly ONE
+    file - the copy's own ``.git/config``. A nested repository has its own, and
+    Eris never sees it. Measured 2026-08-24 on git 2.50.1, with an outer repo
+    whose ``sub/.git`` is a FILE reading ``gitdir: /elsewhere/ext/work/.git``
+    and that EXTERNAL config carrying ``diff.external``:
+
+    * ``sub`` NOT registered in the outer index -> nothing executed;
+    * ``sub`` registered as a GITLINK (``update-index --add --cacheinfo
+      160000,<sha>,sub``) -> ``git --no-optional-locks status --porcelain``,
+      ``git diff HEAD`` and ``status --porcelain=v2`` ALL EXECUTED the external
+      program.
+
+    No ``.gitmodules`` was involved, and the gitdir was outside the copy
+    entirely, so nothing Eris rewrites, deletes or hashes could have helped.
+    The honest answer is to refuse: recursive sanitisation would mean rewriting
+    a config tree of unbounded depth, some of it outside the snapshot, and
+    getting it wrong is exactly this bug again.
+
+    Names are compared with :func:`_fold`, not for equality. Measured
+    2026-08-24 on macOS/APFS: ``sub/.GIT`` is reported by ``os.walk`` under
+    that literal name while ``sub/.git`` EXISTS as far as the kernel and git
+    are concerned, so an exact comparison missed it and the "any ``.git``, any
+    shape, any depth" promise was false as written.
+
+    The root's own ``.git`` is not a nested repository and is skipped; a
+    gitdir under it (``.git/modules/``) is refused by
+    :func:`assert_no_repo_escapes`. The INDEX side of the same scope rule - a
+    gitlink entry with no checked-out ``.git`` to find - is checked where git
+    is already running, on the verification guard's baseline
+    (``evidence.git_index_prober``): it is a superproject either way, but with
+    nothing to execute it is a scope refusal rather than a containment one."""
+    root = Path(copy_root)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        if base == root:
+            # the copy's OWN `.git` is the repository being verified
+            dirnames[:] = [d for d in dirnames if not _is_git_name(d)]
+            names = [f for f in filenames if not _is_git_name(f)]
+        else:
+            names = list(filenames)
+        for name in (*dirnames, *names):
+            if _is_git_name(name):
+                rel = _rel(base / name, root).as_posix()
+                raise SanitizeError(
+                    f"{rel}: a NESTED repository is present in the copy; refusing the copy "
+                    "(Eris does not copy submodule or worktree repositories - their `.git` "
+                    "holds a config Eris never rewrites, and it may point outside the "
+                    "snapshot entirely)"
+                )
+
+
+def drop_git_repo_escapes(copy_root: Path) -> tuple[str, ...]:
+    """Delete every path in :data:`GIT_DROPPED_RELPATHS` from the COPY and
+    return what was removed.
+
+    ``.git/objects/info/alternates`` (and its ``http-`` twin) point git at
+    another object store. Measured 2026-08-24 on git 2.50.1: planting one in a
+    properly history-truncated snapshot makes ``git cat-file -e`` of a commit
+    the snapshot deliberately does NOT contain go from failing to succeeding -
+    the corpus answer the truncation removed becomes readable again.
+    ``.git/config.worktree`` is a second config file, with the same arbitrary
+    execution risk as ``.git/config``, read when ``extensions.worktreeConfig``
+    is set (which the config rewrite also drops).
+
+    Called only AFTER :func:`assert_git_layout_sane`, so each path is a regular
+    file or absent and an ``unlink`` cannot be the wrong operation."""
+    root = Path(copy_root)
+    removed: list[str] = []
+    for parts in GIT_DROPPED_RELPATHS:
+        rel = "/".join(parts)
+        try:
+            root.joinpath(*parts).unlink()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                continue
+            raise SanitizeError(f"{rel}: could not be removed from the copy ({exc})") from exc
+        removed.append(rel)
+    return tuple(removed)
+
+
+def rewrite_git_config(copy_root: Path) -> ConfigRewrite:
+    """Rewrite the COPY's ``.git/config`` from an ALLOWLIST.
 
     **The original is never opened for writing here** - the argument is the
     copy's root, and every path used is under it.
 
-    The control FAILS CLOSED. A ``.git/config`` that exists but is not a
-    regular file used to be skipped silently while git followed it happily:
-    a symlinked config is a complete bypass of everything below. Now, an
-    in-copy symlink to a regular file is READ, UNLINKED and REPLACED by a
-    regular file holding the neutralised bytes (never written through, and
-    recorded in ``dropped_symlinks``); every other shape - a symlink escaping
-    the copy, a dangling one, a fifo, a device, a directory - RAISES
-    :class:`SanitizeError`. A link that escapes or dangles in the ORIGINAL is
-    dropped by the copier before this runs, which legitimately leaves no config
-    and nothing to inherit.
+    A repository-supplied config is arbitrary code execution, not a
+    misconfiguration. Measured 2026-08-24 on git 2.50.1, against the ALLOWLISTED
+    verification command ``git --no-optional-locks diff HEAD``:
 
-    `core.fsmonitor` and `core.untrackedCache` are the two settings that make
-    git answer from a cache instead of from the working tree. Inherited by a
-    raw copy of a repository that configures them, they are a problem in both
-    directions: a live daemon (or a hook) can mark index entries fsmonitor-valid
-    *during* a verification run, which the index digest would report as a
-    violation that no verification command caused, and a stale cache can let a
-    command answer from data the tree no longer supports.
+    * ``[diff] external = /tmp/evil.sh`` in the copy's ``.git/config`` EXECUTED
+      ``evil.sh``;
+    * ``[diff "evil"] textconv = /tmp/evil.sh`` plus ``f.txt diff=evil`` in a
+      TRACKED ``.gitattributes`` (tree content, which sanitisation does not
+      touch) EXECUTED it too;
+    * a planted ``.git/objects/info/alternates`` made a commit the
+      history-truncated snapshot deliberately removed reachable again.
 
-    Matching entries are dropped (including any backslash-continued value), and
-    an explicit ``[core]`` block setting both to ``false`` is appended: a later
-    section wins in git's config order, so the appended block also covers a
-    value pulled in by an ``include``/``includeIf`` directive earlier in the
-    file. A ``.git`` with no regular ``config`` file (no repository, or a
-    gitlink) is left alone - nothing was inherited.
+    So the previous model - neutralise the keys we happen to know about
+    (``core.fsmonitor``, ``core.untrackedCache``) - was the wrong shape. This
+    keeps only :data:`GIT_CONFIG_ALLOWED_CORE_KEYS` and
+    :data:`GIT_CONFIG_EXTENSIONS_KEPT` and drops EVERYTHING else: every
+    ``diff.*``, ``filter.*``, ``merge.*``, ``gpg.*``, ``credential.*``,
+    ``url.*``, ``http.*``, ``uploadpack.*``, ``include.*``, ``includeIf.*``,
+    ``alias.*``, ``remote.*``, ``branch.*``, ``user.*``, and every ``core.*``
+    that is not on the list (``worktree``, ``hooksPath``, ``fsmonitor``,
+    ``untrackedCache``, ``pager``, ``editor``, ``sshCommand``, ``askPass``,
+    ``alternateRefsCommand``, ``sharedRepository``, ...). With no driver
+    DEFINED, a ``.gitattributes`` naming ``diff=evil`` or ``filter=x`` is inert
+    - which is measured, not assumed
+    (``test_verify_real_git.py::test_a_repository_textconv_driver_cannot_execute_
+    in_the_verification_copy``).
 
-    Bytes in, bytes out: the file is never decoded, so a non-UTF-8 or CRLF
-    config round-trips unchanged apart from the removed lines.
+    Because the file is re-serialised from parsed entries rather than filtered
+    line by line, a line git would read differently from the way Eris read it
+    cannot survive. A config Eris cannot parse REFUSES the copy
+    (:class:`GitConfigParseError`); git refuses to open such a repository too.
+
+    The control FAILS CLOSED on shape as well. A ``.git/config`` that exists but
+    is not a regular file used to be skipped silently while git followed it
+    happily. Now an in-copy symlink to a regular file is READ, UNLINKED and
+    REPLACED by a regular file holding the rewritten bytes (never written
+    through, and recorded in ``dropped_symlinks``); every other shape - a
+    symlink escaping the copy, a dangling one, a fifo, a device, a directory -
+    RAISES :class:`SanitizeError`. A link that escapes or dangles in the
+    ORIGINAL is dropped by the copier before this runs, which legitimately
+    leaves no config at all; that case still proceeds.
+
+    Bytes in, bytes out: the file is never decoded, so a non-UTF-8 config is
+    parsed and re-quoted byte-faithfully.
     """
     rel = "/".join(GIT_CONFIG)
     cfg = Path(copy_root).joinpath(*GIT_CONFIG)
@@ -488,7 +1078,7 @@ def neutralise_git_config(copy_root: Path) -> ConfigNeutralisation:
         st = cfg.lstat()  # never stat(): a symlink must not be followed
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-            return ConfigNeutralisation(False)  # no repository, or a gitlink
+            return ConfigRewrite(False)  # no repository, or a gitlink
         raise SanitizeError(f"{rel}: cannot be checked in the copy ({exc}); refusing") from exc
     replaced: str | None = None
     if stat.S_ISLNK(st.st_mode):
@@ -504,7 +1094,12 @@ def neutralise_git_config(copy_root: Path) -> ConfigNeutralisation:
     else:
         raw = cfg.read_bytes()
         mode = stat.S_IMODE(st.st_mode)
-    out = _neutralised_bytes(raw)
+    try:
+        out, kept, dropped = allowlist_git_config(raw)
+    except (GitConfigParseError, UnsupportedRepositoryExtension) as exc:
+        # same type, relpath-prefixed: the caller distinguishes "not a config
+        # git would accept" from "a repository Eris does not support"
+        raise type(exc)(f"{rel}: {exc}") from exc
     # O_EXCL for the replacement (there is nothing at the path), O_NOFOLLOW
     # everywhere: no pre-existing file and no symlink is ever opened for
     # writing, so the write cannot leave the copy.
@@ -518,7 +1113,7 @@ def neutralise_git_config(copy_root: Path) -> ConfigNeutralisation:
     finally:
         os.close(fd)
     cfg.chmod(mode)  # the copy keeps the original's file mode
-    return ConfigNeutralisation(True, replaced)
+    return ConfigRewrite(True, replaced, kept, dropped)
 
 
 def _collect(path: Path, original: Path) -> list[StrippedEntry]:
@@ -559,22 +1154,31 @@ VERIFICATION_PROFILE = SanitizeProfile(frozenset(), frozenset())
 """The profile used for the copy mechanical verification runs in, so a command
 that executes repository code (a trusted ``pytest``) can never touch the
 original. It strips NO instruction files - verification must see the repository
-as it is - and differs from a raw ``cp -a`` in exactly three ways, all
-inherited from :func:`sanitize_snapshot` and all deliberate:
+as it is - and differs from a raw ``cp -a`` in exactly four ways, all inherited
+from :func:`sanitize_snapshot` and all deliberate. The WORKING TREE is copied
+verbatim; every deviation is inside ``.git``, and every one of them exists
+because git treats part of ``.git`` as executable configuration:
 
 1. ``.git/hooks`` is not copied. Our allowlist runs ``git``, and a repository
    hook would execute on the first ``git`` invocation.
-2. The copy's ``.git/config`` has ``core.fsmonitor`` and
-   ``core.untrackedCache`` removed and explicitly set to ``false``
-   (:func:`neutralise_git_config`), so an inherited filesystem monitor cannot
-   mark index entries valid mid-run and no stale cache can answer for the
-   working tree. The ORIGINAL's config is never opened for writing, and the
-   edit happens while the copy is being built - before any verification
-   command, and before the guard takes its baseline.
-3. A symlink that is absolute, dangling, or resolves outside the tree is
+2. The copy's ``.git/config`` is NOT the original's file. It is rewritten from
+   an ALLOWLIST (:func:`rewrite_git_config`): only the keys the repository
+   FORMAT needs survive, and every ``diff.*``/``filter.*``/``alias.*``/
+   ``remote.*``/``include.*`` and every path-or-command ``core.*`` is dropped,
+   because a repository-supplied config otherwise makes git execute a
+   repository-supplied program (measured, three ways, 2026-08-24). The
+   ORIGINAL's config is never opened for writing, and the rewrite happens while
+   the copy is being built - before any verification command, and before the
+   guard takes its baseline.
+3. ``.git/objects/info/alternates``, ``.git/objects/info/http-alternates`` and
+   ``.git/config.worktree`` are deleted (:func:`drop_git_repo_escapes`), and a
+   copy that is not ONE self-contained repository is REFUSED: a gitlink ``.git``
+   FILE, ``.git/commondir``, ``.git/worktrees/`` or ``.git/modules/``
+   (:func:`assert_no_repo_escapes`).
+4. A symlink that is absolute, dangling, or resolves outside the tree is
    dropped and recorded in ``dropped_symlinks``; links that stay inside are
    copied with their target string intact - except an in-copy ``.git/config``
-   link, which is replaced by the neutralised regular file (item 2 must not be
+   link, which is replaced by the rewritten regular file (item 2 must not be
    bypassable by an alias) and recorded there too. Any other non-regular
    ``.git`` path Eris depends on refuses the copy
    (:func:`assert_git_layout_sane`).
@@ -651,6 +1255,17 @@ def _force_writable(
     return handler
 
 
+def _remove_copy(dest: Path) -> None:
+    """Remove a copy this process built. A failure raises
+    :class:`SanitizeCleanupError`; it is never swallowed, because
+    worker-visible files may remain."""
+    try:
+        _restore_owner_access(dest)  # inside the copy only; never a parent
+        shutil.rmtree(dest, onexc=_force_writable(dest))
+    except OSError as exc:
+        raise SanitizeCleanupError(f"sanitized copy {dest} could not be removed: {exc}") from exc
+
+
 @contextmanager
 def sanitized_copy(
     original: Path,
@@ -662,16 +1277,37 @@ def sanitized_copy(
 ) -> Iterator[tuple[Path, SnapshotSanitization]]:
     """``with sanitized_copy(...) as (copy_root, record):`` - the copy is a
     private dir under ``scratch_dir`` and is removed in ``finally``. A
-    removal failure raises :class:`SanitizeCleanupError` (never swallowed)."""
+    removal failure raises :class:`SanitizeCleanupError` (never swallowed).
+
+    A failure while the copy is being BUILT removes it too. ``sanitize_snapshot``
+    used to run before the ``try``/``finally``, so every refusal - and there
+    are now many, each of them deliberate - left a half-built copy behind in
+    the scratch dir for the orphan sweep to find hours later.
+
+    **The removal is gated on the ``mkdir``, not on a prior existence check.**
+    ``make_private_dir`` is called HERE, and only a call that returned
+    normally sets ``created``: that successful ``mkdir(exist_ok=False)`` IS the
+    proof of ownership. Checking ``dest.exists()`` first and cleaning up
+    afterwards was a race - a directory appearing in the window would be
+    refused by ``make_private_dir`` and then deleted by the cleanup, which is
+    somebody else's data. This is the same reservation rule the run scratch
+    already follows: an entry Eris did not create is left exactly as found."""
     dest = Path(scratch_dir) / (name or f"sanitized-{worker_id}")
-    record = sanitize_snapshot(original, dest, profile=profile, worker_id=worker_id)
+    make_private_dir(dest)  # THE reservation: if this raises, `dest` is not ours
+    created = True
+    try:
+        record = sanitize_snapshot(
+            original, dest, profile=profile, worker_id=worker_id, dest_reserved=created
+        )
+    except BaseException as exc:
+        try:
+            _remove_copy(dest)
+        except SanitizeCleanupError as cleanup:
+            # never silent, and never at the cost of the reason: the
+            # refusal that started this is the `__cause__`
+            raise cleanup from exc
+        raise
     try:
         yield dest.resolve(), record
     finally:
-        try:
-            _restore_owner_access(dest)  # inside the copy only; never a parent
-            shutil.rmtree(dest, onexc=_force_writable(dest))
-        except OSError as exc:
-            raise SanitizeCleanupError(
-                f"sanitized copy {dest} could not be removed: {exc}"
-            ) from exc
+        _remove_copy(dest)

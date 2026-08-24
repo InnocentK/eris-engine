@@ -1,7 +1,12 @@
 """eris.sanitize: strip list (minimum, any depth, case-insensitive), copy
-semantics (new inodes, symlink rules, .git without hooks and with
-`core.fsmonitor`/`core.untrackedCache` neutralised), the original is
-untouched, the copy is what agy gets as --add-dir, cleanup in finally."""
+semantics (new inodes, symlink rules, `.git` without hooks and with its
+`config` REWRITTEN FROM AN ALLOWLIST, alternates and `config.worktree`
+dropped, a non-self-contained repository refused), the original is untouched,
+the copy is what agy gets as --add-dir, cleanup in finally.
+
+The end-to-end proof that the allowlist stops real execution needs a real
+git and lives in `test_verify_real_git.py`; what is pinned here is the
+rewriter, the parser and the refusals."""
 
 from __future__ import annotations
 
@@ -28,6 +33,60 @@ from tests.test_policy import minimal_policy, write
 
 PROFILE = SanitizeProfile.from_policy(None)
 
+#: A `.git/config` with ONE entry of every family the allowlist drops - the
+#: execution vectors first - and the format keys it keeps. Written into the
+#: fixture original so every copy-fidelity test exercises the rewrite.
+ORIGINAL_GIT_CONFIG = (
+    "[core]\n"
+    "\trepositoryformatversion = 0\n"  # kept: the format
+    "\tfilemode = true\n"  # kept: a filesystem capability
+    "\tfsmonitor = .git/hooks/fsmonitor-watchman\n"  # dropped
+    "\tuntrackedCache = true\n"  # dropped
+    "\thooksPath = tools/hooks\n"  # dropped: names a directory of programs
+    "\tpager = tools/pager\n"  # dropped: names a program
+    "\tsshCommand = tools/ssh\n"  # dropped: names a program
+    "\tsharedRepository = 0777\n"  # dropped: changes modes under us
+    "[extensions]\n"
+    "\tobjectFormat = sha1\n"  # kept: the repository will not open without it
+    "[diff]\n"
+    "\texternal = /tmp/evil.sh\n"  # dropped: MEASURED arbitrary execution
+    '[diff "evil"]\n'
+    "\ttextconv = /tmp/evil.sh\n"  # dropped: MEASURED arbitrary execution
+    '[filter "evil"]\n'
+    "\tsmudge = /tmp/evil.sh\n"  # dropped
+    "[alias]\n"
+    "\tst = !/tmp/evil.sh\n"  # dropped
+    "[include]\n"
+    "\tpath = extra\n"  # dropped: it pulls in another whole file
+    '[includeIf "gitdir:/"]\n'
+    "\tpath = extra\n"  # dropped
+    "[credential]\n"
+    "\thelper = /tmp/evil.sh\n"  # dropped
+    '[url "https://evil.invalid/"]\n'
+    "\tinsteadOf = https://example.invalid/\n"  # dropped
+    "[http]\n"
+    "\tproxy = http://evil.invalid\n"  # dropped
+    "[uploadpack]\n"
+    "\tpackObjectsHook = /tmp/evil.sh\n"  # dropped
+    "[gpg]\n"
+    "\tprogram = /tmp/evil.sh\n"  # dropped
+    "[merge]\n"
+    "\ttool = evil\n"  # dropped
+    "[user]\n"
+    "\tname = Somebody\n"  # dropped
+    '[remote "origin"]\n'
+    "\turl = https://example.invalid/r.git\n"  # dropped
+    '[branch "main"]\n'
+    "\tremote = origin\n"  # dropped
+)
+
+#: `section.key` of every entry in :data:`ORIGINAL_GIT_CONFIG` that survives.
+ORIGINAL_GIT_CONFIG_KEPT = (
+    "core.repositoryformatversion",
+    "core.filemode",
+    "extensions.objectformat",
+)
+
 
 def build_original(tmp_path: Path) -> Path:
     root = tmp_path / "original"
@@ -44,16 +103,10 @@ def build_original(tmp_path: Path) -> Path:
         ".github/workflows/ci.yml": "kept\n",
         "sub/.cursor/x": "cursor\n",
         ".git/HEAD": "ref: refs/heads/main\n",
-        # a repository that already uses a filesystem monitor: the copy must
-        # neutralise it (`neutralise_git_config`), the original must not move
-        ".git/config": (
-            "[core]\n"
-            "\trepositoryformatversion = 0\n"
-            "\tfsmonitor = .git/hooks/fsmonitor-watchman\n"
-            "\tuntrackedCache = true\n"
-            '[remote "origin"]\n'
-            "\turl = https://example.invalid/r.git\n"
-        ),
+        # a repository config carrying one entry of every family the ALLOWLIST
+        # drops, plus the two format keys it keeps. The copy must come out with
+        # only the keepers; the original must not move.
+        ".git/config": ORIGINAL_GIT_CONFIG,
         ".git/refs/heads/main": "a" * 40 + "\n",
         ".git/hooks/pre-commit": "#!/bin/sh\necho hook\n",
         ".git/AGENTS.md": "inside .git: not stripped, not loaded\n",
@@ -335,108 +388,214 @@ def test_verification_copy_matches_the_original_except_hooks_config_and_escaping
     assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
 
 
-def _core_values(text: str, key: str) -> list[str]:
-    """Every value `git config --get-all core.<key>` would see, in file order:
-    a plain textual read of a config file, so the test does not need a git."""
-    out: list[str] = []
-    in_core = False
-    for raw in text.splitlines():
-        body = raw.strip()
-        if body.startswith("["):
-            in_core = body[1:].split("]", 1)[0].strip().lower() == "core"
-            continue
-        if not in_core or body.startswith(("#", ";")) or not body:
-            continue
-        name, _, value = body.partition("=")
-        if name.strip().lower() == key.lower():
-            out.append(value.strip() if _ else "true")
-    return out
+def _names(raw: bytes) -> list[str]:
+    """`section[.subsection].key` of every entry Eris's parser finds."""
+    from eris.sanitize import parse_git_config
+
+    return [e.name for e in parse_git_config(raw)]
 
 
-def test_the_copy_disables_an_inherited_fsmonitor_and_untracked_cache(tmp_path: Path) -> None:
-    """M2c follow-up 3, item 2: a snapshot taken from a repository that already
-    configures `core.fsmonitor`/`core.untrackedCache` arrives with those
-    settings inside `.git/config`. In the COPY they are removed and explicitly
-    set to `false`; the ORIGINAL is never written.
+# ---------------------------------- M2c follow-up 5: the config is an ALLOWLIST
 
-    Both directions matter. A live monitor can mark index entries
-    fsmonitor-valid DURING a run, which the `-s -v -f` digest would report as a
-    violation no verification command caused; and a stale cache lets a command
-    answer from data the working tree no longer supports."""
-    from eris.sanitize import GIT_CONFIG_NEUTRALISED_BLOCK, VERIFICATION_PROFILE
+
+def test_the_copy_config_keeps_only_the_allowlisted_keys(tmp_path: Path) -> None:
+    """M2c follow-up 5, item 1, and the heart of this change. The previous
+    control was a DENYLIST - remove `core.fsmonitor`/`core.untrackedCache` and
+    append a block - and it left every other key in place. Measured 2026-08-24
+    on git 2.50.1, that is arbitrary code execution: `[diff] external =
+    /tmp/evil.sh` in the copy's `.git/config` made the ALLOWLISTED verification
+    command `git --no-optional-locks diff HEAD` execute `evil.sh`.
+
+    The copy's config is now REWRITTEN from an allowlist: only the keys the
+    repository FORMAT needs survive, and the file is re-serialised rather than
+    filtered, so nothing from the original is carried over verbatim."""
+    from eris.sanitize import GIT_CONFIG_HEADER, VERIFICATION_PROFILE
 
     original = build_original(tmp_path)
     before_bytes = (original / ".git" / "config").read_bytes()
     before_hash, before_inodes = tree_sha256(original), inodes(original)
-    assert _core_values(before_bytes.decode(), "fsmonitor") == [".git/hooks/fsmonitor-watchman"]
 
     copy = tmp_path / "scratch" / "verify-copy"
     sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
 
-    text = (copy / ".git" / "config").read_text()
-    assert _core_values(text, "fsmonitor") == ["false"]  # the only surviving value
-    assert _core_values(text, "untrackedCache") == ["false"]
-    assert text.endswith(GIT_CONFIG_NEUTRALISED_BLOCK)
-    # everything else in the file is untouched, in order
-    assert "\trepositoryformatversion = 0\n" in text
-    assert '[remote "origin"]\n\turl = https://example.invalid/r.git\n' in text
+    raw = (copy / ".git" / "config").read_bytes()
+    assert _names(raw) == list(ORIGINAL_GIT_CONFIG_KEPT)
+    assert raw.decode().startswith(GIT_CONFIG_HEADER)
+    # every dropped family is gone by NAME as well as by parse - no `[diff]`
+    # header, no `evil.sh`, no `origin`, and the fsmonitor keys the old control
+    # used to leave behind as `false`
+    text = raw.decode()
+    for gone in (
+        "evil.sh",
+        "[diff",
+        "[alias",
+        "[include",
+        "[remote",
+        "[user",
+        "[credential",
+        "[url",
+        "[http",
+        "[uploadpack",
+        "[gpg",
+        "[merge",
+        "[branch",
+        "fsmonitor",
+        "untrackedCache",
+        "hooksPath",
+        "pager",
+        "sshCommand",
+        "sharedRepository",
+        "example.invalid",
+    ):
+        assert gone not in text, gone
+    # ... and `extensions.objectFormat` survives: a sha256 repository does not
+    # open without it
+    assert _names(raw)[-1] == "extensions.objectformat"
     # THE ORIGINAL IS NEVER MODIFIED
     assert (original / ".git" / "config").read_bytes() == before_bytes
     assert tree_sha256(original) == before_hash and inodes(original) == before_inodes
 
 
-def test_the_config_neutralisation_survives_odd_spellings_includes_and_continuations(
-    tmp_path: Path,
+#: The git config GRAMMAR, row by row: the bytes, and the entries git reads
+#: out of them. Every row was measured against real git 2.50.1 on
+#: 2026-08-24, and every row is REPLAYED through a real git in
+#: `test_verify_real_git.py::test_the_config_parser_agrees_with_git_on_every_
+#: grammar_row`, which compares these entries with `git config --list -z`
+#: record for record. A construction in neither this table nor
+#: `UNPARSEABLE_ROWS` is not verified against git at all.
+GRAMMAR_ROWS: tuple[tuple[bytes, list[tuple[str, bytes | None]]], ...] = (
+    # the grammar that a LINE-oriented filter gets wrong; every row was
+    # measured against real git 2.50.1 on 2026-08-24 and is re-measured
+    # end to end in `test_verify_real_git.py`
+    (b"[core] filemode = true\n", [("core.filemode", b"true")]),
+    (b"[core]filemode=true\n", [("core.filemode", b"true")]),
+    (b"[core][diff] external = x\n", [("diff.external", b"x")]),
+    (b"[core.sub]\n\tfilemode = true\n", [("core.sub.filemode", b"true")]),
+    (b'[core "SUB"]\n\tfilemode = true\n', [("core.SUB.filemode", b"true")]),
+    (b"[CORE]\n\tFileMode = TRUE\n", [("core.filemode", b"TRUE")]),
+    (b"[core]\n\tbare\n", [("core.bare", None)]),  # a bare key is boolean true
+    (b"[core]\n\tfilemode = tr\\\nue\n", [("core.filemode", b"true")]),  # continued
+    # git reads EOF as a newline, so a trailing backslash ENDS the value
+    # rather than being a bad escape (`config.c`, `get_next_char`)
+    (b"[core]\n\tfilemode = tru\\", [("core.filemode", b"tru")]),
+    (b'[core]\n\tfilemode = "a\\tb\\nc\\\\d\\"e"\n', [("core.filemode", b'a\tb\nc\\d"e')]),
+    (b"[core]\r\n\tfilemode = true\r\n", [("core.filemode", b"true")]),  # CRLF
+    (b"\xef\xbb\xbf[core]\n\tfilemode = true\n", [("core.filemode", b"true")]),  # BOM
+    (b"[core]\n\tfilemode = a # not part\n", [("core.filemode", b"a")]),
+    (b'[core]\n\tfilemode = "a ; kept"\n', [("core.filemode", b"a ; kept")]),
+    (b"[core]\n\tfilemode = bar   \n", [("core.filemode", b"bar")]),  # trailing ws
+    (b"[core]\n\tfilemode =\n", [("core.filemode", b"")]),  # empty value
+    (b"; c\n# c\n[core]\n\t; c\n\tfilemode = true\n", [("core.filemode", b"true")]),
+    # a backslash inside a subsection name takes the next byte literally
+    (b'[core "a\\\\b"]\n\tfilemode = x\n', [("core.a\\b.filemode", b"x")]),
+    (b"", []),
+)
+
+
+@pytest.mark.parametrize(("body", "expected"), GRAMMAR_ROWS)
+def test_the_config_parser_reads_gits_real_grammar(
+    body: bytes, expected: list[tuple[str, bytes | None]]
 ) -> None:
-    """Item 2, the parsing: git config keys and section names are
-    case-insensitive, a bare key means `true`, a value may be continued with a
-    trailing backslash, and an `include` can pull the setting in from another
-    file. The removal handles the first three; the APPENDED `[core]` block is
-    what covers the fourth - a later section wins in git's config order."""
-    from eris.sanitize import VERIFICATION_PROFILE, neutralise_git_config
+    """M2c follow-up 5: the rewrite is only as good as the parse, and git's
+    config grammar is NOT line-oriented. `[core] filemode = true` is a header
+    AND a variable on one line; `[core][diff] external = x` puts the variable
+    in `diff`. A filter that scanned lines for `[core]` would keep the second
+    row's `diff.external` - which is the executing key. This parser is a port
+    of git's `config.c`, and every row here was measured against real git."""
+    from eris.sanitize import parse_git_config
 
-    original = tmp_path / "o"
-    (original / ".git").mkdir(parents=True)
-    (original / "keep.txt").write_text("k\n")
-    (original / ".git" / "config").write_text(
-        "[CORE]\n"
-        "\tFsMonitor\n"  # bare key = true
-        "\tUNTRACKEDCACHE = tr\\\n"
-        "ue\n"  # a continued value: both lines must go
-        "\t# fsmonitor = a comment, not a setting\n"
-        "\tbare = 1\n"
-        '[core "sub"]\n'
-        "\tfsmonitor = not-core.fsmonitor\n"  # a different section: kept
-        "[include]\n"
-        "\tpath = extra\n"
+    got = [(e.name, e.value) for e in parse_git_config(body)]
+    assert got == expected
+
+
+#: Configs git itself REFUSES (`fatal: bad config line`, measured) plus the
+#: places Eris is deliberately stricter than git. Eris refuses all of them.
+UNPARSEABLE_ROWS: tuple[tuple[bytes, str], ...] = (
+    (b'[core]\n\tfilemode = "a\\qb"\n', "bad escape"),
+    (b'[core]\n\tfilemode = "abc\n', "missing closing quote"),
+    (b"[core\n", "newline inside a section header"),
+    (b"[core", "unterminated section header"),
+    (b"[co!re]\n", "invalid character in a section header"),
+    (b"[core x]\n", "expected a quoted subsection name"),
+    (b'[core "x\n', "unterminated subsection name"),
+    (b'[core "x\\', "unterminated subsection name"),  # a backslash at EOF
+    (b'[core "x"y\n', "expected `]` after a subsection name"),
+    (b"filemode = true\n", "a key outside any section"),
+    # measured 2026-08-24: git rejects `[]` (`var->len < 1`) but ACCEPTS
+    # `[ "x"]`, an empty section with a non-empty subsection
+    (b"[]\n\tfilemode = true\n", "an empty section header"),
+    (b"[core]\n\t1mode = true\n", "a key must start with a letter"),
+    (b"[core]\n\tfilemode ! true\n", "expected `=` after a key"),
+)
+
+
+@pytest.mark.parametrize(("body", "reason"), UNPARSEABLE_ROWS)
+def test_a_config_eris_cannot_parse_refuses_the_copy(
+    tmp_path: Path, body: bytes, reason: str
+) -> None:
+    """Fail CLOSED on the parse too. A file Eris cannot read the way git reads
+    it is a file Eris cannot contain, so the copy is refused rather than
+    handed over half-understood. git refuses to open such a repository as well
+    (`fatal: bad config line`), so this costs no working repository."""
+    from eris.sanitize import VERIFICATION_PROFILE, GitConfigParseError
+
+    original = _mkgit(tmp_path / "o")
+    (original / ".git" / "config").write_bytes(body)
+    with pytest.raises(GitConfigParseError, match=r"\.git/config: " + reason):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+def test_an_allowlisted_value_is_requoted_and_a_control_byte_refuses(tmp_path: Path) -> None:
+    """The output is GENERATED, never copied: every value is re-quoted, so a
+    value that would re-parse differently cannot survive. A control byte git
+    cannot represent in a quoted value refuses the copy instead of being
+    silently mangled (git itself truncates a value at a NUL)."""
+    from eris.sanitize import GitConfigParseError, allowlist_git_config, parse_git_config
+
+    out, kept, dropped = allowlist_git_config(
+        b'[core]\n\tfilemode = "a # b\\tc"\n[diff]\n\tx = 1\n'
     )
-    (original / ".git" / "extra").write_text("[core]\n\tfsmonitor = from-the-include\n")
-
-    copy = tmp_path / "scratch" / "verify-copy"
-    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
-
-    text = (copy / ".git" / "config").read_text()
-    assert "FsMonitor\n" not in text and "UNTRACKEDCACHE" not in text and "ue\n" not in text
-    assert "\tbare = 1\n" in text  # an unrelated core key survives
-    assert "# fsmonitor = a comment, not a setting" in text  # comments are not settings
-    assert "fsmonitor = not-core.fsmonitor" in text  # `[core "sub"]` is another section
-    assert "\tpath = extra\n" in text  # the include itself is left alone
-    # the include still sets it - and the appended block, being LAST, wins
-    assert (copy / ".git" / "extra").read_text() == (original / ".git" / "extra").read_text()
-    assert text.rstrip().endswith("untrackedCache = false")
-    assert _core_values(text, "fsmonitor")[-1] == "false"
-    # idempotent: neutralising an already-neutralised copy adds nothing new
-    assert neutralise_git_config(copy).rewritten is True
-    assert _core_values((copy / ".git" / "config").read_text(), "fsmonitor") == ["false"]
+    assert kept == ("core.filemode",) and dropped == ("diff.x",)
+    assert b'\tfilemode = "a # b\\tc"\n' in out
+    assert [(e.name, e.value) for e in parse_git_config(out)] == [("core.filemode", b"a # b\tc")]
+    # every escape git can represent survives the round trip, non-UTF-8 included
+    hairy = b'[core]\n\tfilemode = "a\\\\b\\"c\\nd\\be \xff"\n'
+    out, _kept, _dropped = allowlist_git_config(hairy)
+    assert [e.value for e in parse_git_config(out)] == [b'a\\b"c\nd\x08e \xff']
+    with pytest.raises(GitConfigParseError, match="control byte 0x00"):
+        allowlist_git_config(b"[core]\n\tfilemode = a\x00b\n")
 
 
-@pytest.mark.parametrize("shape", ["no-git", "git-without-config", "git-is-a-gitlink-file"])
-def test_a_copy_with_nothing_to_neutralise_is_left_alone(tmp_path: Path, shape: str) -> None:
-    """Item 2: no `.git`, a `.git` with no config file, or a `.git` that is the
-    gitlink FILE of a worktree/submodule - nothing was inherited and nothing is
-    written. The gitlink case is why `.git` is `file_or_dir` in
-    `GIT_REQUIRED_KINDS` and why ENOTDIR counts as absent."""
-    from eris.sanitize import VERIFICATION_PROFILE, neutralise_git_config
+def test_a_bare_allowlisted_key_stays_bare(tmp_path: Path) -> None:
+    """A bare key is boolean true in git; re-serialising it as `key = ""` would
+    invert it (an empty string is FALSE to `git config --bool`)."""
+    from eris.sanitize import allowlist_git_config, parse_git_config
+
+    out, kept, _dropped = allowlist_git_config(b"[core]\n\tbare\n")
+    assert kept == ("core.bare",)
+    assert [(e.name, e.value) for e in parse_git_config(out)] == [("core.bare", None)]
+
+
+def test_a_subsectioned_core_or_extensions_entry_is_dropped(tmp_path: Path) -> None:
+    """`[core "x"] filemode` is `core.x.filemode`, which git acts on not at
+    all, and `[extensions "x"] y` makes a version-1 repository refuse to open
+    ("unknown repository extension"). Neither is what the FORMAT needs, so the
+    allowlist takes only un-subsectioned entries."""
+    from eris.sanitize import allowlist_git_config
+
+    body = b'[core "x"]\n\tfilemode = true\n[extensions "x"]\n\tobjectFormat = sha256\n'
+    out, kept, dropped = allowlist_git_config(body)
+    assert kept == () and dropped == ("core.x.filemode", "extensions.x.objectformat")
+    assert b"[core]" not in out and b"[extensions]" not in out
+
+
+@pytest.mark.parametrize("shape", ["no-git", "git-without-config"])
+def test_a_copy_with_no_config_to_rewrite_is_left_alone(tmp_path: Path, shape: str) -> None:
+    """No `.git`, or a `.git` with no config file: nothing was inherited and
+    nothing is written. (The third old shape - a `.git` that is the gitlink
+    FILE of a worktree or submodule - is now REFUSED; see
+    `test_a_copy_that_is_not_one_self_contained_repository_is_refused`.)"""
+    from eris.sanitize import VERIFICATION_PROFILE, rewrite_git_config
 
     original = tmp_path / "o"
     original.mkdir()
@@ -444,21 +603,17 @@ def test_a_copy_with_nothing_to_neutralise_is_left_alone(tmp_path: Path, shape: 
     if shape == "git-without-config":
         (original / ".git").mkdir()
         (original / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
-    if shape == "git-is-a-gitlink-file":
-        (original / ".git").write_text("gitdir: ../elsewhere/.git/worktrees/w\n")
 
     copy = tmp_path / "scratch" / "verify-copy"
     sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
 
-    assert neutralise_git_config(copy).rewritten is False
+    assert rewrite_git_config(copy).rewritten is False
     assert not (copy / ".git" / "config").exists()
 
 
-def test_the_neutralised_config_keeps_a_read_only_file_mode(tmp_path: Path) -> None:
-    """Item 2: the rewrite restores the copy's file mode, so a repository that
-    ships a read-only `.git/config` still copies faithfully (cond 4 modes) -
-    and a config with no trailing newline does not run into the appended
-    block."""
+def test_the_rewritten_config_keeps_a_read_only_file_mode(tmp_path: Path) -> None:
+    """The rewrite restores the copy's file mode, so a repository that ships a
+    read-only `.git/config` still copies faithfully (cond 4 modes)."""
     from eris.sanitize import VERIFICATION_PROFILE
 
     original = tmp_path / "o"
@@ -471,8 +626,99 @@ def test_the_neutralised_config_keeps_a_read_only_file_mode(tmp_path: Path) -> N
 
     text = (copy / ".git" / "config").read_text()
     assert stat.S_IMODE((copy / ".git" / "config").stat().st_mode) == 0o444
-    assert text.startswith('[remote "o"]\n\turl = x\n# eris')  # a newline was supplied
-    assert _core_values(text, "fsmonitor") == ["false"]
+    assert text.startswith("# eris") and "url" not in text  # the whole remote is gone
+
+
+# ------------------------- M2c follow-up 5, item 2: the repo-level escapes
+
+
+def test_the_alternates_and_worktree_config_are_dropped_from_the_copy(tmp_path: Path) -> None:
+    """M2c follow-up 5, item 2. `.git/objects/info/alternates` points git at
+    ANOTHER object store: measured 2026-08-24 on git 2.50.1, planting one in a
+    properly history-truncated snapshot makes a commit `eris.snapshot`
+    deliberately removed reachable again (`test_verify_real_git.py::
+    test_a_planted_alternates_cannot_reach_a_truncated_away_object`).
+    `.git/config.worktree` is a second config file with the same execution
+    risk as `.git/config`. All three are deleted from the copy; the ORIGINAL
+    keeps them."""
+    from eris.sanitize import GIT_DROPPED_RELPATHS, VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    for parts in GIT_DROPPED_RELPATHS:
+        target = original.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("planted\n")
+    before_hash = tree_sha256(original)
+
+    copy = tmp_path / "scratch" / "verify-copy"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    for parts in GIT_DROPPED_RELPATHS:
+        assert not copy.joinpath(*parts).exists(), parts
+        assert original.joinpath(*parts).read_text() == "planted\n"
+    assert (copy / ".git" / "objects" / "info").is_dir()  # only the files go
+    assert tree_sha256(original) == before_hash
+
+
+@pytest.mark.parametrize(
+    ("shape", "reason"),
+    [
+        ("gitlink-file", r"^\.git: is a regular file .*worktree/submodule gitlink"),
+        ("commondir", r"\.git/commondir: is present .*LINKED WORKTREE"),
+        ("worktrees", r"\.git/worktrees: is present .*HOSTS linked worktrees"),
+        ("modules", r"\.git/modules: is present .*SUBMODULE gitdirs"),
+    ],
+)
+def test_a_copy_that_is_not_one_self_contained_repository_is_refused(
+    tmp_path: Path, shape: str, reason: str
+) -> None:
+    """M2c follow-up 5, item 2. Each of these means part of the repository
+    lives in a `.git` Eris has not copied, has not rewritten and does not
+    guard - so the config allowlist and the tripwire cover only half of what
+    git would read. Refusing names the path and why; silently verifying half a
+    repository would not."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    original.mkdir()
+    (original / "keep.txt").write_text("k\n")
+    if shape == "gitlink-file":
+        (original / ".git").write_text("gitdir: ../elsewhere/.git/worktrees/w\n")
+    else:
+        _mkgit(original)
+        if shape == "commondir":
+            (original / ".git" / "commondir").write_text("../..\n")
+        else:
+            (original / ".git" / shape / "w").mkdir(parents=True)
+
+    with pytest.raises(SanitizeError, match=reason):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+def test_the_repo_escape_checks_fail_closed_on_an_unreadable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An errno that is not "absent" is never treated as absent."""
+    import eris.sanitize as sanitize_mod
+
+    copy = _mkgit(tmp_path / "copy")
+    (copy / ".git" / "objects" / "info").mkdir(parents=True)
+    (copy / ".git" / "objects" / "info" / "alternates").write_text("/elsewhere\n")
+
+    def denied(self: Path) -> os.stat_result:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(sanitize_mod.Path, "lstat", denied)
+    with pytest.raises(SanitizeError, match=r"\.git/commondir: cannot be checked"):
+        sanitize_mod.assert_no_repo_escapes(copy)
+
+    def undeletable(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.undo()
+    monkeypatch.setattr(sanitize_mod.Path, "unlink", undeletable)
+    with pytest.raises(SanitizeError, match=r"alternates: could not be removed"):
+        sanitize_mod.drop_git_repo_escapes(copy)
 
 
 # ------------------------------------------------ M2c follow-up 4: the control fails CLOSED
@@ -490,16 +736,18 @@ def test_a_symlinked_git_config_inside_the_copy_is_replaced_never_followed(
     tmp_path: Path,
 ) -> None:
     """M2c follow-up 4, item 1: `.git/config` as a symlink used to be SKIPPED
-    silently - a complete bypass, because git follows it and honours
-    `core.fsmonitor` from the target. A link resolving INSIDE the copy is now
-    read, unlinked and replaced by a REGULAR file holding the neutralised
-    bytes: the target is never written through (item 3), the copy is still
-    usable, and the replacement is recorded in `dropped_symlinks`."""
+    silently - a complete bypass, because git follows it and honours the
+    target's settings. A link resolving INSIDE the copy is now read, unlinked
+    and replaced by a REGULAR file holding the ALLOWLISTED bytes: the target is
+    never written through (item 3), the copy is still usable, and the
+    replacement is recorded in `dropped_symlinks`."""
     from eris.sanitize import VERIFICATION_PROFILE
 
     original = _mkgit(tmp_path / "o")
     decoy = original / "decoy"
-    decoy.write_text("[core]\n\tfsmonitor = tools/fsm\n\tuntrackedCache = true\n\tbare = 0\n")
+    decoy.write_text(
+        "[core]\n\tfsmonitor = tools/fsm\n\tbare = 0\n[diff]\n\texternal = /tmp/evil.sh\n"
+    )
     os.symlink("../decoy", original / ".git" / "config")  # inside the tree: the copier keeps it
     before_hash, before_bytes = tree_sha256(original), decoy.read_bytes()
     before_ino = decoy.lstat().st_ino
@@ -510,9 +758,8 @@ def test_a_symlinked_git_config_inside_the_copy_is_replaced_never_followed(
     cfg = copy / ".git" / "config"
     assert not cfg.is_symlink() and stat.S_ISREG(cfg.lstat().st_mode)  # a REGULAR file now
     text = cfg.read_text()
-    assert _core_values(text, "fsmonitor") == ["false"]  # the inherited value is gone
-    assert _core_values(text, "untrackedCache") == ["false"]
-    assert "\tbare = 0\n" in text  # the rest of the target's content survives
+    assert _names(cfg.read_bytes()) == ["core.bare"]  # only the allowlisted key survives
+    assert "fsmonitor" not in text and "evil.sh" not in text  # the smuggled keys are gone
     assert ".git/config" in rec.dropped_symlinks  # the link is recorded, not silently gone
 
     # THE TARGET IS NEVER WRITTEN THROUGH: neither the copy's decoy nor the
@@ -603,20 +850,20 @@ def _plant(root: Path, rel: str, shape: str) -> None:
         ("link-escaping", "OUTSIDE the copy root"),
     ],
 )
-def test_neutralise_refuses_every_config_shape_it_cannot_reason_about(
+def test_the_config_rewrite_refuses_every_shape_it_cannot_reason_about(
     tmp_path: Path, shape: str, reason: str
 ) -> None:
     """M2c follow-up 4, item 1: the control FAILS CLOSED. Anything at
     `.git/config` that is not a regular file and not an in-copy link to one
     refuses the copy loudly, naming the path and the reason. Silently skipping
     it is what let a symlink through for four milestones."""
-    from eris.sanitize import neutralise_git_config
+    from eris.sanitize import rewrite_git_config
 
     copy = tmp_path / "copy"
     _mkgit(copy)
     _plant(copy, ".git/config", shape)
     with pytest.raises(SanitizeError, match=r"\.git/config: .*" + reason):
-        neutralise_git_config(copy)
+        rewrite_git_config(copy)
 
 
 def test_the_config_replacement_refuses_a_link_that_changed_under_it(
@@ -645,7 +892,7 @@ def test_the_config_replacement_refuses_a_link_that_changed_under_it(
 
     monkeypatch.setattr(sanitize_mod, "_read_all", swap)
     with pytest.raises(SanitizeError, match=r"\.git/config: changed while it was being replaced"):
-        sanitize_mod.neutralise_git_config(copy)
+        sanitize_mod.rewrite_git_config(copy)
     assert (copy / ".git" / "config").is_symlink()  # nothing was unlinked or written
     assert (copy / ".git" / "real").read_text() == "[core]\n\tfsmonitor = tools/fsm\n"
 
@@ -667,14 +914,14 @@ def test_a_git_path_that_cannot_be_read_or_stat_ed_refuses_the_copy(
 
     monkeypatch.setattr(sanitize_mod.os, "open", denied)
     with pytest.raises(SanitizeError, match=r"\.git/config: .*could not be read"):
-        sanitize_mod.neutralise_git_config(copy)
+        sanitize_mod.rewrite_git_config(copy)
 
     def unstattable(self: Path) -> os.stat_result:
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(sanitize_mod.Path, "lstat", unstattable)
     with pytest.raises(SanitizeError, match=r"\.git/config: cannot be checked"):
-        sanitize_mod.neutralise_git_config(copy)
+        sanitize_mod.rewrite_git_config(copy)
     with pytest.raises(SanitizeError, match=r"\.git: cannot be checked"):
         sanitize_mod.assert_git_layout_sane(copy)
 
@@ -683,10 +930,18 @@ def test_a_git_path_that_cannot_be_read_or_stat_ed_refuses_the_copy(
 #: REFUSED and the shapes that are fine. Adding a path to the table in
 #: `sanitize.py` without adding a row here fails the coverage assertion below.
 LAYOUT_ROWS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
-    (".git", ("dangling-link", "link-to-dir", "fifo"), ("dir", "file")),
+    # M2c follow-up 5: `.git` as a FILE is no longer accepted. A gitlink means
+    # the real gitdir is somewhere Eris has not copied.
+    (".git", ("dangling-link", "link-to-dir", "fifo", "file"), ("dir",)),
     (".git/config", ("fifo", "dir", "link-to-file"), ("file",)),
     (".git/index", ("fifo", "dir", "link-to-file", "dangling-link"), ("file",)),
     (".git/hooks", ("fifo", "file", "link-to-dir"), ("dir",)),
+    (".git/config.worktree", ("fifo", "dir", "link-to-file"), ("file",)),
+    (".git/objects/info/alternates", ("fifo", "dir", "link-to-file"), ("file",)),
+    (".git/objects/info/http-alternates", ("fifo", "dir", "dangling-link"), ("file",)),
+    (".git/commondir", ("fifo", "dir", "link-to-file"), ("file",)),
+    (".git/worktrees", ("fifo", "file", "link-to-dir"), ("dir",)),
+    (".git/modules", ("fifo", "file", "link-to-dir"), ("dir",)),
 )
 
 
@@ -734,7 +989,7 @@ def test_the_git_layout_assertion_accepts_the_shapes_git_really_has(
     if shape != "absent":
         _plant(copy, rel, shape)
     assert_git_layout_sane(copy)  # no raise
-    assert {"/".join(parts) for parts, _kind in GIT_REQUIRED_KINDS} == {
+    assert {"/".join(parts) for parts, _kind, _why in GIT_REQUIRED_KINDS} == {
         row[0] for row in LAYOUT_ROWS
     }, "every GIT_REQUIRED_KINDS entry needs a LAYOUT_ROWS row"
 
@@ -853,3 +1108,390 @@ def test_the_removal_handler_re_raises_anything_that_is_not_a_permission_error(
     handler(func, str(root / "sub"), PermissionError(errno.EACCES, "denied"))
     assert (root / "sub").stat().st_mode & 0o700 == 0o700
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["ordinary", "gitlink-file", "commondir", "worktrees", "modules", "unparseable-config"],
+)
+def test_the_original_is_byte_identical_whatever_the_copy_does(tmp_path: Path, shape: str) -> None:
+    """M2c follow-up 5: the ORIGINAL's `.git/config` bytes and tree hash are
+    unchanged in EVERY case - the ones that copy, the ones that refuse, and the
+    ones that delete a path from the copy. The refusal paths matter most: they
+    raise part-way through, and a rewrite or an unlink that had escaped the
+    copy root would show up here."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    original.mkdir()
+    (original / "keep.txt").write_text("k\n")
+    if shape == "gitlink-file":
+        (original / ".git").write_text("gitdir: ../elsewhere\n")
+    else:
+        _mkgit(original)
+        (original / ".git" / "config").write_text(ORIGINAL_GIT_CONFIG)
+        (original / ".git" / "objects" / "info").mkdir(parents=True)
+        (original / ".git" / "objects" / "info" / "alternates").write_text("/elsewhere\n")
+        (original / ".git" / "config.worktree").write_text("[diff]\n\texternal = /tmp/evil.sh\n")
+        if shape == "commondir":
+            (original / ".git" / "commondir").write_text("../..\n")
+        elif shape in ("worktrees", "modules"):
+            (original / ".git" / shape / "w").mkdir(parents=True)
+        elif shape == "unparseable-config":
+            (original / ".git" / "config").write_text('[core]\n\tfilemode = "oops\n')
+    before_hash = tree_sha256(original)
+    before_config = (original / ".git" / "config").read_bytes() if shape != "gitlink-file" else b""
+
+    try:
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+    except SanitizeError:
+        assert shape != "ordinary"
+    else:
+        assert shape == "ordinary"
+        assert not (tmp_path / "c" / ".git" / "objects" / "info" / "alternates").exists()
+        assert not (tmp_path / "c" / ".git" / "config.worktree").exists()
+
+    assert tree_sha256(original) == before_hash
+    if shape != "gitlink-file":
+        assert (original / ".git" / "config").read_bytes() == before_config
+        assert (original / ".git" / "objects" / "info" / "alternates").is_file()
+        assert (original / ".git" / "config.worktree").is_file()
+
+
+@pytest.mark.parametrize(
+    ("shape", "rel"),
+    [
+        ("dir", "sub/.git"),  # a legacy EMBEDDED repository (no gitlink file)
+        ("file", "sub/.git"),  # a submodule/worktree gitlink
+        ("dir", "a/b/c/.git"),  # at depth, not just one level down
+        ("link", "sub/.git"),  # an in-tree symlink the copier legitimately keeps
+    ],
+)
+def test_a_nested_repository_anywhere_in_the_copy_is_refused(
+    tmp_path: Path, shape: str, rel: str
+) -> None:
+    """M2c follow-up 5, advisor round. The config allowlist rewrites exactly
+    ONE file - the copy's own `.git/config`. A nested repository has its own,
+    Eris never rewrites it, and it may point outside the snapshot entirely
+    (measured: `test_verify_real_git.py::
+    test_a_nested_repository_pointing_outside_the_snapshot_refuses_the_copy`).
+
+    So ANY `.git` below the root refuses the copy, whatever its shape and at
+    whatever depth - a legacy embedded repository, a gitlink FILE, or a
+    symlink the copier would otherwise keep. Recursive sanitisation is not
+    attempted: refusing is the honest scope."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    nested = original / rel
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    (nested.parent / "keep.txt").write_text("k\n")
+    if shape == "dir":
+        nested.mkdir()
+        (nested / "HEAD").write_text("ref: refs/heads/main\n")
+        (nested / "config").write_text("[diff]\n\texternal = /tmp/evil.sh\n")
+    elif shape == "file":
+        nested.write_text("gitdir: ../../elsewhere/.git\n")
+    else:
+        (nested.parent / "real").mkdir()
+        os.symlink("real", nested)
+
+    with pytest.raises(SanitizeError, match=rel.replace(".", r"\.") + ": a NESTED repository"):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+def test_the_roots_own_git_is_not_a_nested_repository(tmp_path: Path) -> None:
+    """The other half: the guard must not refuse the repository it exists to
+    protect. The copy root's own `.git` is skipped, and a file merely NAMED
+    like one (`.gitignore`, `sub/.gitmodules`) is not a repository."""
+    from eris.sanitize import VERIFICATION_PROFILE, assert_no_nested_repositories
+
+    original = _mkgit(tmp_path / "o")
+    (original / ".gitignore").write_text("*.pyc\n")
+    (original / ".gitattributes").write_text("* text\n")
+    (original / "sub").mkdir()
+    (original / "sub" / ".gitmodules").write_text('[submodule "x"]\n')
+    (original / "sub" / ".gitkeep").write_text("")
+
+    copy = tmp_path / "c"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="v")
+    assert_no_nested_repositories(copy)  # no raise
+    assert (copy / "sub" / ".gitmodules").is_file()
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (b"[extensions]\n\trefstorage = reftable\n", "extensions.refstorage: this repository"),
+        (b"[extensions]\n\tpartialclone = origin\n", "extensions.partialclone: this repository"),
+        (b"[extensions]\n\tfrobnicate = yes\n", "extensions.frobnicate: this repository"),
+        (b"[extensions]\n\tpreciousObjects = true\n", "extensions.preciousobjects: this repo"),
+        (b"[extensions]\n\tobjectFormat = md5\n", "extensions.objectformat: value 'md5'"),
+        (b"[extensions]\n\tobjectFormat\n", "extensions.objectformat: value ''"),
+        (b"[extensions]\n\tcompatObjectFormat = blake3\n", "extensions.compatobjectformat: val"),
+    ],
+)
+def test_an_extension_eris_cannot_vouch_for_refuses_the_copy(
+    tmp_path: Path, body: bytes, reason: str
+) -> None:
+    """M2c follow-up 5, advisor round, item 2. 0.3.9 kept the WHOLE
+    `extensions` section on the assertion that no value there names anything
+    dangerous - an assertion about a key set git is free to grow, with no
+    evidence behind it. It is now a known-key allowlist with VALIDATED values,
+    and anything else REFUSES.
+
+    Refusing rather than dropping is the point: an extension declares how the
+    repository is STORED. Measured 2026-08-24 on git 2.50.1, a reftable
+    repository really exists (`git init --ref-format=reftable`), and a copy
+    with `refstorage` dropped is one whose refs git looks for in the wrong
+    place - it opens, then reports nothing. Loud beats quietly wrong."""
+    from eris.sanitize import (
+        VERIFICATION_PROFILE,
+        UnsupportedRepositoryExtension,
+    )
+
+    original = _mkgit(tmp_path / "o")
+    (original / ".git" / "config").write_bytes(b"[core]\n\trepositoryformatversion = 1\n" + body)
+    with pytest.raises(UnsupportedRepositoryExtension, match=reason.replace(".", r"\.")):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+    # the refusal names the path too, so an operator can find the file
+    with pytest.raises(UnsupportedRepositoryExtension, match=r"^\.git/config: "):
+        sanitize_snapshot(original, tmp_path / "c2", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+@pytest.mark.parametrize(
+    ("body", "kept"),
+    [
+        (b"[extensions]\n\tobjectFormat = sha256\n", ("extensions.objectformat",)),
+        (b"[extensions]\n\tobjectFormat = sha1\n", ("extensions.objectformat",)),
+        (b"[extensions]\n\tOBJECTFORMAT = SHA256\n", ("extensions.objectformat",)),  # case
+        (b"[extensions]\n\tcompatObjectFormat = sha1\n", ("extensions.compatobjectformat",)),
+        (b"[extensions]\n\tworktreeConfig = true\n", ()),  # dropped, never refused
+    ],
+)
+def test_the_supported_extensions_survive_and_worktree_config_is_dropped(
+    body: bytes, kept: tuple[str, ...]
+) -> None:
+    """The other half of the table. `objectformat` is the one extension whose
+    absence makes the repository fail to OPEN, so it is kept (values validated
+    against the two hash algorithms git has). `worktreeConfig` is DROPPED
+    rather than refused: it enables `.git/config.worktree`, which Eris deletes,
+    so its absence changes nothing - and refusing it would be a false refusal
+    on any checkout where someone has run `git config --worktree`."""
+    from eris.sanitize import allowlist_git_config
+
+    _out, got, _dropped = allowlist_git_config(body)
+    assert got == kept
+
+
+def test_dropping_an_unsupported_extension_would_have_been_the_wrong_answer() -> None:
+    """Why item 2 refuses instead of dropping, pinned as an assertion about
+    the CODE rather than as a comment: no `extensions` key is silently
+    droppable except the ones Eris has explicitly neutralised elsewhere."""
+    from eris.sanitize import GIT_CONFIG_EXTENSIONS_DROPPED, GIT_CONFIG_EXTENSIONS_KEPT
+
+    assert GIT_CONFIG_EXTENSIONS_DROPPED == {"worktreeconfig"}  # and Eris deletes that file
+    assert set(GIT_CONFIG_EXTENSIONS_KEPT) == {"objectformat", "compatobjectformat"}
+    assert not GIT_CONFIG_EXTENSIONS_DROPPED & set(GIT_CONFIG_EXTENSIONS_KEPT)
+    for allowed in GIT_CONFIG_EXTENSIONS_KEPT.values():
+        assert allowed == {"sha1", "sha256"}
+
+
+def test_a_refused_copy_is_removed_not_left_behind(tmp_path: Path) -> None:
+    """M2c follow-up 5, advisor round, item 4. `sanitize_snapshot` used to run
+    BEFORE `sanitized_copy`'s `try`/`finally`, so every refusal left a
+    half-built copy in the scratch dir for the orphan sweep to find hours
+    later - and this change added a lot of refusals, each of them deliberate.
+
+    The copy is now removed on the build path too, whatever raised."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    (original / "sub").mkdir()
+    (original / "sub" / ".git").write_text("gitdir: ../../elsewhere\n")  # refused
+
+    scratch = tmp_path / "scratch"
+    with pytest.raises(SanitizeError, match="a NESTED repository"):
+        with sanitized_copy(original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"):
+            raise AssertionError("the body must never run")  # pragma: no cover
+
+    assert not (scratch / "sanitized-verify").exists()  # nothing left behind
+    assert list(scratch.iterdir()) == []
+
+
+def test_a_dest_that_already_existed_is_never_deleted_by_the_refusal(tmp_path: Path) -> None:
+    """The other half of item 4, and the rule the run-scratch reservation
+    already follows: Eris removes only what THIS call created. A `dest` that
+    was already there is refused by `make_private_dir` and left exactly as
+    found, for an operator to inspect."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    scratch = tmp_path / "scratch"
+    squatter = scratch / "sanitized-verify"
+    squatter.mkdir(parents=True)
+    (squatter / "someone-elses.txt").write_text("do not delete me\n")
+
+    with pytest.raises(LaunchRefused, match="already exists"):
+        with sanitized_copy(original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"):
+            raise AssertionError("the body must never run")  # pragma: no cover
+
+    assert (squatter / "someone-elses.txt").read_text() == "do not delete me\n"
+
+
+def test_a_cleanup_failure_on_a_refusal_reports_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If removing the half-built copy ALSO fails, neither fact is lost: the
+    cleanup error is raised (worker-visible files may remain, which is a run
+    error, not a refusal) and the refusal that started it is the `__cause__`."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    (original / "sub").mkdir()
+    (original / "sub" / ".git").write_text("gitdir: ../../elsewhere\n")
+
+    def broken(path: object, *a: object, **k: object) -> None:
+        raise OSError("EBUSY")
+
+    monkeypatch.setattr(shutil, "rmtree", broken)
+    with pytest.raises(SanitizeCleanupError, match="could not be removed") as caught:
+        with sanitized_copy(
+            original, tmp_path / "s", profile=VERIFICATION_PROFILE, worker_id="verify"
+        ):
+            raise AssertionError("the body must never run")  # pragma: no cover
+    assert isinstance(caught.value.__cause__, SanitizeError)
+    assert "a NESTED repository" in str(caught.value.__cause__)
+
+
+@pytest.mark.parametrize("spelling", [".git", ".GIT", ".Git", ".gIT"])
+def test_a_nested_repository_is_refused_whatever_its_case(tmp_path: Path, spelling: str) -> None:
+    """The nested-repo walk compares FOLDED names, because the filesystem may.
+
+    Measured 2026-08-24 on macOS/APFS: a directory created as `.GIT` is
+    reported by `os.walk` under that literal name, while `Path("sub/.git")
+    .exists()` is True and git resolves it. An exact `name == ".git"` test
+    therefore missed it, and the "ANY `.git`, any shape, any depth" claim was
+    false as written.
+
+    On a case-SENSITIVE filesystem `.GIT` is a distinct directory git never
+    reads, so folding costs a refused copy there and never an escape."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    (original / "sub").mkdir()
+    (original / "sub" / spelling).mkdir()
+    (original / "sub" / spelling / "config").write_text("[diff]\n\texternal = /tmp/evil.sh\n")
+
+    with pytest.raises(SanitizeError, match=r"sub/\." + spelling[1:] + ": a NESTED repository"):
+        sanitize_snapshot(original, tmp_path / "c", profile=VERIFICATION_PROFILE, worker_id="v")
+
+
+def test_the_git_name_fold_is_ascii_only_and_normalisation_is_a_no_op() -> None:
+    """What `_fold` does and does not do, pinned rather than assumed.
+
+    `.git` is pure ASCII, so NFC/NFD/NFKC/NFKD all return it unchanged - there
+    is NO decomposed spelling of `.git` to defend against, and the NFC step is
+    a measured no-op kept only so the helper stays correct if a non-ASCII
+    marker name is ever added.
+
+    It must NOT fold compatibility lookalikes: a fullwidth `.g<U+FF49>t` is a
+    DIFFERENT file (measured 2026-08-24 on APFS - creating it leaves `.git`
+    non-existent), so matching it would be a false refusal."""
+    import unicodedata
+
+    from eris.sanitize import _fold, _is_git_name
+
+    for form in ("NFC", "NFD", "NFKC", "NFKD"):
+        assert unicodedata.normalize(form, ".git") == ".git", form
+    for spelling in (".git", ".GIT", ".Git", ".gIT", unicodedata.normalize("NFD", ".GIT")):
+        assert _is_git_name(spelling), spelling
+    for other in (".gitignore", "git", ".gi", ".gｉt", "..git", " .git"):
+        assert not _is_git_name(other), other
+    assert _fold(".GIT") == _fold(".git") == ".git"
+
+
+def test_a_case_folded_git_hooks_directory_is_still_not_copied(tmp_path: Path) -> None:
+    """The same fold, one level down and in the COPIER. `.git/hooks` is
+    dropped because our allowlist runs git and a repository hook would fire on
+    the first invocation - and on a case-insensitive filesystem `.GIT/HOOKS`
+    is that same directory."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = tmp_path / "o"
+    (original / ".GIT" / "HOOKS").mkdir(parents=True)
+    (original / ".GIT" / "HOOKS" / "pre-commit").write_text("#!/bin/sh\nexit 1\n")
+    (original / ".GIT" / "HEAD").write_text("ref: refs/heads/main\n")
+    (original / "keep.txt").write_text("k\n")
+
+    copy = tmp_path / "c"
+    sanitize_snapshot(original, copy, profile=VERIFICATION_PROFILE, worker_id="v")
+
+    assert not (copy / ".GIT" / "HOOKS").exists()
+    assert (copy / ".GIT" / "HEAD").is_file()  # the rest of the gitdir is copied
+
+
+def test_a_directory_appearing_in_the_reservation_window_is_never_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2c follow-up 5, final round, item 4: the cleanup RACE.
+
+    The removal used to be gated on an existence check taken BEFORE
+    `make_private_dir`. A directory appearing in that window would be refused
+    by `make_private_dir` (correctly) and then DELETED by the cleanup
+    (catastrophically) - because "it did not exist when I looked" was being
+    used as "I created it".
+
+    Ownership is now the successful `mkdir(exist_ok=False)` itself: the
+    reservation happens in `sanitized_copy`, and nothing is removed unless
+    that call returned normally. Here the directory is planted inside the
+    window, exactly as a concurrent process would."""
+    import eris.launch as launch_mod
+    import eris.sanitize as sanitize_mod
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    scratch = tmp_path / "scratch"
+    dest = scratch / "sanitized-verify"
+    real_make = launch_mod.make_private_dir
+
+    def racing(path: Path) -> None:
+        if path == dest and not path.exists():
+            path.mkdir(parents=True)  # a concurrent process wins the race
+            (path / "someone-elses.txt").write_text("do not delete me\n")
+        real_make(path)
+
+    monkeypatch.setattr(sanitize_mod, "make_private_dir", racing)
+
+    with pytest.raises(LaunchRefused, match="already exists"):
+        with sanitized_copy(original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"):
+            raise AssertionError("the body must never run")  # pragma: no cover
+
+    assert (dest / "someone-elses.txt").read_text() == "do not delete me\n"
+
+
+def test_the_reservation_is_made_once_and_owned_by_the_context_manager(tmp_path: Path) -> None:
+    """The other half: `sanitized_copy` reserves, and `sanitize_snapshot` is
+    told the reservation is already held so it does not try again. A direct
+    `sanitize_snapshot` call still reserves for itself - the two entry points
+    must not drift into double-reserving or into never reserving."""
+    from eris.sanitize import VERIFICATION_PROFILE, sanitize_snapshot
+
+    original = _mkgit(tmp_path / "o")
+
+    # direct call: reserves for itself, so a pre-existing dest is refused
+    (tmp_path / "taken").mkdir()
+    with pytest.raises(LaunchRefused, match="already exists"):
+        sanitize_snapshot(original, tmp_path / "taken", profile=VERIFICATION_PROFILE, worker_id="v")
+
+    # ... and with the reservation declared, it writes into the dir it was given
+    reserved = tmp_path / "reserved"
+    reserved.mkdir()
+    record = sanitize_snapshot(
+        original,
+        reserved,
+        profile=VERIFICATION_PROFILE,
+        worker_id="v",
+        dest_reserved=True,
+    )
+    assert (reserved / "keep.txt").is_file() and record.worker_id == "v"

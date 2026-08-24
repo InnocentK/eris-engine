@@ -61,6 +61,42 @@ from eris.policy import Policy, VerifyCommand, sha256_file
 # recommends exactly this invocation for read-only status checks.
 GIT_ERIS_GLOBALS: tuple[str, ...] = ("--no-optional-locks",)
 
+#: Flags Eris APPENDS to every verification invocation of a tool, immediately
+#: after the executable and before any subcommand or positional - the same
+#: contract as ``--no-optional-locks`` for git, and for the same reason: the
+#: repository must not get to choose how the tool behaves.
+#:
+#: Measured 2026-08-24, this machine, against the ALLOWLISTED tools:
+#:
+#: * **mypy** - a repository ``mypy.ini`` with ``plugins = ./evil_plugin.py``
+#:   EXECUTED the plugin. That is arbitrary code execution, the same class as
+#:   `[diff] external`, and it is PRE-EXISTING (not introduced by the config
+#:   allowlist work). ``--config-file <devnull>`` stops it.
+#: * **ruff** - a repository ``ruff.toml`` with ``[lint] select = []`` made
+#:   ``ruff check`` report "All checks passed!" on a file with an unused
+#:   import. Not execution: EVIDENCE MANIPULATION, which for an engine whose
+#:   job is deciding whether an answer is defensible is its own kind of
+#:   serious. ``--isolated`` stops it (the same run then reports F401).
+#:
+#: Every flag here is ALSO hard-denied to a model (:data:`HARD_DENY`), exactly
+#: like ``--no-optional-locks``: Eris supplies it, a proposal may not.
+#:
+#: ``os.devnull`` rather than a literal ``/dev/null`` because Windows spells it
+#: ``nul``; whether mypy accepts ``--config-file nul`` there is UNKNOWN and
+#: untested (portability note, ``docs/SECURITY.md``). mypy prints
+#: ``<devnull>: No [mypy] section in config file`` on stderr, which lands in
+#: the evidence as recorded stderr; that noise is accepted in exchange for the
+#: isolation.
+#:
+#: **pytest is deliberately absent.** Its `conftest.py` IS repository code and
+#: no flag isolates it, which is exactly why pytest is refused unless the
+#: policy is `trusted: true`.
+ERIS_ISOLATION_FLAGS: dict[str, tuple[str, ...]] = {
+    "git": GIT_ERIS_GLOBALS,
+    "mypy": ("--config-file", os.devnull),
+    "ruff": ("--isolated",),
+}
+
 HARD_DENY: dict[str, frozenset[str]] = {
     "git": frozenset(
         {
@@ -128,6 +164,7 @@ HARD_DENY: dict[str, frozenset[str]] = {
     "ruff": frozenset(
         {
             "--config",
+            "--isolated",  # Eris appends it; a model may not supply it
             "--fix",
             "--fix-only",
             "--unsafe-fixes",
@@ -267,8 +304,10 @@ def check_command(
 
     rest = list(argv[1:])
     out: list[str] = [str(exe.resolve())]
-    if name == "git":
-        out.extend(GIT_ERIS_GLOBALS)  # global options must precede the subcommand
+    # Eris's own isolation flags go first: git REQUIRES globals before the
+    # subcommand, and ruff accepts `--isolated` on either side of one
+    # (measured 2026-08-24), so one position serves every tool.
+    out.extend(ERIS_ISOLATION_FLAGS.get(name, ()))
     if spec.subcommands:
         if not rest or rest[0] not in spec.subcommands:
             return _refuse(f"{name} subcommand must be one of {sorted(spec.subcommands)}", name)

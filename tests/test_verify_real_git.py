@@ -59,6 +59,7 @@ import pytest
 
 from eris.evidence import (
     PACK_COMMANDS,
+    NestedRepositoryRefused,
     SnapshotGuard,
     TaskSpec,
     VerifyEnv,
@@ -67,9 +68,10 @@ from eris.evidence import (
 )
 from eris.policy import Policy
 from eris.redact import Redactor
-from eris.sanitize import VERIFICATION_PROFILE, sanitize_snapshot
+from eris.sanitize import VERIFICATION_PROFILE, SanitizeError, sanitize_snapshot
 from eris.schemas import EvidenceKind
 from eris.writer import RunWriter
+from tests.test_sanitize import GRAMMAR_ROWS, UNPARSEABLE_ROWS
 
 pytestmark = pytest.mark.real_subprocess(allow=["git"])
 
@@ -486,9 +488,11 @@ def test_an_inherited_fsmonitor_is_off_in_the_verification_copy_never_in_the_ori
     repo = tmp_path / "verify-copy"
     sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
 
-    # the copy: git itself resolves the value, so this is not a text assertion
-    assert _git(repo, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"false"
-    assert _git(repo, git, "config", "--get", "core.untrackedCache").stdout.strip() == b"false"
+    # the copy: git itself resolves the value, so this is not a text assertion.
+    # M2c follow-up 5 made this an ALLOWLIST, so the keys are not set to
+    # `false` any more - they are not in the file at all, which is stronger.
+    assert _git(repo, git, "config", "--get", "core.fsmonitor", check=False).returncode == 1
+    assert _git(repo, git, "config", "--get", "core.untrackedCache", check=False).returncode == 1
     assert (repo / TRACKED_HOOK).is_file()  # the hook file is still there, unused
 
     policy = _policy(tmp_path, git)
@@ -574,8 +578,8 @@ def test_a_symlinked_config_cannot_smuggle_an_fsmonitor_into_the_verification_co
 
     cfg = repo / ".git" / "config"
     assert not cfg.is_symlink() and cfg.is_file()  # replaced, never written through
-    assert _git(repo, git, "config", "--get", "core.fsmonitor").stdout.strip() == b"false"
-    assert _git(repo, git, "config", "--get", "core.untrackedCache").stdout.strip() == b"false"
+    assert _git(repo, git, "config", "--get", "core.fsmonitor", check=False).returncode == 1
+    assert _git(repo, git, "config", "--get", "core.untrackedCache", check=False).returncode == 1
     assert (repo / ".git" / "config.real").read_bytes() == real.read_bytes()  # target untouched
 
     policy = _policy(tmp_path, git)
@@ -701,7 +705,8 @@ def test_the_index_digest_does_not_cover_the_index_extensions(
     assert (change.reason if change is not None else None) == reason
     # whatever the tree hash saw, it was never the extension: the digest is flat
     assert env.guard.probe is not None
-    assert env.guard.probe(repo) == env.guard.index_digest
+    probed = env.guard.probe(repo)
+    assert probed is not None and probed.digest == env.guard.index_digest
     changed_paths = {rel for rel, sha in _files(repo).items() if files_before.get(rel) != sha} | (
         files_before.keys() - _files(repo).keys()
     )
@@ -741,3 +746,646 @@ def test_the_split_index_is_caught_by_the_tree_hash_not_by_the_digest(tmp_path: 
     _git(repo, git, "update-index", "--skip-worktree", "calc.py")
     after = env.guard.changed()
     assert after is not None and after.reason == "git_index"
+
+
+# ------------- M2c follow-up 5: a repository config is arbitrary execution
+#
+# The three vectors below were MEASURED on this machine (git 2.50.1,
+# 2026-08-24) before any of this was written, and each one still executes if
+# `rewrite_git_config` is reverted to the old denylist. They are the reason the
+# copy's `.git/config` is now rewritten from an ALLOWLIST rather than having
+# two known-bad keys removed.
+
+
+def _evil_script(path: Path, marker: Path) -> None:
+    """A tracked, executable file in the repository that records the fact that
+    it ran. It is ordinary repository CONTENT - the snapshot sanitizer has no
+    reason to remove it, and does not."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\nprintf EXECUTED >> {marker}\nexit 0\n")
+    path.chmod(0o755)
+
+
+def _config_list(repo: Path, git: Path) -> list[str]:
+    """`git config --list` as git itself reports it, so the assertions below
+    are not a re-implementation of the parser under test."""
+    out = _git(repo, git, "config", "--list", check=False)
+    return [line for line in out.stdout.decode().splitlines() if line]
+
+
+def test_a_repository_diff_external_cannot_execute_in_the_verification_copy(
+    tmp_path: Path,
+) -> None:
+    """VECTOR 1, measured 2026-08-24 on git 2.50.1: with `[diff] external` in
+    the copy's `.git/config`, the ALLOWLISTED verification command
+    `git --no-optional-locks diff HEAD` EXECUTED the named program. The
+    verification allowlist, the executable pin and the `--ext-diff` hard-deny
+    were all irrelevant: the repository chose the program, not the model.
+
+    The copy's config is now rewritten from an allowlist, so `diff.external` is
+    not in it and there is nothing to run. The ORIGINAL keeps its config."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    marker = tmp_path / "EXECUTED"
+    _evil_script(source / "tools" / "evil", marker)
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c2")
+    _git(source, git, "config", "diff.external", "tools/evil")
+    (source / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return b + a\n")
+    assert _git(source, git, "config", "--get", "diff.external").stdout.strip() == b"tools/evil"
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    assert (repo / "tools" / "evil").is_file()  # the payload is still in the tree
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "diff", "HEAD"]]:
+        outcome = env.run(argv)
+        assert outcome.violated is False, (argv, outcome.violation_reason)
+    assert not marker.exists(), f"the repository's program RAN: {marker.read_text()!r}"
+    assert _git(repo, git, "config", "--get", "diff.external", check=False).returncode == 1
+
+    # THE ORIGINAL IS NEVER MODIFIED: it still has the setting, and running the
+    # same command THERE is what proves the vector is real rather than absent
+    assert _git(source, git, "config", "--get", "diff.external").stdout.strip() == b"tools/evil"
+    _git(source, git, "--no-optional-locks", "diff", "HEAD")
+    assert marker.read_text() == "EXECUTED"  # ... it executes in the original
+
+
+def test_a_repository_textconv_driver_cannot_execute_in_the_verification_copy(
+    tmp_path: Path,
+) -> None:
+    """VECTOR 2, measured the same day: a named diff driver reached through a
+    TRACKED `.gitattributes` (`calc.py diff=evil`). `.gitattributes` is tree
+    content - sanitisation does not touch it and must not - so the only place
+    this can be stopped is the config half, where the driver is DEFINED.
+
+    That is the pin for the spec's claim that with no driver defined a
+    `.gitattributes` naming `diff=evil` is INERT: it is verified here, not
+    assumed. git resolves the attribute, finds no `diff.evil.textconv`, and
+    falls back to its internal diff."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    marker = tmp_path / "EXECUTED"
+    _evil_script(source / "tools" / "evil", marker)
+    (source / ".gitattributes").write_text("calc.py diff=evil\n")
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c2")
+    _git(source, git, "config", "diff.evil.textconv", "tools/evil")
+    (source / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return b + a\n")
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    assert (repo / ".gitattributes").read_text() == "calc.py diff=evil\n"  # tree content stays
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "diff", "HEAD"]]:
+        outcome = env.run(argv)
+        assert outcome.violated is False, (argv, outcome.violation_reason)
+    assert not marker.exists(), f"the repository's program RAN: {marker.read_text()!r}"
+    assert _git(repo, git, "config", "--get", "diff.evil.textconv", check=False).returncode == 1
+    # the diff is still a real diff, produced by git's own machinery
+    assert "return b + a" in env.run(["git", "diff", "HEAD"]).stdout.decode()
+
+    # the vector is real in the ORIGINAL, which still has the driver
+    _git(source, git, "--no-optional-locks", "diff", "HEAD")
+    assert marker.read_text().startswith("EXECUTED")
+
+
+def test_a_git_info_attributes_driver_cannot_execute_in_the_verification_copy(
+    tmp_path: Path,
+) -> None:
+    """VECTOR 2, one level down and inside `.git`. `.git/info/attributes` is
+    the REPOSITORY-LOCAL attributes file: it is not tracked, it is not
+    `.gitattributes`, and the copier copies everything under `.git` except
+    `hooks`, so it arrives in the copy verbatim and always will.
+
+    Measured on git 2.50.1: with `diff.evil.textconv` defined it EXECUTES, and
+    with the driver unset it is inert - exactly like `.gitattributes`. The
+    docs previously called that inert BY REASONING (drivers come only from
+    config); this pins it. The attributes file is deliberately NOT removed
+    from the copy: what makes it safe is that nothing DEFINES the driver it
+    names, which is a property of the config allowlist. If the allowlist ever
+    gains a driver-defining key, this test is what fails."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    marker = tmp_path / "EXECUTED"
+    _evil_script(source / "tools" / "evil", marker)
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c2")
+    info = source / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "attributes").write_text("calc.py diff=evil\n")  # NOT .gitattributes
+    _git(source, git, "config", "diff.evil.textconv", "tools/evil")
+    (source / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return b + a\n")
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    # the attributes file is still there - it is `.git` content, copied verbatim
+    assert (repo / ".git" / "info" / "attributes").read_text() == "calc.py diff=evil\n"
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "diff", "HEAD"]]:
+        outcome = env.run(argv)
+        assert outcome.violated is False, (argv, outcome.violation_reason)
+    assert not marker.exists(), f"the repository's program RAN: {marker.read_text()!r}"
+    assert _git(repo, git, "config", "--get", "diff.evil.textconv", check=False).returncode == 1
+    assert "return b + a" in env.run(["git", "diff", "HEAD"]).stdout.decode()
+
+    # the vector is real in the ORIGINAL, which still has the driver: without
+    # this the test could go vacuous if git ever stopped honouring the file
+    _git(source, git, "--no-optional-locks", "diff", "HEAD")
+    assert marker.read_text().startswith("EXECUTED")
+
+
+def test_a_planted_alternates_cannot_reach_a_truncated_away_object(tmp_path: Path) -> None:
+    """VECTOR 3, measured the same day. `eris.snapshot` builds a
+    history-truncated clone precisely so the commits that contain the answer
+    are NOT in the snapshot. A single line in `.git/objects/info/alternates`
+    points git at another object store and gives them back: measured, the fix
+    commit went from `cat-file -e` FAILING to SUCCEEDING, and its blob could be
+    read out in full.
+
+    The copy deletes `alternates` (and its `http-` twin), so the object stays
+    unreachable. This is corpus contamination, not code execution, and it is
+    the one vector `eris.scan` would not necessarily catch: the worker never
+    has to name a path Eris knows about."""
+    git = _git_executable()
+    upstream = tmp_path / "upstream"
+    _make_repo(upstream, git)
+    (upstream / "FIX.txt").write_text("the answer the corpus hides\n")
+    _git(upstream, git, "add", "-A")
+    _git(upstream, git, "commit", "-qm", "the fix commit")
+    fix_sha = _git(upstream, git, "rev-parse", "HEAD").stdout.decode().strip()
+    pre_sha = _git(upstream, git, "rev-parse", "HEAD~1").stdout.decode().strip()
+    _git(upstream, git, "branch", "-q", "pre", pre_sha)
+
+    # what eris.snapshot builds: history-truncated, single branch, no origin
+    source = tmp_path / "snapshot"
+    _git(
+        upstream,
+        git,
+        "clone",
+        "-q",
+        "--no-local",
+        "--depth",
+        "1",
+        "--single-branch",
+        "-b",
+        "pre",
+        str(upstream),
+        str(source),
+    )
+    _git(source, git, "remote", "remove", "origin")
+    assert _git(source, git, "cat-file", "-e", fix_sha, check=False).returncode != 0
+
+    # ... and the escape a repository-controlled `.git` can add to it
+    alt = source / ".git" / "objects" / "info"
+    alt.mkdir(parents=True, exist_ok=True)
+    (alt / "alternates").write_text(f"{upstream / '.git' / 'objects'}\n")
+    assert _git(source, git, "cat-file", "-e", fix_sha, check=False).returncode == 0
+    assert b"the answer" in _git(source, git, "cat-file", "-p", f"{fix_sha}:FIX.txt").stdout
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    reachable = _git(repo, git, "cat-file", "-e", fix_sha, check=False)
+    assert reachable.returncode != 0, "the truncated-away fix commit is READABLE in the copy"
+    assert _git(repo, git, "cat-file", "-p", f"{fix_sha}:FIX.txt", check=False).returncode != 0
+    assert not (repo / ".git" / "objects" / "info" / "alternates").exists()
+    # ... and the truncated snapshot is still a working repository
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    for argv in (list(a) for a in PACK_COMMANDS):
+        assert env.run(argv).exit_code == 0, argv
+    assert env.violated is False
+
+    # THE ORIGINAL IS NEVER MODIFIED: the planted file is still there
+    assert (alt / "alternates").is_file()
+
+
+def _make_ordinary_repo(root: Path, git: Path) -> None:
+    """A repository configured the way a developer's checkout really is:
+    remotes, a user, aliases, several branches, and the local settings `git
+    init` writes for itself."""
+    _make_repo(root, git)
+    for args in (
+        ("remote", "add", "origin", "https://example.invalid/r.git"),
+        ("remote", "add", "upstream", "https://example.invalid/u.git"),
+        ("config", "user.name", "A Developer"),
+        ("config", "user.email", "dev@example.invalid"),
+        ("config", "alias.st", "status --porcelain"),
+        ("config", "alias.lg", "log --oneline"),
+        ("config", "push.default", "current"),
+        ("config", "pull.rebase", "true"),
+        ("config", "commit.gpgsign", "false"),
+        ("config", "branch.main.remote", "origin"),
+        ("config", "branch.main.merge", "refs/heads/main"),
+        ("branch", "-q", "feature"),
+        ("branch", "-q", "release"),
+    ):
+        _git(root, git, *args)
+
+
+def test_an_ordinary_repository_still_runs_the_whole_battery_after_the_rewrite(
+    tmp_path: Path,
+) -> None:
+    """The false-refusal test, and the one that decides whether this control
+    survives contact with real use. A guard that rejects ordinary repositories
+    gets deleted by the next person.
+
+    An ordinary checkout - two remotes, a user, aliases, tracking config,
+    several branches - must sanitize without refusing and must run the WHOLE
+    default battery clean, with no `snapshot.violated`, no `verify.refused` and
+    real output from every command, even though everything but the format keys
+    has been removed from the copy's config."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_ordinary_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    writer = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
+    task = TaskSpec.model_validate(
+        {
+            "task_id": "t_ordinary",
+            "question": "Does the battery complete on an ordinary repository?",
+            "category": "control",
+            "snapshot": "snapshot",
+        }
+    )
+    build = build_evidence_pack(
+        task, env=env, writer=writer, repeat_index=0, policy_sha256="0" * 64, snapshot_sha=None
+    )
+    writer.close()
+
+    events: list[dict[str, Any]] = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / "r" / "events.jsonl").read_bytes().splitlines()
+    ]
+    kinds = [e["kind"] for e in events]
+    assert "snapshot.violated" not in kinds, [
+        e["payload"] for e in events if e["kind"] == "snapshot.violated"
+    ]
+    assert "verify.refused" not in kinds, [
+        e["payload"] for e in events if e["kind"] == "verify.refused"
+    ]
+    assert build.refused == 0 and env.violated is False
+    facts = [i for i in build.items if i.kind is EvidenceKind.REPO_FACT]
+    assert len(facts) == len(PACK_COMMANDS) == 4
+    assert all(i.exit_code == 0 for i in facts)
+    by_label = {i.label.split(": ", 1)[1]: i for i in facts}
+    assert by_label["git rev-parse HEAD"].content.strip().isalnum()
+    assert by_label["git status --porcelain"].content == ""  # a clean tree, not a broken one
+    assert set(by_label["git ls-files"].content.split()) == {"README.md", "calc.py"}
+    assert "c1" in by_label["git log --oneline -n 20"].content
+    # the branches are still there; only the CONFIG was rewritten
+    assert env.run(["git", "diff", "HEAD"]).exit_code == 0
+    branches = _git(repo, git, "branch", "--format=%(refname:short)").stdout.decode().split()
+    assert set(branches) == {"main", "feature", "release"}
+
+
+def test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports(
+    tmp_path: Path,
+) -> None:
+    """The round-trip, judged by GIT and not by Eris's own parser: whatever
+    `git config --list` reports in the ORIGINAL, the copy must report exactly
+    the allowlisted subset of it and nothing else - no `false` leftovers, no
+    reordering into a different meaning, and every kept value byte-identical.
+
+    This is also the differential test for the parser: if Eris read the file
+    differently from the way git reads it, the two lists would disagree."""
+    from eris.sanitize import GIT_CONFIG_ALLOWED_CORE_KEYS, GIT_CONFIG_EXTENSIONS_KEPT
+
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_ordinary_repo(source, git)
+    # every family the allowlist drops, including the two measured execution
+    # vectors, plus the grammar a line-oriented filter gets wrong
+    (source / ".git" / "config").write_bytes(
+        (source / ".git" / "config").read_bytes()
+        + b"[diff] external = tools/evil\n"  # section AND key on ONE line
+        + b'[diff "evil"]\n\ttextconv = tools/evil\n'
+        + b'[filter "evil"]\n\tsmudge = tools/evil\n'
+        + b"[core]\n\thooksPath = tools\n\tfsmonitor = tools/fsm\n\tuntrackedCache = true\n"
+        + b"[include]\n\tpath = extra\n"
+        + b"[credential]\n\thelper = tools/evil\n"
+        + b"[uploadpack]\n\tpackObjectsHook = tools/evil\n"
+        + b"[gpg]\n\tprogram = tools/evil\n"
+        + b'[url "https://evil.invalid/"]\n\tinsteadOf = https://example.invalid/\n'
+    )
+    (source / ".git" / "extra").write_text("[core]\n\tfsmonitor = from-the-include\n")
+    original_list = _config_list(source, git)
+    assert "diff.external=tools/evil" in original_list  # the one-line form parsed as git does
+    assert "core.fsmonitor=from-the-include" in original_list  # the include was honoured
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    def allowed(line: str) -> bool:
+        name = line.split("=", 1)[0]
+        section, _, key = name.partition(".")
+        if section == "extensions":
+            return key in GIT_CONFIG_EXTENSIONS_KEPT
+        return section == "core" and key in GIT_CONFIG_ALLOWED_CORE_KEYS
+
+    copy_list = _config_list(repo, git)
+    assert copy_list == [line for line in original_list if allowed(line)]
+    assert copy_list and all(allowed(line) for line in copy_list)
+    assert "core.repositoryformatversion=0" in copy_list  # the format survived
+    assert not any("evil" in line for line in copy_list)
+    # the include's file is still copied verbatim - it is simply never read
+    assert (repo / ".git" / "extra").read_bytes() == (source / ".git" / "extra").read_bytes()
+
+
+def test_the_object_format_extension_survives_the_rewrite(tmp_path: Path) -> None:
+    """`extensions.objectformat` is the one allowlist entry whose absence makes
+    the repository fail to OPEN, so it is checked against a real sha256
+    repository rather than by reading the constant back."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    made = _git(source, git, "init", "-q", "--object-format=sha256", ".", check=False)
+    if made.returncode != 0:  # pragma: no cover - git without sha256 support
+        pytest.skip(f"this git cannot build a sha256 repository: {made.stderr.decode()[:120]}")
+    (source / "f.txt").write_text("x\n")
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c1")
+    _git(source, git, "config", "diff.external", "tools/evil")
+    assert "extensions.objectformat=sha256" in _config_list(source, git)
+
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    assert "extensions.objectformat=sha256" in _config_list(repo, git)
+    head = _git(repo, git, "rev-parse", "HEAD").stdout.decode().strip()
+    assert len(head) == 64  # a sha256 repository that still opens and answers
+    assert _git(repo, git, "status", "--porcelain").stdout == b""
+
+
+# ------------- M2c follow-up 5, advisor round: NESTED repositories
+#
+# The config allowlist rewrites exactly ONE file: the copy's own `.git/config`.
+# A nested repository has its own, and Eris never sees it - it may not even be
+# inside the snapshot. Measured 2026-08-24 on git 2.50.1 and reproduced below.
+
+
+def _external_repo_with_an_evil_config(tmp_path: Path, git: Path, marker: Path) -> tuple[Path, str]:
+    """A repository OUTSIDE the snapshot whose config executes something.
+    Returns its root and its HEAD sha."""
+    ext = tmp_path / "elsewhere" / "work"
+    _evil_script(ext / "tools" / "evil", marker)
+    (ext / "n.txt").write_text("n\n")
+    _git(ext, git, "init", "-q", "-b", "main", ".")
+    _git(ext, git, "add", "-A")
+    _git(ext, git, "commit", "-qm", "n1")
+    _git(ext, git, "config", "diff.external", str(ext / "tools" / "evil"))
+    _git(ext, git, "config", "core.fsmonitor", str(ext / "tools" / "evil"))
+    return ext, _git(ext, git, "rev-parse", "HEAD").stdout.decode().strip()
+
+
+def test_a_nested_repository_pointing_outside_the_snapshot_refuses_the_copy(
+    tmp_path: Path,
+) -> None:
+    """The advisor's lead finding, measured 2026-08-24 on git 2.50.1 and the
+    reason the copy is refused rather than patched.
+
+    An outer repository whose `sub/.git` is a FILE reading
+    `gitdir: <somewhere else>`, with that EXTERNAL config carrying
+    `diff.external`:
+
+    * `sub` NOT registered in the index -> nothing executes;
+    * `sub` registered as a GITLINK (`update-index --add --cacheinfo
+      160000,<sha>,sub`) -> `status --porcelain`, `diff HEAD` and
+      `status --porcelain=v2` ALL EXECUTE the external program.
+
+    No `.gitmodules` is involved and `GIT_MODULES` only covers top-level
+    `.git/modules`, so nothing in the config allowlist can help: the config
+    that executes belongs to a repository Eris never copies. `sanitize_snapshot`
+    therefore REFUSES, before any verification command exists to be run."""
+    git = _git_executable()
+    marker = tmp_path / "EXECUTED"
+    ext, nested_head = _external_repo_with_an_evil_config(tmp_path, git, marker)
+
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    (source / "sub").mkdir()
+    (source / "sub" / "keep.txt").write_text("k\n")
+    (source / "sub" / ".git").write_text(f"gitdir: {ext / '.git'}\n")
+    _git(source, git, "update-index", "--add", "--cacheinfo", f"160000,{nested_head},sub")
+
+    # the vector is REAL: in the untouched ORIGINAL every one of these executes
+    for argv in (
+        ["--no-optional-locks", "status", "--porcelain"],
+        ["--no-optional-locks", "diff", "HEAD"],
+        ["--no-optional-locks", "status", "--porcelain=v2"],
+    ):
+        marker.unlink(missing_ok=True)
+        _git(source, git, *argv, check=False)
+        assert marker.exists(), argv
+    marker.unlink(missing_ok=True)
+
+    # ... and the copy is refused, so no verification command is ever built
+    copy = tmp_path / "verify-copy"
+    with pytest.raises(SanitizeError, match=r"sub/\.git: a NESTED repository"):
+        sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+    assert not marker.exists()  # nothing ran during the refusal either
+    assert (source / "sub" / ".git").is_file()  # the ORIGINAL is untouched
+    assert (ext / ".git" / "config").read_text().count("diff") == 1
+
+
+def test_a_gitlink_with_no_checkout_refuses_the_verification_run(tmp_path: Path) -> None:
+    """The other half of the same scope rule, and the only half git can answer.
+
+    A superproject whose submodule is NOT checked out has a gitlink in the
+    index and NOTHING on disk for the copier to find - which is exactly what a
+    non-recursive clone produces, and `eris.snapshot` clones non-recursively.
+    Nothing can execute in that state, so this is a SCOPE refusal, not a
+    containment one; it is taken on the guard's baseline, from the `ls-files -s
+    -v -f` output the tripwire already spawns, with no extra command."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    # any real object name works; git does not require the submodule to exist
+    head = _git(source, git, "rev-parse", "HEAD").stdout.decode().strip()
+    _git(source, git, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    assert not (source / "sub").exists()  # registered, never checked out
+
+    # the copier has nothing to refuse: there is no nested `.git` on disk
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    policy = _policy(tmp_path, git)
+    with pytest.raises(NestedRepositoryRefused, match=r"sub: the index registers 1 submodule"):
+        SnapshotGuard.over(repo, probe=git_index_prober(policy, tmp_path / "verify-home"))
+
+
+def test_the_gitlink_scan_reads_the_mode_out_of_the_digest_output(tmp_path: Path) -> None:
+    """The gitlink signal is free: `-s` already prints the mode, so it comes
+    out of the SAME spawn the digest needs. This pins that the probe reports
+    both, and that an ordinary repository reports no gitlinks at all."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    policy = _policy(tmp_path, git)
+    probe = git_index_prober(policy, tmp_path / "verify-home")
+
+    plain = probe(source)
+    assert plain is not None and plain.gitlinks == () and len(plain.digest) == 64
+
+    head = _git(source, git, "rev-parse", "HEAD").stdout.decode().strip()
+    _git(source, git, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    linked = probe(source)
+    assert linked is not None and linked.gitlinks == ("sub",)
+    assert linked.digest != plain.digest  # the digest still moves, as before
+
+
+@pytest.mark.parametrize(
+    ("flags", "key"),
+    [
+        (["--ref-format=reftable"], "refstorage"),
+        (["--object-format=sha256"], None),  # supported: must NOT refuse
+    ],
+)
+def test_a_repository_extension_eris_cannot_vouch_for_refuses_the_copy(
+    tmp_path: Path, flags: list[str], key: str | None
+) -> None:
+    """M2c follow-up 5, advisor round, item 2. `extensions.*` declares how the
+    repository is STORED, so a copy that silently DROPS one is a repository git
+    opens and then misreads. Measured 2026-08-24 on git 2.50.1: `git init
+    --ref-format=reftable` really does write `extensions.refstorage = reftable`
+    with `repositoryformatversion = 1`, and there are no `refs/` files for a
+    copy without it to fall back on. A loud refusal naming the key is honest.
+
+    The sha256 row is the control: the one extension Eris DOES support must not
+    refuse."""
+    from eris.sanitize import UnsupportedRepositoryExtension
+
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    made = _git(source, git, "init", "-q", *flags, ".", check=False)
+    if made.returncode != 0:  # pragma: no cover - an older git
+        pytest.skip(f"this git cannot build {flags}: {made.stderr.decode()[:120]}")
+    (source / "f.txt").write_text("x\n")
+    _git(source, git, "add", "-A")
+    _git(source, git, "commit", "-qm", "c1")
+
+    copy = tmp_path / "verify-copy"
+    if key is None:
+        sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+        assert _git(copy, git, "status", "--porcelain").stdout == b""
+        return
+    assert f"extensions.{key}" in "\n".join(_config_list(source, git))
+    with pytest.raises(
+        UnsupportedRepositoryExtension, match=rf"extensions\.{key}: this repository"
+    ):
+        sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+
+def test_the_worktree_config_extension_is_dropped_not_refused(tmp_path: Path) -> None:
+    """The one `extensions.*` Eris drops instead of refusing: it enables
+    `.git/config.worktree`, which Eris deletes, so its absence changes nothing.
+    Refusing it would be a false refusal on any checkout where someone has run
+    `git config --worktree` - measured 2026-08-24: git accepts the key at
+    format version 0 and 1 alike."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    _git(source, git, "config", "core.repositoryformatversion", "1")
+    _git(source, git, "config", "extensions.worktreeConfig", "true")
+    (source / ".git" / "config.worktree").write_text("[diff]\n\texternal = tools/evil\n")
+
+    copy = tmp_path / "verify-copy"
+    sanitize_snapshot(source, copy, profile=VERIFICATION_PROFILE, worker_id="verify")
+
+    assert not (copy / ".git" / "config.worktree").exists()
+    assert "extensions.worktreeconfig" not in "\n".join(_config_list(copy, git)).lower()
+    assert _git(copy, git, "status", "--porcelain").stdout == b""  # still a working repo
+
+
+# ------------- M2c follow-up 5, advisor round, item 3: the parser, differentially
+
+
+def _bare_repo_with_config(root: Path, body: bytes) -> Path:
+    """The smallest thing git will read a `.git/config` out of."""
+    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (root / ".git" / "objects").mkdir()
+    (root / ".git" / "refs").mkdir()
+    (root / ".git" / "config").write_bytes(body)
+    return root
+
+
+@pytest.mark.parametrize(("body", "expected"), GRAMMAR_ROWS)
+def test_the_config_parser_agrees_with_git_on_every_grammar_row(
+    tmp_path: Path, body: bytes, expected: list[tuple[str, bytes | None]]
+) -> None:
+    """Item 3: the parser's correspondence with git, checked BY git, row by row.
+
+    `parse_git_config` is a port of git's `config.c`, and 0.3.9 asserted that
+    correspondence in a hand-written expectation table - which pins what I
+    believed git does, not what git does. Here every row of `GRAMMAR_ROWS` is
+    written into a real repository and read back with `git config --list -z`,
+    whose NUL-separated `key\nvalue` records are unambiguous where `--list`
+    is not (a value may contain a newline).
+
+    A disagreement here means Eris keeps or drops a key on a reading git does
+    not share - which is exactly how `[core][diff] external = x` would have
+    slipped a driver past a line-oriented filter."""
+    git = _git_executable()
+    repo = _bare_repo_with_config(tmp_path / "r", body)
+    result = _git(repo, git, "config", "--list", "-z", check=False)
+    assert result.returncode == 0, result.stderr  # every GRAMMAR row is valid to git
+
+    got_records = [r for r in result.stdout.split(b"\x00") if r]
+    want_records = [
+        name.encode() if value is None else name.encode() + b"\n" + value
+        for name, value in expected
+    ]
+    assert got_records == want_records, (got_records, want_records)
+
+    # ... and Eris's parser produces exactly the same entries
+    from eris.sanitize import parse_git_config
+
+    assert [(e.name, e.value) for e in parse_git_config(body)] == expected
+
+
+@pytest.mark.parametrize(("body", "reason"), UNPARSEABLE_ROWS)
+def test_eris_refuses_a_superset_of_what_git_refuses(
+    tmp_path: Path, body: bytes, reason: str
+) -> None:
+    """The other half of item 3, and the honest version of the claim. Eris
+    refuses every row of `UNPARSEABLE_ROWS`; git refuses SOME of them. This
+    test records which, by measurement, instead of asserting the two agree:
+
+    * where git also refuses, Eris costs nothing - the repository was already
+      unopenable;
+    * where git accepts, Eris is STRICTER, which costs a copy (a refusal an
+      operator sees) and never an escape.
+
+    Either way the direction is safe. What is not acceptable is the reverse -
+    Eris accepting something git refuses - and that cannot happen here,
+    because refusal is the only outcome for this table."""
+    from eris.sanitize import GitConfigParseError, parse_git_config
+
+    git = _git_executable()
+    repo = _bare_repo_with_config(tmp_path / "r", body)
+    git_refused = _git(repo, git, "config", "--list", check=False).returncode != 0
+
+    with pytest.raises(GitConfigParseError, match=reason):
+        parse_git_config(body)
+
+    # MEASURED 2026-08-24 (this assertion replaced a guess that this test
+    # itself disproved): git refuses every row here except one, so Eris is
+    # stricter in exactly one place and identical everywhere else.
+    git_accepts = {"a key outside any section"}
+    assert git_refused == (reason not in git_accepts), (reason, git_refused)
