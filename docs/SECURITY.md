@@ -376,7 +376,8 @@ The guard has two halves, because one cannot do the job.
 forced: `.git/index` is git's stat cache, and on a freshly copied tree the
 recorded stat data never matches, so a read-only command rewrites it. Measured
 2026-08-24 on git 2.50.1: with `--no-optional-locks` on every invocation,
-`status --porcelain`, `ls-files`, `ls-files --stage`, `log --oneline`,
+`status --porcelain`, `ls-files`, `ls-files --stage`, `ls-files -s -v` (the
+probe itself, re-measured 2026-08-24), `log --oneline`,
 `grep`, `blame`, `show` and `rev-parse` leave the file byte-identical, but the
 first command that reads the working tree against the index (`diff`,
 `diff HEAD`) refreshes it, flag or no flag. Hashing those bytes would trip the
@@ -388,20 +389,64 @@ command that rewrites history or config is still caught.
 index is not inert: `git ls-files` reads it directly and `git diff`/`git
 status` compare against it, so a command that mutates it changes what LATER
 evidence reports. The guard therefore also digests
-`git --no-optional-locks ls-files --stage` (mode, blob sha, stage, path for
-every entry) before and after each command. Measured on the same day: the
-digest is stable across every read-only command and across the stat refresh,
-and moves on `git add` and on `git rm --cached`. `git rm --cached` changes
-nothing else in the tree at all, so without this digest it is invisible. Either
-half moving is `snapshot.violated`; the event names which (`reason: "tree"` or
-`"git_index"`, the index winning when both moved, as it does for `git add`) and
-records both digests before and after.
+`git --no-optional-locks ls-files -s -v` (per entry: the status letter, then
+mode, blob sha, stage and path) before and after each command. Measured on the
+same day: the digest is stable across every read-only command, across the stat
+refresh and across an UNSTAGED working-tree edit, and moves on `git add` and on
+`git rm --cached`. `git rm --cached` changes nothing else in the tree at all, so
+without this digest it is invisible. Either half moving is `snapshot.violated`;
+the event names which (`reason: "tree"` or `"git_index"`, the index winning when
+both moved, as it does for `git add`) and records both digests before and after.
+
+`-v` (not `--stage` alone) because of the index FLAG BITS. `--skip-worktree`
+and `--assume-unchanged` change what `git status` and `git diff` report about a
+file without changing any staged content: measured 2026-08-24 on git 2.50.1,
+setting or clearing either one left the `ls-files --stage` digest
+byte-identical - a silent tripwire bypass. `-v` prepends the per-entry status
+letter (`H` cached, `S` skip-worktree, lowercase = assume-unchanged) in the
+same invocation, so no extra spawn buys the coverage.
+`test_verify_real_git.py::test_every_index_mutation_trips_the_guard`
+ENUMERATES the mechanisms rather than chasing them one at a time:
+`--skip-worktree`, `--no-skip-worktree`, `--assume-unchanged`,
+`--no-assume-unchanged`, `--cacheinfo`, `--chmod=+x`, `-N`/`--intent-to-add`,
+`git add` of a modified file and `git rm --cached` all trip the guard with
+`reason: "git_index"`, and a new mechanism is one line in that table.
 
 The digest runs on the POLICY-PINNED `git` with a FIXED Eris-internal argv. It
 is deliberately not routed through the model-facing allowlist: it is neither
-proposed nor influenced by a model, and `check_command` would refuse `--stage`
-anyway. The pin is still enforced by hand - an unpinned, missing or
-since-changed binary yields no digest.
+proposed nor influenced by a model, and `check_command` would refuse `-s`/`-v`
+(and `--stage`) anyway. The pin is still enforced by hand - an unpinned, missing
+or since-changed binary yields no digest.
+
+**What the digest does NOT cover.** Measured 2026-08-24 on git 2.50.1, each
+case checked rather than assumed
+(`test_verify_real_git.py::test_the_index_digest_does_not_cover_the_index_extensions`,
+`::test_the_split_index_is_caught_by_the_tree_hash_not_by_the_digest`):
+
+| index feature | tree hash | index digest |
+|---|---|---|
+| untracked cache (`UNTR`) | no | no |
+| fsmonitor (`FSMN`) | no | no |
+| cache-tree (`TREE`) | only the tree OBJECT `write-tree` writes | no |
+| resolve-undo (`REUC`) | no | no |
+| split index (`--split-index`) | YES - the new `.git/sharedindex.<sha>` file | no |
+
+The four EXTENSIONS live inside `.git/index`, which the byte hash excludes, and
+`ls-files` prints no trace of them at any verbosity - so **nothing in Eris
+catches them**. That is a stated gap, not an implied completeness: they are
+caches and undo data, and none of them changes what a later `git status`, `git
+diff` or `git ls-files` reports, which is the property the tripwire exists to
+protect. If that ever stops being true for one of them, it needs a check of its
+own. (The cache-tree case looks caught and is not: the guard trips there only
+because `write-tree` also writes a new object under `.git/objects`.)
+
+The split index is different, and the answer is measured, not assumed:
+`git update-index --split-index` writes a NEW file, `.git/sharedindex.<sha>`,
+which is not in `GUARD_EXCLUDED_RELPATHS`, so the tree hash DOES catch enabling
+it (`reason: "tree"`). The digest is blind to the split itself - `ls-files -s
+-v` prints the same entries either way - but it keeps working over a split
+index: a `--skip-worktree` applied afterwards still moves it. `--no-split-index`
+leaves the shared file behind, so the tree stays changed.
 
 If the copy has a `.git` directory and no digest can be taken (git unavailable,
 unpinned, non-zero exit, timeout, truncated output - including a probe that

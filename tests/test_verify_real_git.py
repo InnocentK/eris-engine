@@ -21,10 +21,18 @@ It also pins the M2c follow-up: the tripwire excludes ``.git/index`` BY BYTES
 (measured here on 2026-08-24: on a fresh copy the first command that reads the
 working tree - ``git diff``/``git diff HEAD`` - rewrites it, with or without
 ``--no-optional-locks``), and covers it SEMANTICALLY with a digest of
-``git ls-files --stage``. Only a real ``git`` can show that the digest is blind
+``git ls-files -s -v``. Only a real ``git`` can show that the digest is blind
 to the stat refresh and sensitive to ``git add`` / ``git rm --cached`` - the
 second of which changes NOTHING else in the tree, so without the semantic
 digest it is invisible.
+
+Follow-up 2 adds the two halves that stop the whack-a-mole:
+``test_every_index_mutation_trips_the_guard`` ENUMERATES every index-mutating
+mechanism (a new one is one line in ``INDEX_MUTATIONS``) - it is what caught
+``--stage`` being blind to ``--skip-worktree``/``--assume-unchanged`` - and
+``test_the_index_digest_does_not_cover_the_index_extensions`` /
+``test_the_split_index_is_caught_by_the_tree_hash_not_by_the_digest`` pin, by
+measurement, what the digest does NOT cover.
 """
 
 from __future__ import annotations
@@ -130,7 +138,9 @@ def _verify_env(policy: Policy, repo: Path, scratch_home: Path) -> VerifyEnv:
     )
 
 
-def _git(repo: Path, git: Path, *args: str) -> None:
+def _git(
+    repo: Path, git: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
     """A raw git, NOT through the allowlist: it stands in for a verification
     command that mutates the index (which the allowlist cannot reach today -
     the guard is defence in depth for the day it is wrong or widened)."""
@@ -140,8 +150,12 @@ def _git(repo: Path, git: Path, *args: str) -> None:
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_AUTHOR_NAME": "Eris Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Eris Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
     }
-    subprocess.run([str(git), *args], cwd=repo, env=env, check=True, capture_output=True)
+    return subprocess.run([str(git), *args], cwd=repo, env=env, check=check, capture_output=True)
 
 
 def test_the_default_battery_runs_clean_against_a_real_git_repository(tmp_path: Path) -> None:
@@ -272,3 +286,239 @@ def test_a_real_staging_change_trips_the_guard_with_reason_git_index(
     assert env.violated is True  # verification is stopped for the run
     with pytest.raises(PermissionError, match="verification is stopped"):
         env.run(["git", "ls-files"])
+
+
+# --------------------------------------------------------------------- enumeration
+
+# An empty blob: `update-index --cacheinfo` stages it without touching the
+# working tree at all.
+EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+#: Every index-mutating mechanism reachable through `git update-index` and
+#: friends: ``(files written before the baseline, setup argv, mutating argv)``.
+#: A new mechanism is ONE line here.
+INDEX_MUTATIONS: list[Any] = [
+    pytest.param({}, (), ("update-index", "--skip-worktree", "calc.py"), id="skip-worktree"),
+    pytest.param(
+        {},
+        ("update-index", "--skip-worktree", "calc.py"),
+        ("update-index", "--no-skip-worktree", "calc.py"),
+        id="no-skip-worktree",
+    ),
+    pytest.param({}, (), ("update-index", "--assume-unchanged", "calc.py"), id="assume-unchanged"),
+    pytest.param(
+        {},
+        ("update-index", "--assume-unchanged", "calc.py"),
+        ("update-index", "--no-assume-unchanged", "calc.py"),
+        id="no-assume-unchanged",
+    ),
+    pytest.param(
+        {},
+        (),
+        ("update-index", "--add", "--cacheinfo", f"100644,{EMPTY_BLOB},ghost.txt"),
+        id="cacheinfo",
+    ),
+    pytest.param({}, (), ("update-index", "--chmod=+x", "calc.py"), id="chmod"),
+    pytest.param({"NEW.txt": "new\n"}, (), ("add", "-N", "NEW.txt"), id="intent-to-add"),
+    pytest.param(
+        {"calc.py": "def add(a: int, b: int) -> int:\n    return a + b  # edited\n"},
+        (),
+        ("add", "calc.py"),
+        id="add-a-modified-file",
+    ),
+    pytest.param({}, (), ("rm", "--cached", "-q", "README.md"), id="rm-cached"),
+]
+
+
+@pytest.mark.parametrize(("files", "setup", "mutation"), INDEX_MUTATIONS)
+def test_every_index_mutation_trips_the_guard(
+    tmp_path: Path, files: dict[str, str], setup: tuple[str, ...], mutation: tuple[str, ...]
+) -> None:
+    """M2c follow-up 2, the ENUMERATION that stops the whack-a-mole: every
+    index-mutating mechanism reachable through `git update-index` and friends
+    must be `snapshot.violated` with ``reason: "git_index"``.
+
+    The flag cases are why :data:`GIT_INDEX_DIGEST_ARGS` is `ls-files -s -v`
+    and no longer `ls-files --stage`: `--skip-worktree` and
+    `--assume-unchanged` change what `git status`/`git diff` report about a
+    file WITHOUT changing any staged content, so the `--stage` digest stayed
+    byte-identical and the tripwire said nothing (measured 2026-08-24, git
+    2.50.1). `-v` prints the per-entry status letter (`H` cached, `S`
+    skip-worktree, lowercase = assume-unchanged) in the SAME invocation - no
+    extra spawn - so the flag bits are in the digest. Reverting to `--stage`
+    makes the four flag cases here FAIL."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    # anything the mutation needs must exist BEFORE the baseline, so the guard
+    # reacts to the INDEX mutation and not to the file that set it up
+    for name, content in files.items():
+        (repo / name).write_text(content)
+    if setup:
+        _git(repo, git, *setup)
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    before = env.guard.index_digest
+    assert env.run(["git", "status", "--porcelain"]).violated is False  # quiet beforehand
+
+    _git(repo, git, *mutation)
+
+    outcome = env.run(["git", "status", "--porcelain"])
+    assert outcome.violated is True, mutation
+    assert outcome.violation_reason == "git_index", mutation
+    assert outcome.index_digest_after != before
+    assert env.violated is True  # verification is stopped for the run
+    with pytest.raises(PermissionError, match="verification is stopped"):
+        env.run(["git", "ls-files"])
+
+
+# --------------------------------------------------------- what it does NOT cover
+
+
+def _files(root: Path) -> dict[str, str]:
+    """relpath -> sha256 for every file EXCEPT `.git/index` itself."""
+    out = {}
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        if p.is_file() and not p.is_symlink() and rel != ".git/index":
+            out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+def _noop(repo: Path, git: Path) -> None:
+    pass
+
+
+def _invalidate_cache_tree(repo: Path, git: Path) -> None:
+    (repo / "new.txt").write_text("new\n")
+    _git(repo, git, "update-index", "--add", "new.txt")
+
+
+def _resolved_merge(repo: Path, git: Path) -> None:
+    """Leaves a resolve-undo (REUC) section in the index."""
+    _git(repo, git, "checkout", "-q", "-b", "other")
+    (repo / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return b + a\n")
+    _git(repo, git, "commit", "-qam", "other")
+    _git(repo, git, "checkout", "-q", "main")
+    (repo / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b + 0\n")
+    _git(repo, git, "commit", "-qam", "main2")
+    _git(repo, git, "merge", "other", check=False)  # conflict
+    (repo / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b\n")
+    _git(repo, git, "add", "calc.py")  # resolving writes REUC
+    _git(repo, git, "commit", "-qm", "merged")
+
+
+@pytest.mark.parametrize(
+    ("setup", "mutation", "marker", "present", "reason"),
+    [
+        pytest.param(
+            _noop,
+            ("update-index", "--untracked-cache"),
+            b"UNTR",
+            (False, True),
+            None,
+            id="untracked-cache",
+        ),
+        pytest.param(
+            _noop, ("update-index", "--fsmonitor"), b"FSMN", (False, True), None, id="fsmonitor"
+        ),
+        pytest.param(
+            _invalidate_cache_tree, ("write-tree",), b"TREE", (True, True), "tree", id="cache-tree"
+        ),
+        pytest.param(
+            _resolved_merge, ("read-tree", "HEAD"), b"REUC", (True, False), None, id="resolve-undo"
+        ),
+    ],
+)
+def test_the_index_digest_does_not_cover_the_index_extensions(
+    tmp_path: Path,
+    setup: Any,
+    mutation: tuple[str, ...],
+    marker: bytes,
+    present: tuple[bool, bool],
+    reason: str | None,
+) -> None:
+    """M2c follow-up 2, the honest half: the index EXTENSIONS are NOT covered.
+
+    `.git/index` carries optional sections beside the cache entries - untracked
+    cache (`UNTR`), fsmonitor (`FSMN`), cache-tree (`TREE`), resolve-undo
+    (`REUC`). They live in the bytes the tree hash excludes, and `ls-files`
+    prints no trace of them at any verbosity, so NEITHER half of the guard sees
+    them move. Measured here, 2026-08-24, git 2.50.1: the index bytes change,
+    the digest does not.
+
+    The cache-tree case is the one apparent exception, and it is not one: the
+    guard trips with ``reason: "tree"`` because `write-tree` also writes a new
+    tree OBJECT under `.git/objects`. The cached tree itself stays invisible.
+
+    None of these four changes what a later `git status`/`git diff`/`git
+    ls-files` REPORTS - they are caches and undo data - which is why this is
+    documented rather than fixed. If that ever stops being true for one of
+    them, it needs a digest of its own."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    setup(repo, git)
+
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    index_before = (repo / ".git" / "index").read_bytes()
+    files_before = _files(repo)
+
+    _git(repo, git, *mutation)
+
+    index_after = (repo / ".git" / "index").read_bytes()
+    assert index_after != index_before, mutation  # the extension really moved
+    # the section this case is about is really the one that appeared/vanished
+    assert ((marker in index_before), (marker in index_after)) == present, marker
+    change = env.guard.changed()
+    assert (change.reason if change is not None else None) == reason
+    # whatever the tree hash saw, it was never the extension: the digest is flat
+    assert env.guard.probe is not None
+    assert env.guard.probe(repo) == env.guard.index_digest
+    changed_paths = {rel for rel, sha in _files(repo).items() if files_before.get(rel) != sha} | (
+        files_before.keys() - _files(repo).keys()
+    )
+    assert all(p.startswith(".git/objects/") for p in changed_paths), changed_paths
+
+
+def test_the_split_index_is_caught_by_the_tree_hash_not_by_the_digest(tmp_path: Path) -> None:
+    """M2c follow-up 2: `git update-index --split-index` moves the cache
+    entries out into `.git/sharedindex.<sha>` and leaves a delta in
+    `.git/index`. Measured 2026-08-24: that shared file is a NEW file in the
+    copy, it is not in `GUARD_EXCLUDED_RELPATHS`, and the tree hash therefore
+    catches enabling it (``reason: "tree"``). The digest is blind to the split
+    - `ls-files -s -v` prints the same entries either way - but it keeps
+    working afterwards: with the split enabled, a `--skip-worktree` still moves
+    the digest."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    digest_before = env.guard.index_digest
+    assert not list((repo / ".git").glob("sharedindex.*"))
+
+    _git(repo, git, "update-index", "--split-index")
+
+    shared = [p.name for p in (repo / ".git").glob("sharedindex.*")]
+    assert len(shared) == 1 and shared[0].startswith("sharedindex.")
+    change = env.guard.changed()
+    assert change is not None and change.reason == "tree"  # the NEW file is hashed
+    assert change.index_digest_after == digest_before  # ... and the digest did not move
+
+    # the semantic half still works against a split index
+    env.guard.baseline = change.tree_after
+    _git(repo, git, "update-index", "--skip-worktree", "calc.py")
+    after = env.guard.changed()
+    assert after is not None and after.reason == "git_index"
