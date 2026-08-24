@@ -1178,6 +1178,21 @@ def _finalize_after_post_scan_failure(
         )
 
 
+def _safe_text(value: object, fallback: str) -> str:
+    """``str(value)`` that cannot raise.
+
+    Every caller is a handler already dealing with a failure, so formatting the
+    thing it is reporting must not become the reported outcome. A pathological
+    ``__str__`` (or a ``Path`` subclass, or an exception carrying an object
+    whose repr explodes) is answered with ``fallback`` instead of replacing the
+    reason - the same rule as :func:`_print_scratch_cleanup_failure`, applied
+    one step earlier, where the arguments are built."""
+    try:
+        return str(value)
+    except BaseException:  # noqa: BLE001 - see the docstring: the reason outranks it
+        return fallback
+
+
 def _remove_scratch(scratch: Path) -> str | None:
     """Remove the run's scratch root. Returns the failure text, never raises -
     so EVERY caller must do something with the return value: worker-visible
@@ -1188,7 +1203,10 @@ def _remove_scratch(scratch: Path) -> str | None:
         elif scratch.exists():
             shutil.rmtree(scratch)
     except OSError as exc:
-        return f"{scratch}: {exc}"
+        # formatted defensively: this function's contract is that it NEVER
+        # raises, and its callers rely on the return value being the only
+        # signal (a dropped return is a silent leak)
+        return f"{_safe_text(scratch, '<scratch>')}: {_safe_text(exc, '<unprintable error>')}"
     return None
 
 
@@ -1237,7 +1255,9 @@ def _scratch_root(scratch: Path, err: IO[str]) -> Iterator[Path]:
         try:
             shutil.rmtree(scratch, ignore_errors=False)
         except BaseException as cleanup:  # noqa: BLE001 - the reason outranks it
-            _print_scratch_cleanup_failure(err, scratch.name, scratch, str(cleanup))
+            _print_scratch_cleanup_failure(
+                err, scratch.name, scratch, _safe_text(cleanup, "<unprintable error>")
+            )
         raise  # the original reason, never the cleanup's
     shutil.rmtree(scratch, ignore_errors=False)
 

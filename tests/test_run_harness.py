@@ -1641,3 +1641,50 @@ def test_the_reporter_itself_never_raises(tmp_path: Path) -> None:
         tmp_path / "scratch" / "r3",
         "EBUSY",
     )
+
+
+class _Unprintable(OSError):
+    """An exception whose ``__str__`` raises, as a C-extension error can."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("this exception cannot be printed")
+
+
+def test_an_unprintable_cleanup_error_never_replaces_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Formatting the cleanup failure happens where the arguments are built,
+    OUTSIDE the reporter's own guard - so a pathological ``__str__`` there
+    would replace the reason just as surely as an unguarded write."""
+    import eval.run as run_module
+
+    scratch = tmp_path / "scratch" / "r4"
+    scratch.parent.mkdir(parents=True)
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise _Unprintable("never seen")
+
+    monkeypatch.setattr(run_module.shutil, "rmtree", boom)
+    err = io.StringIO()
+    with pytest.raises(RuntimeError, match="the real reason"):
+        with run_module._scratch_root(scratch, err):
+            raise RuntimeError("the real reason")
+    line = json.loads(err.getvalue().strip())
+    assert line["error"] == "<unprintable error>"
+
+
+def test_remove_scratch_never_raises_on_an_unprintable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_remove_scratch` documents that it never raises; its own error
+    formatting must therefore be defensive too."""
+    import eval.run as run_module
+
+    scratch = tmp_path / "scratch" / "r5"
+    scratch.mkdir(parents=True)
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise _Unprintable("never seen")
+
+    monkeypatch.setattr(run_module.shutil, "rmtree", boom)
+    assert run_module._remove_scratch(scratch) == f"{scratch}: <unprintable error>"
