@@ -130,7 +130,7 @@ verify:
       executable: /opt/homebrew/bin/ruff
       executable_sha256: UNPINNED
       subcommands: [check]
-      literal_flags: ["--no-fix", "--quiet", "--isolated", "--no-cache", "--output-format=concise", "--output-format=json"]
+      literal_flags: ["--no-fix", "--quiet", "--no-cache", "--output-format=concise", "--output-format=json"]
       value_flags:
         "--select": "^[A-Z0-9,]{1,64}$"
       positional: ["path"]

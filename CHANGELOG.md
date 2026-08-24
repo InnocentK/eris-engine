@@ -157,6 +157,39 @@ Fixed (final round) - `.GIT` evaded the nested-repo walk
 * On a case-SENSITIVE filesystem `.GIT` is a distinct directory git never
   reads, so folding costs a refused copy there and never an escape.
 
+Fixed (final round) - a repository config is not only a git problem
+* Measured 2026-08-24 against the other two allowlisted tools, and both were
+  already true before any of the M2c config work - nothing in it introduced
+  these, and nothing in it would have caught them either:
+
+  | tool | what a repository config did | Eris's flag |
+  |---|---|---|
+  | `mypy` | `mypy.ini` with `plugins = ./evil_plugin.py` **EXECUTED the plugin** - arbitrary code execution, the same class as `[diff] external` | `--config-file <os.devnull>` |
+  | `ruff` | `ruff.toml` with `[lint] select = []` made `ruff check` report "All checks passed!" on a file with an unused import - **evidence manipulation**, not execution | `--isolated` |
+
+* Eris appends these itself (`verify.ERIS_ISOLATION_FLAGS`) on exactly the
+  contract `--no-optional-locks` already had: FIRST in argv, before any
+  subcommand or positional. Every one of them is also HARD-DENIED to a model,
+  so a proposal can neither double the flag nor point it somewhere else, and a
+  test asserts the two halves cannot drift apart. `--isolated` was removed from
+  the default policy's ruff `literal_flags`, since Eris now supplies it.
+* The ruff case is not execution, but for an engine whose one job is deciding
+  whether an answer is defensible *given the evidence*, a repository that gets
+  to choose which findings exist is its own kind of serious.
+* `os.devnull` rather than a literal `/dev/null`: Windows spells it `nul`, and
+  whether mypy accepts `--config-file nul` there is UNKNOWN and untested. mypy
+  also prints `<devnull>: No [mypy] section in config file` on stderr, which
+  lands in the recorded evidence; that noise is accepted for the isolation.
+* **`pytest` gets no isolation flag because none exists**, and that is now
+  stated in `docs/SECURITY.md` rather than implied: `conftest.py` IS repository
+  code that pytest imports and executes by design, which is exactly why pytest
+  carries `requires_trusted`.
+* The end-to-end tests live in a new `tests/test_verify_isolation.py`. It needs
+  no addition to the hermeticity allow-list: every command runs as
+  `sys.executable -m <tool>`, and the argv is the one `check_command` actually
+  produced with only argv[0] swapped, so what is proved is the flag Eris really
+  emits.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c

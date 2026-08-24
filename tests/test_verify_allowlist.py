@@ -83,7 +83,7 @@ def world(tmp_path: Path) -> tuple[Policy, Path]:
             "executable": str(ruff),
             "executable_sha256": ruff_sha,
             "subcommands": ["check"],
-            "literal_flags": ["--no-fix", "--isolated", "--output-format=json"],
+            "literal_flags": ["--no-fix", "--output-format=json"],
             "value_flags": {"--select": "^[A-Z0-9,]{1,64}$"},
             "positional": ["path"],
         },
@@ -498,3 +498,100 @@ def test_git_subcommand_help_fixtures_are_full_captures() -> None:
         text = (HELP_DIR / fname).read_text()
         assert len(text) > 10_000, f"{fname} looks truncated ({len(text)} bytes)"
         assert f"git-{sub}" in text or f"git {sub}" in text
+
+
+# ------- M2c follow-up 5, final round: Eris supplies each tool's isolation flag
+
+
+def isolation_world(tmp_path: Path) -> tuple[Policy, Path]:
+    """git, mypy and ruff together: the three tools Eris hands its own
+    isolation flag to."""
+    snapshot = tmp_path / "snap"
+    (snapshot / "src").mkdir(parents=True)
+    (snapshot / "src" / "a.py").write_text("x = 1\n")
+    exes = {n: fake_exe(tmp_path, n) for n in ("git", "mypy", "ruff")}
+    policy = policy_with(
+        tmp_path,
+        git={
+            "executable": str(exes["git"][0]),
+            "executable_sha256": exes["git"][1],
+            "subcommands": ["status", "log"],
+            "literal_flags": ["--porcelain"],
+            "positional": ["path"],
+        },
+        mypy={
+            "executable": str(exes["mypy"][0]),
+            "executable_sha256": exes["mypy"][1],
+            "literal_flags": ["--strict"],
+            "positional": ["path"],
+        },
+        ruff={
+            "executable": str(exes["ruff"][0]),
+            "executable_sha256": exes["ruff"][1],
+            "subcommands": ["check"],
+            "literal_flags": ["--no-fix"],
+            "positional": ["path"],
+        },
+    )
+    return policy, snapshot
+
+
+def test_eris_appends_each_tools_isolation_flag_before_everything_else(tmp_path: Path) -> None:
+    """M2c follow-up 5, final round, item 2. A repository config is not only a
+    git problem. Measured 2026-08-24 on this machine, against the ALLOWLISTED
+    tools:
+
+    * a repository `mypy.ini` with `plugins = ./evil_plugin.py` EXECUTED the
+      plugin - arbitrary code execution, the same class as `[diff] external`,
+      and PRE-EXISTING rather than introduced by this milestone;
+    * a repository `ruff.toml` with `[lint] select = []` made `ruff check`
+      report "All checks passed!" on a file with an unused import - evidence
+      manipulation rather than execution, which for an engine that decides
+      whether an answer is defensible is its own kind of serious.
+
+    Eris therefore supplies `--config-file <devnull>` and `--isolated` itself,
+    on exactly the contract `--no-optional-locks` already had: FIRST in argv,
+    before any subcommand or positional, and hard-denied to a model."""
+    policy, snapshot = isolation_world(tmp_path)
+    for argv, expected in (
+        (["git", "status", "--porcelain"], ["--no-optional-locks", "status", "--porcelain"]),
+        (["mypy", "--strict", "src"], ["--config-file", os.devnull, "--strict", "src"]),
+        (["ruff", "check", "--no-fix", "src"], ["--isolated", "check", "--no-fix", "src"]),
+    ):
+        decision = check_command(argv, policy=policy, snapshot_root=snapshot)
+        assert decision.allowed, (argv, decision.reason)
+        assert list(decision.argv[1:]) == expected, argv
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["mypy", "--config-file", "mypy.ini", "src"],
+        ["mypy", "--config-file=mypy.ini", "src"],
+        ["ruff", "check", "--isolated", "src"],
+        ["git", "log", "--no-optional-locks"],  # after the subcommand: the deny list fires
+    ],
+)
+def test_a_model_may_not_supply_an_isolation_flag(tmp_path: Path, argv: list[str]) -> None:
+    """Eris supplies them, a proposal may not - the same rule that has always
+    applied to `--no-optional-locks`. A model-supplied `--config-file` would
+    point mypy back at the repository's config, which is the whole vector."""
+    policy, snapshot = isolation_world(tmp_path)
+    decision = check_command(argv, policy=policy, snapshot_root=snapshot)
+    assert not decision.allowed and "hard-denied" in decision.reason
+
+
+def test_every_isolation_flag_is_also_hard_denied() -> None:
+    """The two halves cannot drift apart: anything Eris appends must be
+    refused when a model supplies it, or the model could double it or point it
+    somewhere else."""
+    from eris.verify import ERIS_ISOLATION_FLAGS, HARD_DENY
+
+    for name, flags in ERIS_ISOLATION_FLAGS.items():
+        for flag in flags:
+            if flag.startswith("-"):
+                assert flag in HARD_DENY.get(name, frozenset()), (name, flag)
+    assert set(ERIS_ISOLATION_FLAGS) == {"git", "mypy", "ruff"}
+    # pytest is deliberately absent: `conftest.py` IS repository code and no
+    # flag isolates it, which is why pytest requires a trusted policy
+    assert "pytest" not in ERIS_ISOLATION_FLAGS
