@@ -281,10 +281,12 @@ name at any depth, case-insensitively, whatever the entry is (a file, a
 directory, or a symlink named `AGENTS.md`). Files get new inodes (never
 hardlinks); symlinks are kept only when relative, resolving inside the tree
 and not into a stripped entry (every other link is dropped and recorded);
-`.git` is copied without `hooks` and with `core.fsmonitor`/`core.untrackedCache`
-neutralised in the COPY's `.git/config` (see the verification-copy section), a
-control that fails CLOSED (a non-regular config is replaced or refused, never
-skipped).
+`.git` is copied without `hooks`, with the COPY's `.git/config` REWRITTEN FROM
+AN ALLOWLIST, with `objects/info/alternates` / `objects/info/http-alternates` /
+`config.worktree` deleted, and with a copy that is not one self-contained
+repository refused (see the verification-copy section) - a control that fails
+CLOSED (a non-regular config is replaced or refused, never skipped; an
+unparseable config refuses the copy).
 `SnapshotSanitization` records the
 profile hash, the original's tree hash, the copy's tree hash, every stripped
 file (relpath, size, sha256) and every dropped link.
@@ -358,38 +360,127 @@ to construct (documented; M2c adds a portable fallback).
 A trusted `pytest` executes repository code and could modify it. Every
 verification command therefore runs in a fresh copy of the original
 (`sanitize.VERIFICATION_PROFILE`) under the run's scratch root - never in
-the original and never in a sanitized copy. That profile strips NOTHING
-(verification must see the repository as it is, instruction files included)
-and differs from a raw `cp -a` in exactly three documented ways: `.git/hooks`
-is not copied (our allowlist runs `git`, so a repository hook would fire on
-the first invocation); the COPY's `.git/config` has `core.fsmonitor` and
-`core.untrackedCache` removed and explicitly set to `false`; and a symlink
-that is absolute, dangling or resolves outside the tree is dropped and
-recorded
-An in-copy `.git/config` symlink is REPLACED by the neutralised regular file
-and recorded there too, and any other non-regular shape at a `.git` path Eris
-depends on refuses the copy (`assert_git_layout_sane`). File set, bytes, FILE AND DIRECTORY modes (the copy root
-included), kept symlink targets and the rest of `.git`
-are identical; a preserved read-only directory cannot wedge cleanup
-(owner write is restored on retry). `evidence.SnapshotGuard` compares the
-copy after every command: a change is recorded (`snapshot.violated`,
-`EvidenceItem.violated`, the item's summary) and verification stops for the
-run; the original's tree hash is recorded in `run.started` and asserted
-unchanged at the end (`run.error snapshot_modified`). pytest always carries
-`-p no:cacheprovider`.
+the original and never in a sanitized copy. That profile strips NOTHING from
+the WORKING TREE (verification must see the repository as it is, instruction
+files included). Every deviation from a raw `cp -a` is inside `.git`, and there
+are four of them, because git treats parts of `.git` as executable
+configuration:
 
-**The copy's filesystem-monitor settings are neutralised** (M2c follow-up 3,
-`sanitize.neutralise_git_config`). A snapshot taken from a repository that
-configures `core.fsmonitor` inherits it verbatim, and dropping `.git/hooks` does
-not disable it: the value may name any path in the repository. The copy's
-`.git/config` therefore has `core.fsmonitor` and `core.untrackedCache` (same
-class of inherited cache) removed and explicitly set to `false` - the removal
-handles case, bare keys and backslash-continued values, and the appended
-`[core]` block, being last, also covers a value pulled in by an `include`. **The
-ORIGINAL is never opened for writing**; the edit happens while the copy is being
-built, so it is in place before the guard takes its baseline and before any
-verification command runs. It matters in both directions, and both are
-measured (2026-08-24, git 2.50.1,
+1. `.git/hooks` is not copied (our allowlist runs `git`, so a repository hook
+   would fire on the first invocation).
+2. **The copy's `.git/config` is NOT the original's file.** It is rewritten
+   from an ALLOWLIST (`sanitize.rewrite_git_config`) - see below.
+3. `.git/objects/info/alternates`, `.git/objects/info/http-alternates` and
+   `.git/config.worktree` are deleted, and a copy that is not ONE
+   self-contained repository is REFUSED (`.git` as a gitlink FILE,
+   `.git/commondir`, `.git/worktrees/`, `.git/modules/`).
+4. A symlink that is absolute, dangling or resolves outside the tree is
+   dropped and recorded; an in-copy `.git/config` symlink is REPLACED by the
+   rewritten regular file and recorded there too, and any other non-regular
+   shape at a `.git` path Eris depends on refuses the copy
+   (`assert_git_layout_sane`).
+
+Otherwise the file set, bytes, FILE AND DIRECTORY modes (the copy root
+included), kept symlink targets and the rest of `.git` are identical; a
+preserved read-only directory cannot wedge cleanup (owner write is restored on
+retry). `evidence.SnapshotGuard` compares the copy after every command: a
+change is recorded (`snapshot.violated`, `EvidenceItem.violated`, the item's
+summary) and verification stops for the run; the original's tree hash is
+recorded in `run.started` and asserted unchanged at the end (`run.error
+snapshot_modified`). pytest always carries `-p no:cacheprovider`.
+
+#### The copy's `.git/config` is an ALLOWLIST, not the repository's config
+
+M2c follow-up 5, the SIXTH consecutive stop-time finding against this control
+and the first that is arbitrary code execution rather than an observation gap.
+The previous model neutralised the keys we knew about (`core.fsmonitor`,
+`core.untrackedCache`) and left the rest of the repository's config in place.
+Measured on this machine, git 2.50.1, 2026-08-24, against the ALLOWLISTED
+verification command `git --no-optional-locks diff HEAD`:
+
+| vector | observed before the fix |
+|---|---|
+| `[diff] external = <path>` in the copy's `.git/config` | the named program **EXECUTED** |
+| `[diff "evil"] textconv = <path>` + `f.txt diff=evil` in a tracked `.gitattributes` | **EXECUTED** (twice - once per side) |
+| `.git/objects/info/alternates` -> another object store, in a properly history-truncated snapshot | a commit `eris.snapshot` removed went from `cat-file -e` FAILING to SUCCEEDING; its blob read out in full |
+
+So a repository-controlled config defeated the verification allowlist entirely.
+The executable pin, the subcommand lists, the per-tool hard-deny (`--ext-diff`,
+`--textconv`) and the "no model may pass `-c`" rule are all irrelevant here:
+the repository chose the program, not the model.
+
+**What survives in the copy** (`GIT_CONFIG_ALLOWED_CORE_KEYS`,
+`GIT_CONFIG_ALLOWED_SECTIONS`): `core.repositoryformatversion`,
+`core.filemode`, `core.bare`, `core.symlinks`, `core.ignorecase`,
+`core.precomposeunicode`, `core.logallrefupdates`, and the whole `extensions`
+section. That is the repository FORMAT and the filesystem capability flags -
+`git init` writes them from what the filesystem supports, and a sha256
+repository does not open at all without `extensions.objectformat`. None of them
+names a command or a path git will act on.
+
+**What is dropped**: everything else. Every `diff.*`, `filter.*`, `merge.*`,
+`gpg.*`, `credential.*`, `url.*`, `http.*`, `uploadpack.*`, `include.*`,
+`includeIf.*`, `alias.*`, `remote.*`, `branch.*`, `user.*`, and every
+path-or-command `core.*` (`worktree`, `hooksPath`, `fsmonitor`,
+`untrackedCache`, `pager`, `editor`, `sshCommand`, `askPass`,
+`alternateRefsCommand`, `sharedRepository`, ...). A subsectioned `[core "x"]`
+or `[extensions "x"]` entry is dropped too: neither is a key git acts on.
+`core.fsmonitor` and `core.untrackedCache` are therefore no longer set to
+`false`; they are simply not in the file, which is strictly stronger. With no
+driver DEFINED, a `.gitattributes` in the tree naming `diff=evil` or
+`filter=x` is INERT - verified end to end, not assumed
+(`test_verify_real_git.py::test_a_repository_textconv_driver_cannot_execute_in_the_verification_copy`).
+
+**The rewrite is a re-serialisation, not a filter.** Every previous version of
+this control scanned LINES, and git's config grammar is not line-oriented:
+measured on 2026-08-24, `[core] filemode = true` and `[core]filemode=true` are
+both a section header AND a variable on one line, `[core][diff] external = x`
+puts the variable in `diff`, values continue across lines with a trailing
+backslash, `\r\n` collapses to `\n`, a UTF-8 BOM is skipped, and `#`/`;`
+outside quotes starts a comment mid-value. `sanitize.parse_git_config` is a
+port of git's `config.c` (`git_parse_source` / `get_base_var` /
+`get_extended_base_var` / `get_value` / `parse_value`); the output is generated
+from the parsed `(section, key, value)` triples with every value re-quoted, so
+a line git would read differently from the way Eris read it cannot survive into
+the copy. A config Eris cannot parse REFUSES the copy - git refuses to open
+such a repository too (`fatal: bad config line`), so that costs no working
+repository. The parse is checked against git itself, not against Eris's own
+reading: `test_verify_real_git.py::test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports`
+asserts that `git config --list` in the copy equals the allowlisted subset of
+`git config --list` in the original.
+
+**The ORIGINAL is never opened for writing.** The rewrite happens while the
+copy is being built - before the guard takes its baseline and before any
+verification command runs - and every path it touches is under the copy root.
+
+**False refusals are the failure mode that matters.** A guard that rejects
+ordinary repositories gets deleted by the next person, so an ordinary checkout
+(two remotes, a user, aliases, tracking config, several branches) is pinned to
+sanitize without refusing and to run the WHOLE default battery clean
+(`::test_an_ordinary_repository_still_runs_the_whole_battery_after_the_rewrite`).
+
+**The config control cannot be aliased away** (M2c follow-up 4). `.git/config`
+that was not a regular file used to be skipped SILENTLY: a symlinked config
+bypassed every rule above, because git follows the link and reads its target
+while Eris `lstat`ed and gave up. It fails CLOSED. A link resolving INSIDE the
+copy to a regular file is read, unlinked and REPLACED by a regular file holding
+the rewritten bytes - the target is never written through: containment is
+decided on the REALPATH, the read carries `O_NOFOLLOW|O_NONBLOCK` (a link to a
+fifo fails the type check instead of blocking the run), the link is re-`lstat`ed
+and must still be the same dev+inode immediately before the `unlink`, and the
+replacement is created `O_CREAT|O_EXCL|O_NOFOLLOW`, so no pre-existing path
+anywhere is ever opened for writing. The replacement is recorded in
+`dropped_symlinks`. Every other shape - a link escaping the copy root, a
+dangling link, a link to a directory or fifo, a fifo, a directory - REFUSES the
+copy, naming the path and the reason. A link that escapes or dangles in the
+ORIGINAL is dropped by the copier before any of this, which legitimately leaves
+no config at all; that case still proceeds.
+
+**The filesystem-monitor case is still why the copy's config matters at all**
+(M2c follow-up 3). A snapshot taken from a repository that configures
+`core.fsmonitor` inherits it verbatim, and dropping `.git/hooks` does not
+disable it: the value may name any path in the repository. It matters in both
+directions, and both are measured (2026-08-24, git 2.50.1,
 `test_verify_real_git.py::test_an_inherited_fsmonitor_left_on_would_false_trip_the_guard`,
 `::test_an_inherited_fsmonitor_is_off_in_the_verification_copy_never_in_the_original`):
 a live monitor marks index entries fsmonitor-valid BY ITSELF on the second
@@ -397,41 +488,84 @@ refresh of a fresh copy, which the index digest reports as a violation no
 verification command caused (verification would halt for the run); and a stale
 cache lets a command answer from data the working tree no longer supports.
 
-**And the neutralisation cannot be aliased away** (M2c follow-up 4, the FIFTH
-consecutive stop-time finding against this same control). `.git/config` that was
-not a regular file used to be skipped SILENTLY: a symlinked config bypassed
-every rule above, because git follows the link and honours `core.fsmonitor` from
-its target while Eris `lstat`ed and gave up. It now fails CLOSED. A link
-resolving INSIDE the copy to a regular file is read, unlinked and REPLACED by a
-regular file holding the neutralised bytes - the target is never written
-through: containment is decided on the REALPATH, the read carries
-`O_NOFOLLOW|O_NONBLOCK` (a link to a fifo fails the type check instead of
-blocking the run), the link is re-`lstat`ed and must still be the same dev+inode
-immediately before the `unlink`, and the replacement is created
-`O_CREAT|O_EXCL|O_NOFOLLOW`, so no pre-existing path anywhere is ever opened for
-writing. The replacement is recorded in `dropped_symlinks`. Every other shape -
-a link escaping the copy root, a dangling link, a link to a directory or fifo, a
-fifo, a directory - REFUSES the copy, naming the path and the reason. A link
-that escapes or dangles in the ORIGINAL is dropped by the copier before any of
-this, which legitimately leaves no config and nothing to inherit; that case
-still proceeds.
+#### The repository-level escapes (M2c follow-up 5, item 2)
 
-**The general assertion (`sanitize.assert_git_layout_sane`).** Four of the five
-findings against this control were different KINDS of hole, so the fix is a
+The config is not the only part of `.git` git treats as instructions.
+
+* **`.git/objects/info/alternates` and `.git/objects/info/http-alternates` are
+  deleted from the copy.** One line naming another object store re-exposes
+  exactly the commits `eris.snapshot`'s history truncation removed. This is
+  corpus contamination rather than execution, and it is the vector `eris.scan`
+  would be least likely to catch: the worker never has to name a path Eris
+  knows about. (`eris.snapshot` already removes `alternates` when it BUILDS a
+  snapshot; the copy no longer trusts that it did.)
+* **`.git/config.worktree` is deleted.** It is a second config file with the
+  same execution risk, read when `extensions.worktreeConfig` is set - which the
+  config rewrite also drops.
+* **A copy that is not ONE self-contained repository is REFUSED**, naming the
+  path and why: `.git` present as a FILE (a worktree/submodule gitlink),
+  `.git/commondir` (this IS a linked worktree - its refs, config and objects
+  live in a `.git` Eris has not copied), `.git/worktrees/` (this repository
+  hosts linked worktrees, each with its own `config.worktree`), and
+  `.git/modules/` (submodule gitdirs, each a repository with its own config).
+  Refusing is the honest answer: verifying the half of the repository Eris can
+  see, and reporting it as if it were the whole, is worse than saying no.
+  **This is a deliberate scope reduction** - a repository with submodules or a
+  checkout that is itself a linked worktree can no longer be verified at all,
+  and that shows up as a refusal, never as a quiet pass.
+
+#### What is still open after M2c follow-up 5
+
+Stated, not implied:
+
+* **The tree is still the repository's.** `.gitattributes`, `.gitmodules`,
+  `.mailmap` and every other in-tree file are copied verbatim, by design.
+  They are inert only for as long as nothing DEFINES the driver they name;
+  that is a property of the config allowlist, so widening the allowlist is
+  the thing to watch.
+* **Objects and refs are copied verbatim.** A malicious commit message, a
+  branch name, a tag or a note is still an in-band instruction channel, and a
+  worker with git tools can still read them.
+* **The allowlist is checked ONCE, at the end of sanitisation.** Nothing
+  re-checks it between verification commands. A command that rewrote
+  `.git/config` mid-run would be caught by the guard's tree hash (`.git/config`
+  is inside it), not by the rewriter.
+* **The `extensions` section is kept whole.** Its values name no command, but
+  `extensions.partialclone` names a REMOTE; every `remote.*` section is
+  dropped, so it resolves to nothing. An extension git does not know refuses
+  the repository, which is a refusal rather than an escape.
+* **Config Eris does not own is out of scope here.** System and global config
+  are excluded by the launcher's `GIT_CONFIG_NOSYSTEM=1` /
+  `GIT_CONFIG_GLOBAL=/dev/null` hardening and a scratch `HOME`, not by this
+  control.
+* **This is not a container.** It contains git's reading of the copy. It does
+  not stop a worker or a trusted `pytest` from reading outside the snapshot
+  (E1, above), and it does not make an adversarial repository safe -
+  adversarial repositories remain OUT of scope until Phase 3.
+
+**The general assertion (`sanitize.assert_git_layout_sane`).** Four of the first
+five findings against this control were different KINDS of hole, so the fix is a
 guard, not another patch. After sanitisation, every path in `GIT_REQUIRED_KINDS`
 that Eris depends on must be the kind Eris assumes, or absent: `.git` a
-directory or a regular file (a worktree/submodule gitlink IS a file),
-`.git/config` a regular file, `.git/index` a regular file, `.git/hooks` a
-directory. Every check is an `lstat`, so a symlink is never followed and is
-never accepted for a path on the list; ABSENT is always allowed (no `.git`, no
-index yet, the `hooks` Eris deliberately does not copy). Anything else refuses
-the copy. Adding a path Eris comes to depend on is one line there and one row in
-the test table, and the test asserts the two sets are EQUAL - a new path with no
-row fails. **What it does not cover, stated:** it is a TYPE check on a fixed
-list, not a semantic one. It says nothing about the CONTENT of those files, says
-nothing about `.git` paths not on the list (`HEAD`, `refs/`, `objects/`,
-`info/`, `modules/`, `commondir`, `objects/info/alternates`), and nothing about
-a path outside `.git`. In-tree symlinks elsewhere are still kept by design.
+DIRECTORY (a worktree/submodule gitlink is a FILE and is now refused - M2c
+follow-up 5), `.git/config` a regular file, `.git/index` a regular file,
+`.git/hooks` a directory, and the paths follow-up 5 added - `.git/config.worktree`,
+`.git/objects/info/alternates`, `.git/objects/info/http-alternates`,
+`.git/commondir` (files), `.git/worktrees`, `.git/modules` (directories). Every
+check is an `lstat`, so a symlink is never followed and is never accepted for a
+path on the list; ABSENT is always allowed (no `.git`, no index yet, the `hooks`
+Eris deliberately does not copy, the paths Eris drops or refuses). Anything else
+refuses the copy, naming the path, the shape found and WHY Eris depends on that
+path. Adding a path Eris comes to depend on is one line there and one row in the
+test table, and the test asserts the two sets are EQUAL - a new path with no row
+fails. A second, separate table (`GIT_REFUSED_IF_PRESENT`,
+`assert_no_repo_escapes`) refuses `.git/commondir`, `.git/worktrees/` and
+`.git/modules/` on PRESENCE, whatever their shape. **What it does not cover,
+stated:** it is a TYPE check on a fixed list, not a semantic one. It says nothing
+about the CONTENT of those files (the config allowlist does that, and only for
+the config), nothing about `.git` paths not on the list (`HEAD`, `refs/`,
+`objects/`, `info/`), and nothing about a path outside `.git`. In-tree symlinks
+elsewhere are still kept by design.
 
 The guard has two halves, because one cannot do the job.
 
@@ -502,7 +636,7 @@ case checked rather than assumed
 
 | index feature | tree hash | index digest |
 |---|---|---|
-| untracked cache (`UNTR`) | no | no (disabled in the copy) |
+| untracked cache (`UNTR`) | no | no (`core.untrackedCache` is not in the copy's config) |
 | fsmonitor: enabling it (`core.fsmonitor`) | YES - `.git/config` is hashed | no |
 | fsmonitor: the `FSMN` section and its token | no | no |
 | fsmonitor: the per-entry VALID BIT | no | **YES - this is what `-f` buys** |
@@ -530,8 +664,8 @@ diff` or `git ls-files` reports, which is the property the tripwire exists to
 protect. If that ever stops being true for one of them, it needs a check of its
 own. (The cache-tree case looks caught and is not: the guard trips there only
 because `write-tree` also writes a new object under `.git/objects`. The
-untracked cache is uncaught but neutralised: the copy sets
-`core.untrackedCache = false`.)
+untracked cache is uncaught but cannot be turned on from the repository:
+`core.untrackedCache` is not in the copy's allowlisted config.)
 
 The split index is different, and the answer is measured, not assumed:
 `git update-index --split-index` writes a NEW file, `.git/sharedindex.<sha>`,

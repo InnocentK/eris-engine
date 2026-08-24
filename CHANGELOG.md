@@ -1,5 +1,122 @@
 # Changelog
 
+## 0.3.9 - the verification copy's `.git` is contained: config by allowlist (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
+cross-family stop-time review of `b271b87` found the SIXTH consecutive hole in
+this control, and the first that is ARBITRARY CODE EXECUTION rather than an
+observation gap: "the new fail-closed control still permits Git to escape the
+verification copy."
+
+Measured on this machine, git 2.50.1, 2026-08-24, against the ALLOWLISTED
+verification command `git --no-optional-locks diff HEAD`:
+
+| vector | observed before this change |
+|---|---|
+| `[diff] external = <path>` in the copy's `.git/config` | the named program **EXECUTED** |
+| `[diff "evil"] textconv = <path>` + `f.txt diff=evil` in a TRACKED `.gitattributes` | **EXECUTED** |
+| `.git/objects/info/alternates` -> another object store, in a history-truncated snapshot | a commit `eris.snapshot` removed went from `cat-file -e` FAILING to SUCCEEDING; its blob read out in full |
+
+The repository chose the program, not the model, so the executable pin, the
+subcommand lists and the `--ext-diff`/`--textconv` hard-denies were all
+irrelevant. The previous control neutralised the two keys we happened to know
+about (`core.fsmonitor`, `core.untrackedCache`) and left everything else. That
+was the wrong SHAPE, so this replaces the denylist with an allowlist rather
+than adding a seventh patch.
+
+Fixed
+* **The copy's `.git/config` is rewritten from an ALLOWLIST**
+  (`sanitize.rewrite_git_config`, replacing `neutralise_git_config`). Only
+  `core.repositoryformatversion`, `core.filemode`, `core.bare`, `core.symlinks`,
+  `core.ignorecase`, `core.precomposeunicode`, `core.logallrefupdates` and the
+  whole un-subsectioned `extensions` section survive - the repository FORMAT
+  and the filesystem capability flags. Every `diff.*`, `filter.*`, `merge.*`,
+  `gpg.*`, `credential.*`, `url.*`, `http.*`, `uploadpack.*`, `include.*`,
+  `includeIf.*`, `alias.*`, `remote.*`, `branch.*`, `user.*` and every other
+  `core.*` is dropped. `core.fsmonitor`/`core.untrackedCache` are no longer set
+  to `false`; they are simply absent, which is stronger. With no driver
+  DEFINED, a `.gitattributes` naming `diff=evil` is inert - verified end to end
+  against a real git, not assumed.
+* **The rewrite is a re-serialisation, not a line filter.**
+  `sanitize.parse_git_config` is a port of git's `config.c`; the output is
+  generated from the parsed `(section, key, value)` triples with every value
+  re-quoted. Every previous version of this control scanned LINES, and git's
+  grammar is not line-oriented: measured the same day, `[core] filemode = true`
+  is a header AND a variable on one line, and `[core][diff] external = x` puts
+  the variable in `diff` - which a line filter looking for `[core]` would have
+  kept. A config Eris cannot parse REFUSES the copy; git refuses to open such a
+  repository too.
+* **The repository-level escapes are removed or refused.** The copy deletes
+  `.git/objects/info/alternates`, `.git/objects/info/http-alternates` and
+  `.git/config.worktree` (`drop_git_repo_escapes`), and REFUSES a copy that is
+  not ONE self-contained repository (`assert_no_repo_escapes` +
+  `assert_git_layout_sane`): `.git` present as a gitlink FILE,
+  `.git/commondir`, `.git/worktrees/`, `.git/modules/`. Each refusal names the
+  path and why.
+* `GIT_REQUIRED_KINDS` gained the six paths this change names and a third
+  column (WHY, appended to the refusal message); `.git` tightened from
+  "file or dir" to "dir". `GIT_REFUSED_IF_PRESENT` and `GIT_DROPPED_RELPATHS`
+  are new tables beside it, and `LAYOUT_ROWS` still has to match
+  `GIT_REQUIRED_KINDS` exactly.
+* `neutralise_git_config` -> `rewrite_git_config`; `ConfigNeutralisation` ->
+  `ConfigRewrite`, which now also reports the entry names kept and dropped.
+
+Behaviour changes an operator will notice
+* **A snapshot with submodules (`.git/modules/`), one that hosts linked
+  worktrees (`.git/worktrees/`), one that IS a linked worktree
+  (`.git/commondir`), or one whose `.git` is a gitlink FILE is now REFUSED.**
+  That is a deliberate scope reduction: those repositories keep config and
+  objects in a `.git` Eris has not copied, has not rewritten and does not
+  guard. It shows up as a refusal, never as a quiet half-verification.
+* The copy's `.git/config` no longer resembles the original's. Anything reading
+  it for the repository's remotes, user or aliases will find none.
+
+Not a regression
+* The ORIGINAL is still never opened for writing, in every path including the
+  refusals, and that is now pinned across the refusing cases too.
+* The race guards (`lstat`, `O_NOFOLLOW`, `O_EXCL`, the dev+inode re-check
+  before the `unlink`), `GUARD_EXCLUDED_RELPATHS`, `GIT_INDEX_DIGEST_ARGS`, the
+  model-facing allowlist and the `bytes_fallback` are untouched.
+* An ordinary checkout - two remotes, a user, aliases, tracking config, several
+  branches - still runs the WHOLE default battery clean. That test exists
+  because a guard that rejects ordinary repositories gets deleted by the next
+  person.
+
+Honest limits (not fixed, stated)
+* The working TREE is still the repository's, `.gitattributes` included. It is
+  inert only for as long as nothing DEFINES the driver it names, so widening
+  the allowlist is the thing to watch.
+* Objects, refs, commit messages, tags and notes are copied verbatim and remain
+  in-band instruction channels.
+* The allowlist is applied ONCE, during sanitisation. Nothing re-applies it
+  between verification commands; a command that rewrote `.git/config` mid-run
+  would be caught by the guard's tree hash, not by the rewriter.
+* This contains git's reading of the copy. It is not a container, and it does
+  not stop a worker or a trusted `pytest` from reading outside the snapshot.
+
+Tests
+* `test_verify_real_git.py::test_a_repository_diff_external_cannot_execute_in_the_verification_copy`,
+  `::test_a_repository_textconv_driver_cannot_execute_in_the_verification_copy`,
+  `::test_a_planted_alternates_cannot_reach_a_truncated_away_object` - the three
+  measured vectors, end to end through `sanitize_snapshot` and a real
+  verification command. Each also proves the vector is REAL by running the same
+  thing in the untouched original.
+* `::test_an_ordinary_repository_still_runs_the_whole_battery_after_the_rewrite`
+  (no false refusal), `::test_the_config_rewrite_keeps_exactly_the_allowlisted_keys_git_reports`
+  (the round trip, judged by `git config --list` rather than by Eris's own
+  parser), `::test_the_object_format_extension_survives_the_rewrite` (a real
+  sha256 repository still opens).
+* `test_sanitize.py::test_the_copy_config_keeps_only_the_allowlisted_keys`,
+  `::test_the_config_parser_reads_gits_real_grammar`,
+  `::test_a_config_eris_cannot_parse_refuses_the_copy`,
+  `::test_an_allowlisted_value_is_requoted_and_a_control_byte_refuses`,
+  `::test_a_bare_allowlisted_key_stays_bare`,
+  `::test_a_subsectioned_core_or_extensions_entry_is_dropped`,
+  `::test_the_alternates_and_worktree_config_are_dropped_from_the_copy`,
+  `::test_a_copy_that_is_not_one_self_contained_repository_is_refused`,
+  `::test_the_repo_escape_checks_fail_closed_on_an_unreadable_path`,
+  `::test_the_original_is_byte_identical_whatever_the_copy_does`.
+
 ## 0.3.8 - the `.git/config` control fails closed, and a general layout guard (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched). The
