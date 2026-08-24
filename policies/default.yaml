@@ -18,19 +18,21 @@ scratch_retention_s: 604800     # hard bound: scratch older than this is swept e
 path_env: /usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
 vendors_allowed: [anthropic, openai, xai, google]
 api_hosts_allowed: [api.openai.com, api.x.ai, localhost, 127.0.0.1]
-# All five files verified to EXIST on this machine on 2026-08-22. A declared
+# All four files verified to EXIST on this machine on 2026-08-22. A declared
 # file that is missing is a doctor WARN; one that exists but cannot be parsed
 # refuses the run (its secrets could not be added to the redactor).
 # ~/.gemini/antigravity-cli/settings.json (126 B, mode 600) held only
 # enableTelemetry/trustedWorkspaces when inspected; where agy keeps its OAuth
 # token is UNKNOWN (A8: auth is HOME-rooted). Declared so that anything
 # secret-shaped that appears there is redacted.
+# ~/.grok/auth.json was declared until 2026-08-23 and REMOVED: `eris doctor`
+# reports it absent - the Grok CLI no longer creates it. Where grok keeps its
+# credentials is UNKNOWN; re-declare the file if it reappears.
 credential_files:
   - ~/.codex/auth.json
   - ~/.claude/.credentials.json
   - ~/.gemini/oauth_creds.json
   - ~/.gemini/antigravity-cli/settings.json
-  - ~/.grok/auth.json
 
 workers:
   claude:

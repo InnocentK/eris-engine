@@ -90,6 +90,22 @@ docs must keep honoring:
   `GIT_`, `AWS_`, `PYTEST_`, `CODEX_SANDBOX`, `ANTIGRAVITY_`. `AGY_` is not
   blanket-banned (the policy sets `AGY_CLI_DISABLE_AUTO_UPDATE`). The only
   `GIT_*` allowed are Eris's own four hardening values.
+* The allowlist is exact and is pinned by a test
+  (`test_launch.py::test_env_key_set_is_exact_for_every_cli`): locale/pager
+  hygiene, `PATH`, `HOME`, `TMPDIR`, `USER`, the git hardening values and the
+  per-CLI knobs, plus whatever the policy's `env`/`env_allow` names add.
+  `USER` is there deliberately (M2c, 2026-08-23). Without it `claude` reports
+  `Not logged in · Please run /login` while `claude auth status` says
+  `loggedIn: true` — bisected on this machine: `HOME` + `PATH` + `TMPDIR`
+  fails, adding `USER` fixes it, `LOGNAME` alone and `SHELL` alone do not. It
+  is an account name, not a credential, and is on no NEVER list; it is
+  resolved from the OS (`launch.resolve_user`: the passwd database first,
+  `getpass.getuser` as the portable fallback), never read out of a filtered
+  `os.environ`, and it is omitted rather than invented when the account cannot
+  be determined (`eris doctor` warns). API workers do not get this environment
+  at all — they are HTTP calls with no subprocess. Mechanical VERIFICATION
+  commands (`build_verify_env`) also do not get `USER`: git, ruff, mypy and
+  pytest do not authenticate.
 * Pinned executable path + sha256 checked immediately before spawn; a changed
   binary is refused. Pins are machine-specific (`policies/pins.yaml`).
 * `stdin=DEVNULL`, `shell=False`, `start_new_session=True`, stdout and stderr

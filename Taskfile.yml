@@ -54,6 +54,18 @@ tasks:
       - task: coverage
       - task: audit
 
+  corpus:plumbing-snapshot:
+    desc: (Re)build the plumbing-control snapshot repo from its tracked files
+    vars:
+      DIR: eval/corpus/plumbing-control
+    cmds:
+      - rm -rf {{.DIR}}/snapshot
+      - mkdir -p {{.DIR}}/snapshot
+      - cp {{.DIR}}/files/calc.py {{.DIR}}/files/README.md {{.DIR}}/snapshot/
+      - git -C {{.DIR}}/snapshot init -q -b main
+      - git -C {{.DIR}}/snapshot add -A
+      - git -C {{.DIR}}/snapshot -c user.name="Eris Corpus" -c user.email="corpus@eris.invalid" commit -qm "plumbing control: calc.py"
+
   hooks:install:
     desc: Install the pre-commit hooks into .git
     cmds:

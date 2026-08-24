@@ -76,6 +76,17 @@ def test_repo_default_policy_agy_entry() -> None:
     assert not any(w.cli == "gemini" for w in pol.workers.values())  # type: ignore[comparison-overlap]
 
 
+def test_repo_default_policy_no_longer_declares_the_grok_credential_file() -> None:
+    """M2c: `~/.grok/auth.json` was declared until 2026-08-23 and removed -
+    `eris doctor` reports it absent; the Grok CLI no longer creates it. A
+    declared file that never exists is a permanent WARN that trains the
+    operator to ignore the doctor."""
+    pol = load_policy(REPO_POLICY, pins_path=REPO_POLICY.with_name("no-such-pins.yaml")).policy
+    assert "~/.grok/auth.json" not in pol.credential_files
+    assert not any("grok" in f for f in pol.credential_files)
+    assert len(pol.credential_files) == 4
+
+
 def _agy(model: str | None) -> dict[str, object]:
     worker: dict[str, object] = {
         "transport": "cli",

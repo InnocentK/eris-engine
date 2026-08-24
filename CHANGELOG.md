@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.3.4 - first live plumbing run: two defects fixed (2026-08-23)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; every committed golden is
+untouched). The harness was pointed at a real worker CLI for the first time
+(`eval/run.py run --task-file eval/corpus/plumbing-control/task.json --arm
+single --panel claude`). The harness behaved - pack built, absences recorded,
+scan ran twice, exit 3, no crash - and surfaced two defects that no hermetic
+test could have caught, because the fakes never execute a real CLI or a real
+`git`. Full bisection tables in `docs/EVAL-PLAN.md` ("First live plumbing
+run"); every rule below has a row in `docs/INVARIANTS.md`.
+
+Fixed (each with a test that would have caught it)
+* **A - `USER` is required in the worker environment.** `claude` reported
+  `Not logged in - Please run /login` while `claude auth status` said
+  `loggedIn: true`. `HOME` + `PATH` + `TMPDIR` + every var the harness adds
+  still failed; `USER` alone fixed it; `LOGNAME` alone and `SHELL` alone did
+  not. `launch.build_env` now takes a required `user` keyword and sets
+  `USER`; `launch.resolve_user()` reads the OS (passwd database first,
+  `getpass.getuser` as the portable Windows fallback), never a filtered
+  `os.environ`, and discards an implausible name. `WorkerCall.user` and
+  `StageContext.user` have NO default so no call site can omit it silently.
+  `eris doctor` gains a `user` check that WARNs, naming the bogus auth
+  symptom, when the account cannot be resolved. API workers are unaffected
+  (no subprocess); verification commands do not get `USER` either.
+* **B - a read-only `git` command tripped the verification tripwire.**
+  `git status --porcelain` refreshed `.git/index` on the freshly copied
+  verification tree, the tree hash changed, `snapshot.violated` was recorded
+  and every remaining verification command in the run was refused. Both
+  halves: (1) `verify.GIT_ERIS_GLOBALS` - Eris appends `--no-optional-locks`
+  to every `git` invocation, before the subcommand; it is hard-denied from a
+  model like every other git global; (2) `evidence.GUARD_EXCLUDED_RELPATHS` -
+  the tripwire hash excludes `.git/index` and `.git/index.lock` and NOTHING
+  else, so a write to refs, objects, HEAD, config or hooks is still a
+  violation. `evidence.request_key` also drops the Eris-appended globals, or
+  a resumed run would re-execute requests it had already executed.
+  `tests/test_verify_real_git.py` runs the real battery against a real git
+  repository (`real_subprocess(allow=["git"])` now has two call sites, not
+  one); reverting both halves reproduces the live ledger exactly.
+
+Also
+* `policies/default.yaml`: `~/.grok/auth.json` removed from
+  `credential_files` (doctor: absent; the Grok CLI no longer creates it). The
+  reason is in the policy comment.
+* `eval/corpus/plumbing-control/` - the first corpus entry, a **plumbing
+  control, not a scored task**: two functions, no defect. Its `snapshot/` is
+  GENERATED, never committed (a git repository cannot live inside another,
+  and `.gitignore` excludes `eval/corpus/*/snapshot/`); the working tree is
+  tracked in `files/` and `task corpus:plumbing-snapshot` rebuilds it.
+* `docs/EVAL-PLAN.md`: the live-run result rows, and **M2c-2** recorded as an
+  OPEN portability item - the tracked policy holds machine-specific ABSOLUTE
+  verify executables while the hashes live in the gitignored `pins.yaml`,
+  with the two candidate designs. Not fixed here: it changes the policy schema
+  and the pin command.
+* `pack.incomplete` on that run was a CONSEQUENCE of defect B and is recorded
+  as M2c-C, to be re-checked on the next live run.
+
+---
+
 ## 0.3.3 - final advisor fix round (2026-08-23)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; every committed golden is

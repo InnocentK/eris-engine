@@ -85,6 +85,24 @@ Google lineage is Antigravity `agy` 1.1.18.
 | A6 / A10 / A10b / A11 / A14–A16 (agy, `--disable-slash-commands`) | stderr on every such run: `warning: --mode plan has no effect while slash command expansion is disabled.` The observed protections (write denied A6, shell denied, read outside the workspace denied A16) therefore come from agy's non-interactive permission check, not from plan mode; A16 shows it holds with `--add-dir`. The flag set is kept as specified (it still denied everything it was asked to deny) but the mechanism label in SECURITY.md is "permission check", and re-verification on any agy version change is required. |
 | A9 + A11 (agy injection, NO declared workspace) | Snapshot with `GEMINI.md`/`AGENTS.md`/`CLAUDE.md` markers, `.agents/rules/r.md` marker and `.agents/hooks.json` (SessionStart touching a file); prompt asked to quote any begin-reply instructions verbatim. Response quoted only agy's own system-prompt thought-format instruction; no planted marker; hook file not created. **No injection WITHOUT a declared workspace — vacuous**: agy had not loaded the directory at all (A14). With `--add-dir` the rules ARE injected (A15, above). |
 
+## First live plumbing run (2026-08-23, this machine)
+
+`eval/run.py run --task-file eval/corpus/plumbing-control/task.json --arm
+single --panel claude --repeat-index 0` — the first time the harness was
+pointed at a real worker CLI. The harness itself behaved: the pack was built,
+the missing workers were recorded as absences, the contamination scan ran
+twice, the run exited 3 and nothing crashed. Two defects surfaced that no
+hermetic test could have caught, because the fakes never execute a real CLI
+or a real `git`.
+
+| Id | Result |
+|---|---|
+| M2c-A | **`USER` is required in the worker environment.** `claude` reported `Not logged in · Please run /login` although `claude auth status` said `loggedIn: true`. Bisected: full shell env → `is_error: false`; `HOME` + `PATH` + `TMPDIR` + every var the harness adds → **`Not logged in`**; + `USER` → `ok`; + `LOGNAME` only → `Not logged in`; + `SHELL` only → `Not logged in`. The failure presents as an auth error, so it reads as an operator mistake — the worst possible symptom. FIXED: `launch.build_env` sets `USER` from `launch.resolve_user()` (passwd first, `getpass` fallback; never a filtered `os.environ`); `eris doctor` warns when it cannot be resolved. |
+| M2c-B | **A read-only `git` command tripped the verification tripwire.** Ledger: `snapshot.violated argv=["/usr/bin/git","status","--porcelain"]` with different before/after tree hashes, then `verify.refused` for `git ls-files` and `git log --oneline -n 20` ("an earlier command changed the verification copy"). `git status` refreshes `.git/index` (its stat cache) — on a freshly copied verification tree the recorded stat data never matches, so it always wants to. `git ls-files` and `git log` alone do not. FIXED, both halves: Eris appends `--no-optional-locks` to every `git` verification invocation (before the subcommand; still hard-denied from a model), and the tripwire hash excludes `.git/index` and `.git/index.lock` — and nothing else, so a command that rewrites refs, objects, HEAD, config or hooks is still caught. `test_verify_real_git.py` runs the real battery against a real repo. |
+| M2c-C | `pack.incomplete` on the same run was a CONSEQUENCE of M2c-B (the battery could not complete). Re-check it on the next live run; report it if it persists. NOT RE-RUN. |
+| M2c-1 | `policies/default.yaml` declared `~/.grok/auth.json` as a credential file; `eris doctor` reports it absent — the Grok CLI no longer creates it. REMOVED (with the reason in the policy comment). Where grok keeps its credentials is UNKNOWN. |
+| M2c-2 | **OPEN portability item.** The tracked policy holds machine-specific ABSOLUTE verify executables (`/opt/homebrew/bin/{ruff,mypy,pytest}`) while the machine-specific hashes live in the gitignored `pins.yaml`. The path belongs with the hash. Two candidate designs: (a) resolve the command by NAME against `path_env` at pin time and record only the name in the tracked policy, or (b) let `pins.yaml` supply the path alongside the sha256, the tracked policy carrying a name and a `path` only as a hint. Not fixed in M2c: it touches the policy schema and the pin command, which is a structural change. |
+
 ## Still open (must run before corpus runs)
 
 | Id | Question | How | Status |
@@ -102,7 +120,15 @@ Google lineage is Antigravity `agy` 1.1.18.
 | E15 | agy `--sandbox` mechanism and the effect of `AGY_CLI_DISABLE_AUTO_UPDATE` | Seatbelt profile strings are embedded in the binary (shell commands only, per those strings); the env name comes from the binary's strings — effect ASSUMPTION. Verify with a pinned binary and a watch on the auto-updater process. | ASSUMPTION |
 
 ## Corpus (Milestone 2)
-~25-30 tasks from Athena's history: ~10 hunk-level reverts of real fixed
+`eval/corpus/plumbing-control/` is the first entry and is a **plumbing
+control, not a scored corpus task**: two functions, no defect, no distractors.
+It exists to exercise the harness end to end and is excluded from Phase 0
+metrics. Its `snapshot/` is GENERATED, never committed — a git repository
+cannot live inside another one, and `.gitignore` excludes
+`eval/corpus/*/snapshot/`; the working tree is tracked in `files/` and
+`task corpus:plumbing-snapshot` rebuilds it (see that directory's README).
+
+The scored corpus: ~25-30 tasks from Athena's history: ~10 hunk-level reverts of real fixed
 defects, 5 planted bugs, 5 plan reviews with known pitfalls, 5 clean controls,
 2 insufficient-evidence tasks (correct answer = ABSTAIN). Keys in
 `eval/corpus/<task>/key.json`; snapshots built with `eris.snapshot` at the
