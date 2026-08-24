@@ -1571,3 +1571,73 @@ def test_a_snapshot_eris_refuses_is_a_clean_refusal_not_a_traceback(tmp_path: Pa
     # ... and no half-built copy is left in the scratch dir
     leftovers = list((tmp_path / "cache" / "scratch").rglob("*verify*"))
     assert leftovers == [], leftovers
+
+
+# --------------------------------------------------------------------------- cleanup reporting
+
+
+class _ClosedStream:
+    """A stderr whose every write fails, like a closed pipe."""
+
+    def write(self, _data: str) -> int:
+        raise ValueError("I/O operation on closed file")
+
+    def flush(self) -> None:
+        raise ValueError("I/O operation on closed file")
+
+
+def test_the_cleanup_report_never_replaces_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A report that cannot be delivered is dropped: the reason survives.
+
+    The reporting channel exists so a cleanup failure is not lost. If writing
+    it could itself raise, it would destroy the very exception it was called
+    to preserve - the defect one level deeper than the one it fixed.
+    """
+    import eval.run as run_module
+
+    scratch = tmp_path / "scratch" / "r1"
+    scratch.parent.mkdir(parents=True)
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise OSError("EBUSY: device or resource busy")
+
+    monkeypatch.setattr(run_module.shutil, "rmtree", boom)
+    with pytest.raises(RuntimeError, match="the real reason"):
+        with run_module._scratch_root(scratch, _ClosedStream()):  # type: ignore[arg-type]
+            raise RuntimeError("the real reason")
+
+
+def test_a_cleanup_that_raises_something_other_than_oserror_is_still_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``rmtree`` is not contractually limited to OSError - a handler of ours
+    can raise anything. Whatever it raises, the reason still wins."""
+    import eval.run as run_module
+
+    scratch = tmp_path / "scratch" / "r2"
+    scratch.parent.mkdir(parents=True)
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise RecursionError("a handler blew the stack")
+
+    monkeypatch.setattr(run_module.shutil, "rmtree", boom)
+    err = io.StringIO()
+    with pytest.raises(RuntimeError, match="the real reason"):
+        with run_module._scratch_root(scratch, err):
+            raise RuntimeError("the real reason")
+    line = json.loads(err.getvalue().strip())
+    assert line["kind"] == "scratch_cleanup_failed"
+    assert "blew the stack" in line["error"]
+
+
+def test_the_reporter_itself_never_raises(tmp_path: Path) -> None:
+    import eval.run as run_module
+
+    run_module._print_scratch_cleanup_failure(
+        _ClosedStream(),  # type: ignore[arg-type]
+        "r3",
+        tmp_path / "scratch" / "r3",
+        "EBUSY",
+    )

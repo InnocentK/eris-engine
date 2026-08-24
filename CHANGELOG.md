@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.12 - the cleanup report cannot replace the reason (2026-08-24)
+
+Tenth stop-time finding, one level deeper than 0.3.11's: the reporting channel
+that exists so a cleanup failure is never lost could itself raise, destroying
+the very exception it was called to preserve.
+
+* `_print_scratch_cleanup_failure` NEVER raises. Every caller is already
+  handling a failure; a closed stream or broken pipe must not become the
+  reported outcome. An undeliverable report is dropped deliberately - there is
+  nowhere left to say so, and the docstring says exactly that.
+* `_scratch_root` catches `BaseException` from `shutil.rmtree`, not just
+  `OSError`: rmtree is not contractually limited to it (an `onexc` handler can
+  raise anything), and anything escaping that inner block would replace the
+  reason.
+* Three tests, each verified to fail without the fix: the reason survives an
+  undeliverable report; a non-OSError cleanup is still reported and still
+  loses to the reason; the reporter is called directly against a closed stream.
+
 ## 0.3.11 - a scratch removal failure is reported, and never instead of the reason (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched).
