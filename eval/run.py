@@ -1223,15 +1223,21 @@ def _print_scratch_cleanup_failure(
     the reason it was called to report - the exact defect this channel exists
     to prevent. A report that cannot be delivered is dropped, silently and
     deliberately: there is nowhere left to say so."""
-    line: dict[str, Any] = {
-        "status": "error",
-        "kind": "scratch_cleanup_failed",
-        "scratch": str(scratch),
-        "error": error,
-    }
-    if run_id is not None:
-        line["run_id"] = run_id
+    # The WHOLE body is guarded, not its last step. This was fixed three times
+    # one step at a time - the write, then the caller's formatting, then the
+    # dict construction below - because each fix guarded only what the previous
+    # finding named. A handler that is already dealing with a failure must be
+    # unable to raise ANYWHERE, so the guard goes around everything and stays
+    # there as the body changes.
     try:
+        line: dict[str, Any] = {
+            "status": "error",
+            "kind": "scratch_cleanup_failed",
+            "scratch": _safe_text(scratch, "<scratch>"),
+            "error": error,
+        }
+        if run_id is not None:
+            line["run_id"] = run_id
         print(json.dumps(line), file=err, flush=True)
     except BaseException:  # noqa: BLE001 - see the docstring: nowhere left to report
         pass
