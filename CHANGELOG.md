@@ -87,6 +87,25 @@ Fixed - the parser claim is now measured rather than asserted
   what is verified - a correspondence pinned by two tables - and says plainly
   that a construction in neither table is unverified.
 
+Fixed - a refusal now behaves like one, end to end
+* `sanitized_copy` called `sanitize_snapshot` BEFORE entering its
+  `try`/`finally`, so any failure while the copy was being built left a
+  half-built copy in the scratch dir for the orphan sweep to find hours later.
+  This milestone added a lot of refusals, so that mattered a lot more than it
+  used to. The copy is now removed on the build path too - but only when THIS
+  call created it: a `dest` that already existed is refused by
+  `make_private_dir` and left exactly as found, the rule the run-scratch
+  reservation already follows. If the removal ALSO fails, the cleanup error is
+  raised (worker-visible files may remain, which is a run error, not a
+  refusal) with the original refusal as its `__cause__` - neither fact is lost.
+* `SanitizeError` was not caught by `run_cell`, so every deliberate refusal
+  would have surfaced as an unhandled traceback with no ledger entry and no
+  documented exit code. `SanitizeError` and `NestedRepositoryRefused` now exit
+  `EXIT_CONFIG` with status `refused`, the reason in the summary and a
+  `run.error` event on the ledger - like every other refusal.
+  `SanitizeCleanupError`, a SUBCLASS, is caught first and stays
+  `EXIT_RUN_ERROR`: it is a failure, not a refusal.
+
 Behaviour change an operator will notice
 * **A repository that uses submodules can no longer be verified at all** -
   checked out or not. This is the largest scope reduction in the M2c

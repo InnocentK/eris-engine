@@ -1192,6 +1192,17 @@ def _force_writable(
     return handler
 
 
+def _remove_copy(dest: Path) -> None:
+    """Remove a copy this process built. A failure raises
+    :class:`SanitizeCleanupError`; it is never swallowed, because
+    worker-visible files may remain."""
+    try:
+        _restore_owner_access(dest)  # inside the copy only; never a parent
+        shutil.rmtree(dest, onexc=_force_writable(dest))
+    except OSError as exc:
+        raise SanitizeCleanupError(f"sanitized copy {dest} could not be removed: {exc}") from exc
+
+
 @contextmanager
 def sanitized_copy(
     original: Path,
@@ -1203,16 +1214,30 @@ def sanitized_copy(
 ) -> Iterator[tuple[Path, SnapshotSanitization]]:
     """``with sanitized_copy(...) as (copy_root, record):`` - the copy is a
     private dir under ``scratch_dir`` and is removed in ``finally``. A
-    removal failure raises :class:`SanitizeCleanupError` (never swallowed)."""
+    removal failure raises :class:`SanitizeCleanupError` (never swallowed).
+
+    A failure while the copy is being BUILT removes it too. This is the part
+    the advisor caught: ``sanitize_snapshot`` used to run before the
+    ``try``/``finally``, so every refusal - and there are now many, each of
+    them a deliberate one - left a half-built copy behind in the scratch dir
+    for the orphan sweep to find hours later. The copy is removed only when
+    THIS call created it: a ``dest`` that already existed is refused by
+    ``make_private_dir`` and left exactly as found, the same rule the run
+    scratch reservation follows."""
     dest = Path(scratch_dir) / (name or f"sanitized-{worker_id}")
-    record = sanitize_snapshot(original, dest, profile=profile, worker_id=worker_id)
+    pre_existing = dest.is_symlink() or dest.exists()
+    try:
+        record = sanitize_snapshot(original, dest, profile=profile, worker_id=worker_id)
+    except BaseException as exc:
+        if not pre_existing and (dest.is_symlink() or dest.exists()):
+            try:
+                _remove_copy(dest)
+            except SanitizeCleanupError as cleanup:
+                # never silent, and never at the cost of the reason: the
+                # refusal that started this is the `__cause__`
+                raise cleanup from exc
+        raise
     try:
         yield dest.resolve(), record
     finally:
-        try:
-            _restore_owner_access(dest)  # inside the copy only; never a parent
-            shutil.rmtree(dest, onexc=_force_writable(dest))
-        except OSError as exc:
-            raise SanitizeCleanupError(
-                f"sanitized copy {dest} could not be removed: {exc}"
-            ) from exc
+        _remove_copy(dest)

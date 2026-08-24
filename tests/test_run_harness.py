@@ -1450,3 +1450,37 @@ def test_campaign_discovery_skips_an_unscored_plumbing_task(tmp_path: Path) -> N
     )
     assert rc == EXIT_OK
     assert {c["task_id"] for c in json.loads(out2.getvalue())["cells"]} == {"t_plumb"}
+
+
+def test_a_snapshot_eris_refuses_is_a_clean_refusal_not_a_traceback(tmp_path: Path) -> None:
+    """M2c follow-up 5, advisor round, item 4. `SanitizeError` was not caught
+    by `run_cell`: every deliberate refusal added by this milestone - a nested
+    repository, an unsupported `extensions.*`, a `.git` shape Eris cannot
+    reason about - would have surfaced as an unhandled traceback with no
+    ledger entry and no documented exit code.
+
+    A refusal is a refusal: EXIT_CONFIG, status `refused`, the reason in the
+    summary, and a `run.error` event on the ledger."""
+    w = world(tmp_path)
+    snap = w["task"].parent / "snapshot"
+    (snap / "vendor").mkdir()
+    (snap / "vendor" / ".git").write_text("gitdir: ../../elsewhere/.git\n")
+
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="nested", panel="grok"),
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_CONFIG
+    summary = json.loads(out.getvalue())
+    assert summary["status"] == "refused"
+    assert "vendor/.git" in summary["error"] and "NESTED repository" in summary["error"]
+    kinds = [e.kind for e in events_of(w["runs"] / "nested").events]
+    assert "run.error" in kinds
+    # ... and no half-built copy is left in the scratch dir
+    leftovers = list((tmp_path / "cache" / "scratch").rglob("*verify*"))
+    assert leftovers == [], leftovers

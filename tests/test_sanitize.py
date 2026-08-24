@@ -1295,3 +1295,70 @@ def test_dropping_an_unsupported_extension_would_have_been_the_wrong_answer() ->
     assert not GIT_CONFIG_EXTENSIONS_DROPPED & set(GIT_CONFIG_EXTENSIONS_KEPT)
     for allowed in GIT_CONFIG_EXTENSIONS_KEPT.values():
         assert allowed == {"sha1", "sha256"}
+
+
+def test_a_refused_copy_is_removed_not_left_behind(tmp_path: Path) -> None:
+    """M2c follow-up 5, advisor round, item 4. `sanitize_snapshot` used to run
+    BEFORE `sanitized_copy`'s `try`/`finally`, so every refusal left a
+    half-built copy in the scratch dir for the orphan sweep to find hours
+    later - and this change added a lot of refusals, each of them deliberate.
+
+    The copy is now removed on the build path too, whatever raised."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    (original / "sub").mkdir()
+    (original / "sub" / ".git").write_text("gitdir: ../../elsewhere\n")  # refused
+
+    scratch = tmp_path / "scratch"
+    with pytest.raises(SanitizeError, match="a NESTED repository"):
+        with sanitized_copy(original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"):
+            raise AssertionError("the body must never run")  # pragma: no cover
+
+    assert not (scratch / "sanitized-verify").exists()  # nothing left behind
+    assert list(scratch.iterdir()) == []
+
+
+def test_a_dest_that_already_existed_is_never_deleted_by_the_refusal(tmp_path: Path) -> None:
+    """The other half of item 4, and the rule the run-scratch reservation
+    already follows: Eris removes only what THIS call created. A `dest` that
+    was already there is refused by `make_private_dir` and left exactly as
+    found, for an operator to inspect."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    scratch = tmp_path / "scratch"
+    squatter = scratch / "sanitized-verify"
+    squatter.mkdir(parents=True)
+    (squatter / "someone-elses.txt").write_text("do not delete me\n")
+
+    with pytest.raises(LaunchRefused, match="already exists"):
+        with sanitized_copy(original, scratch, profile=VERIFICATION_PROFILE, worker_id="verify"):
+            raise AssertionError("the body must never run")  # pragma: no cover
+
+    assert (squatter / "someone-elses.txt").read_text() == "do not delete me\n"
+
+
+def test_a_cleanup_failure_on_a_refusal_reports_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If removing the half-built copy ALSO fails, neither fact is lost: the
+    cleanup error is raised (worker-visible files may remain, which is a run
+    error, not a refusal) and the refusal that started it is the `__cause__`."""
+    from eris.sanitize import VERIFICATION_PROFILE
+
+    original = _mkgit(tmp_path / "o")
+    (original / "sub").mkdir()
+    (original / "sub" / ".git").write_text("gitdir: ../../elsewhere\n")
+
+    def broken(path: object, *a: object, **k: object) -> None:
+        raise OSError("EBUSY")
+
+    monkeypatch.setattr(shutil, "rmtree", broken)
+    with pytest.raises(SanitizeCleanupError, match="could not be removed") as caught:
+        with sanitized_copy(
+            original, tmp_path / "s", profile=VERIFICATION_PROFILE, worker_id="verify"
+        ):
+            raise AssertionError("the body must never run")  # pragma: no cover
+    assert isinstance(caught.value.__cause__, SanitizeError)
+    assert "a NESTED repository" in str(caught.value.__cause__)
