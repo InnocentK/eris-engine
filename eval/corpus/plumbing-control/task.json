@@ -3,6 +3,7 @@
   "question": "Is calc.py defensible as it stands? It provides add(a, b) and mean(values); mean raises ValueError on an empty list. State whether you find a defect, and support every claim with evidence from the repository.",
   "category": "control",
   "snapshot": "snapshot",
+  "scored": false,
   "battery": [],
   "excerpts": [
     {

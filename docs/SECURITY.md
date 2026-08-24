@@ -106,6 +106,16 @@ docs must keep honoring:
   at all — they are HTTP calls with no subprocess. Mechanical VERIFICATION
   commands (`build_verify_env`) also do not get `USER`: git, ruff, mypy and
   pytest do not authenticate.
+* `USER` is not attacker- or policy-controllable. A policy `env` or an
+  `env_allow` secret that names `USER` is REFUSED, and the OS-derived value is
+  written LAST so nothing already in the dict can override it. `getpass` is a
+  fallback only where it cannot be answering out of the environment (it reads
+  `LOGNAME`/`USER`/`LNAME`/`USERNAME` before the passwd database); an
+  environment-derived answer counts as unresolved and `USER` is omitted, so a
+  stray `export USER=` cannot choose the account a worker CLI is told it is
+  running as. On Windows that means no `USER` at all — a deliberate,
+  documented refusal, reported by `eris doctor`. The doctor prints
+  `USER: resolved`, never the account name.
 * Pinned executable path + sha256 checked immediately before spawn; a changed
   binary is refused. Pins are machine-specific (`policies/pins.yaml`).
 * `stdin=DEVNULL`, `shell=False`, `start_new_session=True`, stdout and stderr

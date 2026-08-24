@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
+from pydantic import ValidationError
+
 from eris.arms import (
     ARM_ORDER,
     CellSpec,
@@ -1355,8 +1357,20 @@ def campaign_cells(
     return cells
 
 
+def task_is_scored(task_file: Path) -> bool:
+    """``task.json``'s ``scored`` flag (default True). An unparsable task file
+    is left to the caller to fail on - never silently skipped."""
+    try:
+        return bool(TaskSpec.model_validate_json(Path(task_file).read_bytes()).scored)
+    except (OSError, ValidationError):
+        return True
+
+
 def discover_tasks(corpus: Path) -> list[Path]:
-    return sorted(p for p in Path(corpus).glob("*/task.json") if p.is_file())
+    """Every scored ``task.json`` under the corpus. A task with
+    ``"scored": false`` is a PLUMBING task: it is skipped here so a campaign
+    never sweeps it up, while an explicit ``--task-file`` still runs it."""
+    return sorted(p for p in Path(corpus).glob("*/task.json") if p.is_file() and task_is_scored(p))
 
 
 def _cell_state(cell_dir: Path) -> str:

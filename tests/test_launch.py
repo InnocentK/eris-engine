@@ -355,9 +355,12 @@ def test_env_key_set_is_exact_for_every_cli() -> None:
 
 def test_resolve_user_prefers_passwd_and_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     """The account name comes from the OS, never from a filtered os.environ.
-    getpass is the portable fallback (Windows has no `pwd`)."""
+    getpass is the portable fallback (Windows has no `pwd`) and is consulted
+    only when it CANNOT be answering out of the environment."""
     import eris.launch as launch_mod
 
+    for name in launch_mod._GETPASS_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(launch_mod, "_passwd_user", lambda: "from-passwd")
     monkeypatch.setattr(launch_mod.getpass, "getuser", lambda: "from-getpass")
     assert resolve_user() == "from-passwd"
@@ -373,6 +376,61 @@ def test_resolve_user_prefers_passwd_and_falls_back(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(launch_mod.getpass, "getuser", _boom)
     assert resolve_user() is None
+
+
+@pytest.mark.parametrize("name", ["LOGNAME", "USER", "LNAME", "USERNAME"])
+def test_resolve_user_ignores_an_environment_derived_fallback(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """`getpass.getuser()` reads LOGNAME/USER/LNAME/USERNAME BEFORE the passwd
+    database. When passwd cannot answer and any of those is set, the fallback
+    would hand a worker CLI a name an attacker (or a stray export) chose. That
+    is treated as UNRESOLVED - omitted, never passed through."""
+    import eris.launch as launch_mod
+
+    for n in launch_mod._GETPASS_ENV_NAMES:
+        monkeypatch.delenv(n, raising=False)
+
+    def _no_pwd() -> str:
+        raise ImportError("no pwd module on this platform")
+
+    monkeypatch.setattr(launch_mod, "_passwd_user", _no_pwd)
+    monkeypatch.setattr(launch_mod.getpass, "getuser", lambda: "attacker")
+    monkeypatch.setenv(name, "attacker")
+    assert resolve_user() is None
+    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t", user=resolve_user())
+    assert "USER" not in env
+
+
+def test_user_is_not_policy_or_secret_controllable() -> None:
+    """USER is Eris's, from the OS. A policy `env` or an `env_allow` secret
+    that names it is REFUSED outright, and the OS value is written LAST so
+    nothing already in the dict can override it."""
+    with pytest.raises(LaunchRefused, match="USER is set by Eris"):
+        build_env(
+            "claude",
+            path_env="/usr/bin",
+            home="/h",
+            tmpdir="/t",
+            user="alice",
+            policy_env={"USER": "root"},
+        )
+    with pytest.raises(LaunchRefused, match="USER is set by Eris"):
+        build_env(
+            "claude",
+            path_env="/usr/bin",
+            home="/h",
+            tmpdir="/t",
+            user="alice",
+            secrets={"USER": "root"},
+        )
+    # refused even when Eris itself could not resolve an account
+    with pytest.raises(LaunchRefused, match="USER is set by Eris"):
+        build_env(
+            "grok", path_env="/usr/bin", home="/h", tmpdir="/t", user=None, policy_env={"USER": "x"}
+        )
+    env = build_env("claude", path_env="/usr/bin", home="/h", tmpdir="/t", user="alice")
+    assert env["USER"] == "alice"
 
 
 @pytest.mark.parametrize("bad", ["", "a\nb", "x\x00y", "u" * 65])

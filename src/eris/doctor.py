@@ -161,14 +161,16 @@ def run_doctor(
         "python",
         f"{v.major}.{v.minor}.{v.micro} (>= 3.12 required)",
     )
+    # The account NAME is never printed: the doctor reports names, not values,
+    # and a username is a value (it also leaks into pasted terminal output).
     user = user_resolver()
     report.add(
         "OK" if user else "WARN",
         "user",
-        f"USER={user} (passed to every CLI worker)"
+        "USER: resolved (passed to every CLI worker)"
         if user
-        else "the account name could not be resolved: CLI workers run without USER, "
-        "which claude reports as 'Not logged in' even when the credentials are valid",
+        else 'USER: could not be resolved (claude will report "Not logged in" even when '
+        "the credentials are valid); see docs/SECURITY.md",
     )
     try:
         loaded: LoadedPolicy = load_policy(policy_path)

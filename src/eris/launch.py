@@ -385,23 +385,39 @@ def _passwd_user() -> str:
     return str(pwd.getpwuid(os.getuid()).pw_name)
 
 
+# getpass.getuser() consults these BEFORE the passwd database. If any of them
+# is set, its answer is environment-derived - exactly what USER must never be.
+_GETPASS_ENV_NAMES: tuple[str, ...] = ("LOGNAME", "USER", "LNAME", "USERNAME")
+
+
 def resolve_user() -> str | None:
     """The account name Eris itself runs as, or ``None`` when it cannot be
-    determined.
+    determined from the OS.
 
-    Resolved from the OS, never from a filtered ``os.environ``: the passwd
-    database first, then :func:`getpass.getuser` as the portable fallback
-    (Windows has no ``pwd`` module; ``getpass`` reads ``USERNAME`` there).
-    A name with a control character or over 64 bytes is discarded rather than
-    smuggled into a subprocess environment.
+    The passwd database is the ONLY trusted source. :func:`getpass.getuser` is
+    the portable fallback for platforms without ``pwd`` (Windows), but it
+    reads ``LOGNAME``/``USER``/``LNAME``/``USERNAME`` before falling through to
+    passwd, so it is used only when none of those names is present in the
+    environment. ``os.environ`` is read here to DETECT that - never for a
+    value. An environment-derived answer is treated as unresolved: ``USER`` is
+    then omitted and ``eris doctor`` warns, rather than a name an attacker (or
+    a stray shell export) chose being handed to a worker CLI. In practice this
+    means Windows normally runs without ``USER``; that is a deliberate,
+    documented refusal, not an oversight.
+
+    A name with a control character or over 64 characters is discarded too.
     """
-    for source in (_passwd_user, getpass.getuser):
-        try:
-            name = source()
-        except Exception:  # noqa: BLE001 - any failure just means "try the next source"
-            continue
-        if name and _USER_VALUE_RE.fullmatch(name):
-            return name
+    name: str | None = None
+    try:
+        name = _passwd_user()
+    except Exception:  # noqa: BLE001 - no pwd module / no passwd entry: try the fallback
+        if not any(n in os.environ for n in _GETPASS_ENV_NAMES):
+            try:
+                name = getpass.getuser()
+            except Exception:  # noqa: BLE001 - no account name available at all
+                return None
+    if name and _USER_VALUE_RE.fullmatch(name):
+        return name
     return None
 
 
@@ -440,21 +456,30 @@ def build_env(
 
     API workers do NOT get this environment: they are HTTP calls with no
     subprocess, so there is nothing to authenticate by account name.
+
+    ``USER`` is neither policy- nor secret-controllable: a policy ``env`` or an
+    ``env_allow`` secret that names ``USER`` is REFUSED, and the OS-derived
+    value is written LAST so nothing already in the dict can override it.
     """
     env: dict[str, str] = {}
     env.update(BASE_ENV)
     env["PATH"] = path_env
     env["HOME"] = home
     env["TMPDIR"] = tmpdir
-    if user:
-        env["USER"] = user
     env.update(PER_CLI_ENV.get(cli, {}))
     for name, value in dict(policy_env or {}).items():
+        if name == "USER":
+            raise LaunchRefused("env USER is set by Eris from the OS; a policy may not supply it")
         env[name] = value
     for name, value in dict(secrets or {}).items():
+        if name == "USER":
+            raise LaunchRefused("env USER is set by Eris from the OS; a secret may not supply it")
         env[name] = value
     assert_env_safe(env)
     env.update(GIT_HARDENING)
+    # LAST, and only from the caller's OS-derived value (see resolve_user).
+    if user:
+        env["USER"] = user
     return env
 
 

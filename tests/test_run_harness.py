@@ -25,6 +25,7 @@ from eval.run import (
     EXIT_RUN_ERROR,
     EXIT_SIGINT,
     EXIT_STOP,
+    discover_tasks,
     main,
     sweep_scratch,
 )
@@ -1382,3 +1383,70 @@ def test_a_finalized_but_unfsynced_manifest_gets_its_own_exit_code(
     assert manifest_path.is_file()  # the run IS finalized
     assert json.loads(manifest_path.read_bytes())["extra"]["status"] == "complete"
     assert events_of(w["runs"] / "unsynced").kinds()[-1] == "scan.result"
+
+
+def test_campaign_discovery_skips_an_unscored_plumbing_task(tmp_path: Path) -> None:
+    """M2c: `"scored": false` in task.json is ENFORCED, not just documented -
+    a campaign never sweeps a plumbing task up. An explicit --task-file still
+    runs it, which is the whole point of having one."""
+    w = world(tmp_path)
+    plumbing = w["corpus"] / "t_plumb"
+    (plumbing / "snapshot" / ".git").mkdir(parents=True)
+    (plumbing / "snapshot" / ".git" / "HEAD").write_text("f" * 40 + "\n")
+    (plumbing / "snapshot" / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    spec = json.loads((w["corpus"] / "t_01" / "task.json").read_text())
+    spec.update({"task_id": "t_plumb", "scored": False, "diff_rev": None, "excerpts": []})
+    (plumbing / "task.json").write_text(json.dumps(spec))
+    (plumbing / "key.json").write_text((w["corpus"] / "t_01" / "key.json").read_text())
+
+    assert [p.parent.name for p in discover_tasks(w["corpus"])] == ["t_01"]
+
+    out = io.StringIO()
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c1",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+            "--dry-run",
+        ],
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+    )
+    assert rc == EXIT_OK
+    cells = json.loads(out.getvalue())["cells"]
+    assert cells and all(c["task_id"] == "t_01" for c in cells)
+    # ... but naming it explicitly still runs it
+    assert [p.name for p in [plumbing / "task.json"]] == ["task.json"]
+    out2 = io.StringIO()
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c2",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+            "--task-file",
+            str(plumbing / "task.json"),
+            "--dry-run",
+        ],
+        out=out2,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+    )
+    assert rc == EXIT_OK
+    assert {c["task_id"] for c in json.loads(out2.getvalue())["cells"]} == {"t_plumb"}

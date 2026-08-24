@@ -123,10 +123,14 @@ or a real `git`.
 `eval/corpus/plumbing-control/` is the first entry and is a **plumbing
 control, not a scored corpus task**: two functions, no defect, no distractors.
 It exists to exercise the harness end to end and is excluded from Phase 0
-metrics. Its `snapshot/` is GENERATED, never committed — a git repository
+metrics - enforced, not merely documented: `task.json` carries
+`"scored": false`, campaign discovery skips it, and `eval/score.py` reports
+its cells as `skipped: not a scored corpus task`. An explicit `--task-file`
+still runs it. Its `snapshot/` is GENERATED, never committed — a git repository
 cannot live inside another one, and `.gitignore` excludes
 `eval/corpus/*/snapshot/`; the working tree is tracked in `files/` and
-`task corpus:plumbing-snapshot` rebuilds it (see that directory's README).
+`eval/make_control_snapshot.py` (portable Python, not POSIX shell) rebuilds
+it - see that directory's README.
 
 The scored corpus: ~25-30 tasks from Athena's history: ~10 hunk-level reverts of real fixed
 defects, 5 planted bugs, 5 plan reviews with known pitfalls, 5 clean controls,

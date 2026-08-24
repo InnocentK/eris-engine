@@ -376,7 +376,24 @@ def test_doctor_warns_when_the_account_name_cannot_be_resolved(tmp_path: Path) -
         user_resolver=lambda: "alice",
     )
     line = by_name(report.render(), "user")
-    assert line.startswith("OK") and "USER=alice" in line
+    assert line.startswith("OK") and "resolved" in line
+
+
+def test_doctor_never_prints_the_account_name(tmp_path: Path) -> None:
+    """The doctor reports NAMES, not values - and an account name is a value.
+    It also ends up in pasted terminal output far more often than a run does."""
+    exe = fake_exe(tmp_path)
+    policy = write_policy(tmp_path, exe, pinned=True)
+    for account in ("alice", None):
+        report = run_doctor(
+            policy_path=policy,
+            env_file=tmp_path / ".env",
+            home=tmp_path,
+            user_resolver=lambda account=account: account,  # type: ignore[misc]
+        )
+        text = report.render()
+        assert "alice" not in text
+        assert "USER=" not in text
 
 
 def test_doctor_probe_env_carries_the_resolved_user(tmp_path: Path) -> None:

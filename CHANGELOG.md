@@ -39,6 +39,34 @@ Fixed (each with a test that would have caught it)
   repository (`real_subprocess(allow=["git"])` now has two call sites, not
   one); reverting both halves reproduces the live ledger exactly.
 
+Advisor round (one review round; findings folded into the same milestone)
+* `USER` is not attacker-, policy- or secret-controllable: a policy `env` or
+  an `env_allow` secret naming `USER` is REFUSED, the OS value is written LAST
+  in `build_env`, and `getpass.getuser` is consulted only when none of
+  `LOGNAME`/`USER`/`LNAME`/`USERNAME` is set (it reads them before passwd), so
+  an environment-derived answer counts as UNRESOLVED. Windows therefore runs
+  without `USER` - a deliberate, documented refusal that `eris doctor` reports.
+* `eris doctor` no longer prints the account NAME: `USER: resolved` /
+  `USER: could not be resolved (...)`. The doctor reports names, not values.
+* `TaskSpec.scored` (default True). `"scored": false` is now ENFORCED rather
+  than documented: campaign discovery skips the task and `eval/score.py`
+  reports its cells as `skipped: not a scored corpus task`, entering them in
+  no metric. An explicit `--task-file` still runs it. The scorer reads the
+  flag as JSON, deliberately NOT through `eris.evidence.TaskSpec`, which would
+  drag `eris.verify` and `subprocess` into the scorer (its import guard caught
+  this).
+* `request_key` is keyed only on a VALIDATED argv: `execute_evidence_requests`
+  applies the grammar BEFORE computing the key, so a model-supplied
+  `--no-optional-locks` is refused instead of aliasing an already-executed
+  request into `verify.duplicate`. `run_allowlisted` still re-validates
+  immediately before spawn.
+* The corpus snapshot generator is Python (`eval/make_control_snapshot.py`),
+  not POSIX shell: `shutil` copies and only `git` is spawned, with the commit
+  identity passed per invocation. The README no longer overclaims portability.
+* Guard coverage extended: writes to `.git/objects/...`, `.git/HEAD` and
+  `.git/hooks/pre-commit` trip the tripwire; `.git/index` and
+  `.git/index.lock` do not.
+
 Also
 * `policies/default.yaml`: `~/.grok/auth.json` removed from
   `credential_files` (doctor: absent; the Grok CLI no longer creates it). The
@@ -47,7 +75,8 @@ Also
   control, not a scored task**: two functions, no defect. Its `snapshot/` is
   GENERATED, never committed (a git repository cannot live inside another,
   and `.gitignore` excludes `eval/corpus/*/snapshot/`); the working tree is
-  tracked in `files/` and `task corpus:plumbing-snapshot` rebuilds it.
+  tracked in `files/` and `eval/make_control_snapshot.py` (portable Python)
+  rebuilds it.
 * `docs/EVAL-PLAN.md`: the live-run result rows, and **M2c-2** recorded as an
   OPEN portability item - the tracked policy holds machine-specific ABSOLUTE
   verify executables while the hashes live in the gitignored `pins.yaml`,

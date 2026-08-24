@@ -573,7 +573,11 @@ def test_the_guard_excluded_set_is_exactly_the_git_index(tmp_path: Path) -> None
         ("PLANTED", True),  # a tracked working-tree file
         (".git/refs/heads/main", True),  # history: must still be caught
         (".git/config", True),
+        (".git/objects/ab/cdef0123", True),  # a new object
+        (".git/HEAD", True),  # the current branch
+        (".git/hooks/pre-commit", True),  # code that would run on the next git
         (".git/index", False),  # git's stat cache: the ONLY tolerated write
+        (".git/index.lock", False),  # the file it writes the stat cache through
     ],
 )
 def test_the_guard_still_trips_on_everything_but_the_git_index(
@@ -595,14 +599,56 @@ def test_the_guard_still_trips_on_everything_but_the_git_index(
 def test_request_key_ignores_the_options_eris_appends(tmp_path: Path) -> None:
     """M2c defect B: the dedupe key must survive Eris's own git globals, or a
     RESUMED run re-executes every request it already executed (the recorded
-    argv carries them, the raw request does not)."""
+    argv carries them, the freshly validated one does too, but a key built
+    from either must match)."""
     from eris.evidence import request_key
     from eris.verify import GIT_ERIS_GLOBALS
 
-    raw = ["git", "ls-files"]
-    recorded = ["/usr/bin/git", *GIT_ERIS_GLOBALS, "ls-files"]
-    assert request_key(recorded) == request_key(raw)
+    validated = ["/usr/bin/git", "ls-files"]
+    recorded = ["/opt/homebrew/bin/git", *GIT_ERIS_GLOBALS, "ls-files"]
+    assert request_key(recorded) == request_key(validated)
     assert request_key(["git", "log"]) != request_key(["git", "ls-files"])
+
+
+def test_a_model_supplied_eris_global_is_refused_not_deduped(tmp_path: Path) -> None:
+    """M2c follow-up: `request_key` strips the options Eris appends, so keying
+    a RAW request would let `git --no-optional-locks ls-files` alias an
+    already-executed `git ls-files` and come back as `verify.duplicate` - a
+    hard-denied option quietly becoming a no-op. The grammar therefore runs
+    BEFORE the key is computed: the request is REFUSED, and the legitimate
+    repeat right after it is still deduped."""
+    make_snapshot(tmp_path)
+    policy = make_policy(tmp_path)
+    popen = ScriptedPopen()
+    env = make_env(tmp_path, tmp_path / "snap", popen, policy)
+    w = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
+    items = execute_evidence_requests(
+        [
+            EvidenceRequest(argv=["git", "ls-files"]),
+            EvidenceRequest(argv=["git", "--no-optional-locks", "ls-files"]),
+            EvidenceRequest(argv=["git", "ls-files", "--no-optional-locks"]),
+            EvidenceRequest(argv=["git", "ls-files"]),  # the legitimate repeat
+        ],
+        source="P1",
+        env=env,
+        writer=w,
+        state=RequestState(),
+        task_id="t_01",
+        stop_check=lambda: False,
+    )
+    w.close()
+    ev = events(w)
+    kinds = [e["kind"] for e in ev]
+    assert len(items) == 1 and len(popen.calls) == 1  # only the first request ran
+    refused = [e["payload"] for e in ev if e["kind"] == "verify.refused"]
+    assert len(refused) == 2, refused
+    assert [r["argv"][1:] for r in refused] == [
+        ["--no-optional-locks", "ls-files"],
+        ["ls-files", "--no-optional-locks"],
+    ]
+    assert "hard-denied" in refused[1]["reason"]
+    # and the honest repeat is still a duplicate, not a re-spawn
+    assert kinds.count("verify.duplicate") == 1
 
 
 def test_pytest_commands_carry_no_cacheprovider(tmp_path: Path) -> None:

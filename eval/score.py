@@ -14,7 +14,11 @@ Per cell (one run dir with ``manifest.json``):
   BUDGET_TRIPPED cell -> ``missing``;
 * E1 GATE: categories ``revert`` / ``planted`` / ``insufficient`` require
   ``ArmRun.containment == "container"``; otherwise the whole scoring run
-  is REFUSED (exit 7, no metrics, no override). ``control`` and ``plan``
+  is REFUSED (exit 7, no metrics, no override). A task whose ``task.json``
+  says ``"scored": false`` is a PLUMBING task: its cells are reported under
+  ``skipped`` (``"not a scored corpus task"``) and never enter a metric,
+  and campaign discovery does not sweep it up in the first place.
+  ``control`` and ``plan``
   score normally (user decision; the testing critic's objection that plan
   keys are as readable as the others is recorded in EVAL-PLAN).
 
@@ -129,6 +133,23 @@ class Key(_Strict):
     scan: KeyScan = Field(default_factory=KeyScan)
     injection_canary: bool | None = None
     source_repo: str | None = None
+
+
+def task_is_scored(corpus: Path, task_id: str) -> bool:
+    """``task.json``'s ``scored`` flag (default True). False marks a PLUMBING
+    task - one that exercises the harness and is deliberately excluded from
+    Phase 0 metrics. A missing or unparsable task.json is NOT a silent skip:
+    it scores, and the key gate below fails on it if it is really broken."""
+    path = Path(corpus) / task_id / "task.json"
+    try:
+        data = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return True
+    # Read as data, deliberately NOT through eris.evidence.TaskSpec: importing
+    # it would drag eris.verify (and subprocess) into the scorer, which the
+    # import guard forbids. Only a literal `false` opts out; anything else is
+    # a malformed task file and fails loudly on the key gate instead.
+    return isinstance(data, dict) and data.get("scored", True) is not False
 
 
 def load_key(corpus: Path, task_id: str) -> Key:
@@ -588,18 +609,30 @@ def cell_dirs(campaign_dir: Path) -> list[Path]:
 def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str, Any]:
     scores: list[CellScore] = []
     invalid: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
     for run_dir in cell_dirs(campaign_dir):
         try:
             cell = read_cell(run_dir)
         except LedgerCorrupt as exc:
             invalid.append({"run_id": run_dir.name, "error": str(exc)[:200]})
             continue
-        key = load_key(corpus, cell.arm_run.task_id)
+        task_id = cell.arm_run.task_id
+        if not task_is_scored(corpus, task_id):
+            skipped.append(
+                {
+                    "run_id": run_dir.name,
+                    "task_id": task_id,
+                    "skipped": "not a scored corpus task",
+                }
+            )
+            continue
+        key = load_key(corpus, task_id)
         scores.append(score_cell(cell, key, home=home, corpus=corpus))
     return {
         "campaign_dir": str(campaign_dir),
         "cells": [asdict(s) for s in scores],
         "ledger_invalid": invalid,
+        "skipped": skipped,
         "per_arm": aggregate(scores),
         "paired": paired_deltas(scores),
         "pre_registration_notes": [

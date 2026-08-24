@@ -651,3 +651,33 @@ def test_symlinked_cell_dirs_and_manifests_are_never_followed(tmp_path: Path) ->
     assert found == ["t_01-r0-single-grok"]
     summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
     assert [c["run_id"] for c in summary["cells"]] == ["t_01-r0-single-grok"]
+
+
+def test_scorer_skips_an_unscored_plumbing_task_and_says_so(tmp_path: Path) -> None:
+    """M2c: a task.json with `"scored": false` never enters a metric. The
+    scorer reports its cells under `skipped` with the reason, rather than
+    silently dropping them or quietly folding them into the aggregates."""
+    w = world(tmp_path)
+    cdir = campaign(w, tmp_path, "single")
+    write_key(w, expected_verdict=["ACCEPT"])
+    scored = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert scored["cells"] and scored["skipped"] == []
+
+    spec = json.loads((w["corpus"] / "t_01" / "task.json").read_text())
+    spec["scored"] = False
+    (w["corpus"] / "t_01" / "task.json").write_text(json.dumps(spec))
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert summary["cells"] == []
+    assert [c["skipped"] for c in summary["skipped"]] == ["not a scored corpus task"]
+    assert {c["task_id"] for c in summary["skipped"]} == {"t_01"}
+    assert all(not v for v in summary["per_arm"].values()) or summary["per_arm"] is not None
+
+
+def test_the_repo_plumbing_control_task_is_marked_unscored() -> None:
+    """The corpus entry's own claim ("a plumbing control, not a scored task")
+    must be true in the file the tools read, not only in its README."""
+    from eris.evidence import TaskSpec
+
+    task_file = Path(__file__).resolve().parents[1] / "eval" / "corpus" / "plumbing-control"
+    spec = TaskSpec.model_validate_json((task_file / "task.json").read_bytes())
+    assert spec.task_id == "plumbing-control" and spec.scored is False

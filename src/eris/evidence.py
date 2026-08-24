@@ -62,7 +62,7 @@ from eris.schemas import (
     now_ts,
     sha256_hex,
 )
-from eris.verify import GIT_ERIS_GLOBALS, run_allowlisted
+from eris.verify import GIT_ERIS_GLOBALS, check_command, run_allowlisted
 from eris.writer import BlobRef, RunWriter
 
 PACK_COMMANDS: tuple[tuple[str, ...], ...] = (
@@ -121,6 +121,12 @@ class TaskSpec(BaseModel):
     excerpts: list[Excerpt] = Field(default_factory=list)
     diff_rev: str | None = None
     plan_text: str | None = None
+    # False = a PLUMBING task: it exercises the harness and is deliberately
+    # excluded from Phase 0 metrics. Campaign discovery skips it and the
+    # scorer refuses to score it. An explicit --task-file still runs it (that
+    # is the whole point of a plumbing task). Default True so every real
+    # corpus entry is scored unless someone opts out on purpose.
+    scored: bool = True
 
 
 def derive_nonce(
@@ -573,11 +579,18 @@ def rebuild_pack(
 
 
 def request_key(argv: Sequence[str]) -> str:
-    """Dedupe key of a request: canonical argv with the executable's basename
-    and without the options Eris itself appends (so a recorded, resolved argv
-    and a raw request compare equal - a resumed run must recognise a request
-    it already executed). Dropping them cannot alias two distinct requests:
-    every one of them is hard-denied from a model."""
+    """Dedupe key of an ALREADY VALIDATED argv: canonical argv with the
+    executable's basename and without the options Eris itself appends, so a
+    recorded, resolved argv and a freshly validated one compare equal (a
+    resumed run must recognise a request it already executed).
+
+    Call this ONLY with an argv that :func:`~eris.verify.check_command` has
+    accepted, or with one read back off the ledger (which is the same thing).
+    Keying a RAW model request would let ``git --no-optional-locks log`` alias
+    ``git log`` and come back as ``verify.duplicate`` instead of the refusal
+    it must be - the stripped options are hard-denied from a model, and that
+    refusal has to happen BEFORE the key is computed.
+    """
     argv = list(argv)
     if argv:
         argv[0] = Path(argv[0]).name
@@ -621,7 +634,14 @@ def execute_evidence_requests(
         if stop_check():
             writer.append("verify.stopped", {"argv": argv, "source": source})
             raise EvidenceStopped("STOP requested before an evidence request")
-        canon = request_key(argv)
+        # Validate FIRST: a model-supplied option that Eris itself appends is a
+        # refusal, never a duplicate. run_allowlisted re-applies the grammar
+        # immediately before spawn regardless; this decision only keys.
+        decision = check_command(argv, env.policy, Path(env.snapshot_root), hasher=env.hasher)
+        if not decision.allowed:
+            _refused(writer, argv, f"PermissionError: refusing to run: {decision.reason}", source)
+            continue
+        canon = request_key(decision.argv)
         if canon in state.executed:
             writer.append(
                 "verify.duplicate",
