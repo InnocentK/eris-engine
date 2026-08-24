@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.11 - a scratch removal failure is reported, and never instead of the reason (2026-08-24)
+
+No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched).
+Two cleanup-reporting defects in `eval/run.py`, both found by reading the
+contract `sanitize._remove_copy` states - "never swallowed, because
+worker-visible files may remain" - against what the harness actually does.
+
+Fixed
+* **A run-scratch removal failure on the writer-open path was reported
+  NOWHERE.** `run_cell` catches `RunExists` / `LedgerInvalid` / `WriterLocked`,
+  hands the reservation back with `_remove_scratch(scratch)` and DISCARDED its
+  return value. `_remove_scratch` returns the failure text and never raises, so
+  on that one path a failed removal changed nothing: no ledger is open to take
+  a `run.error`, no stderr line was printed, the exit code was the clean
+  refusal it would have been anyway - and the verification copy stayed on disk
+  with nothing pointing at it. The return value is now used on both channels
+  that exist there: the harness's structured stderr line
+  (`{"status": "error", "kind": "scratch_cleanup_failed", "run_id", "scratch",
+  "error"}`, naming the path of the leftover) AND the returned `CellOutcome` -
+  the text is appended to `error`, and the exit code becomes the run error (4),
+  because a refusal that left worker-visible files behind is not a clean
+  refusal. `status` still names why the writer refused (`exists` / `corrupt` /
+  `locked`); no new exit code was invented.
+* **`_scratch_root` raised from a `finally`, replacing the reason the run
+  failed.** `shutil.rmtree(scratch, ignore_errors=False)` in a `finally`
+  propagates out of the context manager and DISCARDS whatever was already in
+  flight - the refusal, the writer error, the `KeyboardInterrupt` - so the
+  operator would have been told the scratch directory was busy and never why
+  the run stopped. A cleanup failure is still never silent, but it no longer
+  costs the reason: with an exception in flight it goes to the structured
+  stderr line and the original propagates; with nothing in flight it is raised,
+  exactly as before. `cmd_invoke` takes `err` for this (it also stops writing
+  the sweep line to `sys.stderr` directly, so `main`'s stream is honoured).
+* `_remove_scratch`'s docstring now says why the return value is not optional,
+  and `docs/INVARIANTS.md` carries both rules with their tests.
+
+Audited, unchanged: the other two `_remove_scratch` call sites already use the
+return value - the happy path appends `run.error` before the final scan (so
+`scan.result` stays last and the run exits 4), and the `finally` records it
+through `_record_run_error`, which routes to the ledger, or to the manifest and
+stderr once the ledger is sealed.
+
 ## 0.3.10 - nested repositories are refused (advisor round) (2026-08-24)
 
 No schema change (`SCHEMA_VERSION` stays 0.1.5; the goldens are untouched).

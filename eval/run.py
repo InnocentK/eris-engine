@@ -276,7 +276,12 @@ def cmd_dry_run(args: argparse.Namespace, out: IO[str], home: Path) -> int:
 
 
 def cmd_invoke(
-    args: argparse.Namespace, out: IO[str], home: Path, popen: PopenFactory, killpg: KillPg
+    args: argparse.Namespace,
+    out: IO[str],
+    err: IO[str],
+    home: Path,
+    popen: PopenFactory,
+    killpg: KillPg,
 ) -> int:
     run_id = (
         args.run_id
@@ -293,7 +298,7 @@ def cmd_invoke(
         raise LaunchRefused(f"scratch_dir {scratch_root} must not be under the runs dir")
     sweep_scratch(
         scratch_root,
-        sys.stderr,
+        err,
         runs_dir=Path(args.runs_dir),
         exclude=[run_id],
         max_age_s=float(loaded.policy.scratch_retention_s),
@@ -310,7 +315,7 @@ def cmd_invoke(
     # The RESERVATION is the mkdir(exist_ok=False) inside _scratch_root, and it
     # happens BEFORE the writer opens: an entry that appears between the check
     # above and the mkdir refuses with no ledger created and nothing deleted.
-    with _scratch_root(scratch), RunWriter(run_dir, redactor, run_id=run_id) as writer:
+    with _scratch_root(scratch, err), RunWriter(run_dir, redactor, run_id=run_id) as writer:
         (scratch / "tmp").mkdir()
         started = now_ts()
         writer.append(
@@ -808,11 +813,22 @@ def run_cell(
         ).open()
     except (RunExists, LedgerInvalid, WriterLocked) as exc:
         # the reservation is ours and no ledger opened: give it back
-        _remove_scratch(scratch)
+        cleanup_error = _remove_scratch(scratch)
         if isinstance(exc, RunExists):
-            return CellOutcome(run_id, EXIT_CONFIG, "exists", error=str(exc))
-        status = "corrupt" if isinstance(exc, LedgerInvalid) else "locked"
-        return CellOutcome(run_id, EXIT_RUN_ERROR, status, error=str(exc))
+            outcome = CellOutcome(run_id, EXIT_CONFIG, "exists", error=str(exc))
+        else:
+            status = "corrupt" if isinstance(exc, LedgerInvalid) else "locked"
+            outcome = CellOutcome(run_id, EXIT_RUN_ERROR, status, error=str(exc))
+        if cleanup_error is not None:
+            # NO ledger is open on this path, so the only channels left are
+            # stderr and the outcome itself: use BOTH. A refusal whose scratch
+            # survived is not a clean refusal - worker-visible files remain -
+            # so it takes the run-error exit code (the status still names the
+            # reason the writer refused).
+            _print_scratch_cleanup_failure(h.err, run_id, scratch, cleanup_error)
+            outcome.error = f"{outcome.error}; scratch cleanup failed: {cleanup_error}"
+            outcome.exit_code = EXIT_RUN_ERROR
+        return outcome
     prompts = load_prompt_files(h.prompts_dir)
     snapshot_sha = read_head_sha(snapshot)
     original_tree = tree_sha256(snapshot)
@@ -1163,7 +1179,9 @@ def _finalize_after_post_scan_failure(
 
 
 def _remove_scratch(scratch: Path) -> str | None:
-    """Remove the run's scratch root. Returns the failure text, never raises."""
+    """Remove the run's scratch root. Returns the failure text, never raises -
+    so EVERY caller must do something with the return value: worker-visible
+    files may remain, and a dropped return is a silent leak."""
     try:
         if scratch.is_symlink():
             scratch.unlink()
@@ -1174,15 +1192,45 @@ def _remove_scratch(scratch: Path) -> str | None:
     return None
 
 
+def _print_scratch_cleanup_failure(
+    err: IO[str], run_id: str | None, scratch: Path, error: str
+) -> None:
+    """The harness's structured stderr line for a scratch that could NOT be
+    removed. It is the only channel left when no ledger is open (the writer
+    refused) or when the ledger is already gone (the cleanup runs in a
+    ``finally``); it names the scratch path so the leftover can be found."""
+    line: dict[str, Any] = {
+        "status": "error",
+        "kind": "scratch_cleanup_failed",
+        "scratch": str(scratch),
+        "error": error,
+    }
+    if run_id is not None:
+        line["run_id"] = run_id
+    print(json.dumps(line), file=err, flush=True)
+
+
 @contextmanager
-def _scratch_root(scratch: Path) -> Iterator[Path]:
+def _scratch_root(scratch: Path, err: IO[str]) -> Iterator[Path]:
     """Create the run's private scratch root (refusing a planted entry or
-    symlink) and remove it in ``finally`` whatever happens."""
+    symlink) and remove it in ``finally`` whatever happens.
+
+    A removal failure NEVER replaces the reason the body failed. Raising out of
+    a ``finally`` would discard the exception already propagating (the refusal,
+    the writer error, the interrupt) and report a leftover directory in its
+    place. When something is already in flight the cleanup failure goes to
+    stderr as a structured line and the original propagates; when nothing is,
+    it is raised, as before."""
     make_private_dir(scratch)
     try:
         yield scratch
-    finally:
-        shutil.rmtree(scratch, ignore_errors=False)
+    except BaseException:
+        try:
+            shutil.rmtree(scratch, ignore_errors=False)
+        except OSError as cleanup:
+            _print_scratch_cleanup_failure(err, scratch.name, scratch, str(cleanup))
+        raise  # the original reason, never the cleanup's
+    shutil.rmtree(scratch, ignore_errors=False)
 
 
 def _spent_from_view(view: LedgerView) -> tuple[float, float]:
@@ -1760,7 +1808,7 @@ def main(
         if args.command == "dry-run":
             return cmd_dry_run(args, out, home)
         if args.command == "invoke":
-            return cmd_invoke(args, out, home, popen, killpg)
+            return cmd_invoke(args, out, err, home, popen, killpg)
         if args.command == "run":
             return cmd_run(args, out, err, home, popen, killpg)
         if getattr(args, "campaign_command", None) == "status":
