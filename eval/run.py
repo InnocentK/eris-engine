@@ -1198,7 +1198,13 @@ def _print_scratch_cleanup_failure(
     """The harness's structured stderr line for a scratch that could NOT be
     removed. It is the only channel left when no ledger is open (the writer
     refused) or when the ledger is already gone (the cleanup runs in a
-    ``finally``); it names the scratch path so the leftover can be found."""
+    ``finally``); it names the scratch path so the leftover can be found.
+
+    It NEVER raises. Every caller is already handling a failure, so an error
+    from the reporting itself (a closed stream, a broken pipe) would replace
+    the reason it was called to report - the exact defect this channel exists
+    to prevent. A report that cannot be delivered is dropped, silently and
+    deliberately: there is nowhere left to say so."""
     line: dict[str, Any] = {
         "status": "error",
         "kind": "scratch_cleanup_failed",
@@ -1207,7 +1213,10 @@ def _print_scratch_cleanup_failure(
     }
     if run_id is not None:
         line["run_id"] = run_id
-    print(json.dumps(line), file=err, flush=True)
+    try:
+        print(json.dumps(line), file=err, flush=True)
+    except BaseException:  # noqa: BLE001 - see the docstring: nowhere left to report
+        pass
 
 
 @contextmanager
@@ -1227,7 +1236,7 @@ def _scratch_root(scratch: Path, err: IO[str]) -> Iterator[Path]:
     except BaseException:
         try:
             shutil.rmtree(scratch, ignore_errors=False)
-        except OSError as cleanup:
+        except BaseException as cleanup:  # noqa: BLE001 - the reason outranks it
             _print_scratch_cleanup_failure(err, scratch.name, scratch, str(cleanup))
         raise  # the original reason, never the cleanup's
     shutil.rmtree(scratch, ignore_errors=False)
