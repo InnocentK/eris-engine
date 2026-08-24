@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -47,7 +48,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from eris.launch import KillPg, LaunchRefused, PopenFactory, make_private_dir
+from eris.launch import KillPg, LaunchRefused, PopenFactory, make_private_dir, spawn
 from eris.policy import Policy, sha256_file
 from eris.sanitize import tree_sha256
 from eris.schemas import (
@@ -62,7 +63,12 @@ from eris.schemas import (
     now_ts,
     sha256_hex,
 )
-from eris.verify import GIT_ERIS_GLOBALS, check_command, run_allowlisted
+from eris.verify import (
+    GIT_ERIS_GLOBALS,
+    build_verify_env,
+    check_command,
+    run_allowlisted,
+)
 from eris.writer import BlobRef, RunWriter
 
 PACK_COMMANDS: tuple[tuple[str, ...], ...] = (
@@ -243,38 +249,154 @@ def _record(
 # --------------------------------------------------------------------------- commands
 
 
-# The ONLY paths the verification tripwire ignores. `.git/index` is git's stat
-# cache, not history: a read-only command may rewrite it (M2c defect B - `git
-# status` did, which tripped the guard and refused every later command in the
-# first live run). `.git/index.lock` is the transient file it writes it
-# through. Everything else under `.git` - refs, objects, HEAD, config, hooks -
-# STAYS in the hash, so a command that rewrites history or config is still
-# caught. Excluding `.git` wholesale would hide exactly that.
+# The ONLY paths the verification tripwire ignores BY BYTES. `.git/index` is
+# git's stat cache, not history: a read-only command rewrites it (M2c defect B -
+# `git status` did, which tripped the guard and refused every later command in
+# the first live run; measured again 2026-08-24, `git diff`/`git diff HEAD`
+# refresh it too, with or without `--no-optional-locks`). `.git/index.lock` is
+# the transient file it writes it through.
+#
+# The exclusion is NOT a blind spot any more: the index is covered SEMANTICALLY
+# by :func:`git_index_prober` (a digest of `git ls-files --stage`), which is
+# blind to the stat refresh and sensitive to real staging changes - `git add`
+# and `git rm --cached` both move it (measured 2026-08-24). `git rm --cached`
+# changes NOTHING else in the tree, so without the semantic digest it would be
+# invisible.
+#
+# Everything else under `.git` - refs, objects, HEAD, config, hooks - STAYS in
+# the byte hash, so a command that rewrites history or config is still caught.
+# Excluding `.git` wholesale would hide exactly that.
 GUARD_EXCLUDED_RELPATHS: frozenset[str] = frozenset({".git/index", ".git/index.lock"})
+
+# Eris-internal, FIXED argv. It is deliberately NOT routed through
+# `check_command`/`run_allowlisted`: the model-facing allowlist governs
+# model-proposed requests, and this command is neither proposed nor influenced
+# by a model. (`--stage` is not an allowlisted flag in the repo policy, so
+# routing it there would refuse it.) The pin on the git executable is still
+# enforced here, by hand.
+GIT_INDEX_DIGEST_ARGS: tuple[str, ...] = (*GIT_ERIS_GLOBALS, "ls-files", "--stage")
+
+# What the guard is doing about `.git/index` for a given run.
+INDEX_CHECK_SEMANTIC = "semantic"
+INDEX_CHECK_BYTES_FALLBACK = "bytes_fallback"
+INDEX_CHECK_NONE = "none"  # the copy has no `.git` directory: no index to guard
+
+#: ``(root) -> digest`` of the staged content, or ``None`` when it cannot be
+#: taken (git missing, unpinned, changed since the pin, non-zero exit, timeout).
+IndexProbe = Callable[[Path], str | None]
+
+
+def git_index_prober(
+    policy: Policy,
+    scratch_home: Path,
+    *,
+    popen: PopenFactory = subprocess.Popen,
+    killpg: KillPg = os.killpg,
+    hasher: Callable[[Path], str] = sha256_file,
+    timeout_s: float = 60.0,
+) -> IndexProbe:
+    """An :data:`IndexProbe` over the POLICY-PINNED git, run with
+    :data:`GIT_INDEX_DIGEST_ARGS` and the hardened verification env.
+
+    Returns ``None`` (never raises, never a partial digest) on any doubt; the
+    caller treats that as "fail closed"."""
+
+    def probe(root: Path) -> str | None:
+        spec = policy.verify.commands.get("git")
+        if spec is None or not spec.pinned:
+            return None
+        exe = Path(spec.executable)
+        try:
+            if not exe.is_file():
+                return None
+            real = exe.resolve()
+            if not real.is_file() or hasher(real) != spec.executable_sha256:
+                return None
+            Path(scratch_home).mkdir(parents=True, exist_ok=True)
+            env = build_verify_env(path_env=policy.path_env, scratch_home=Path(scratch_home))
+            result = spawn(
+                [str(real), *GIT_INDEX_DIGEST_ARGS],
+                env=env,
+                cwd=Path(root),
+                timeout_s=timeout_s,
+                max_stdout_bytes=policy.verify.max_output_bytes,
+                max_stderr_bytes=policy.verify.max_output_bytes,
+                popen=popen,
+                killpg=killpg,
+            )
+        except (LaunchRefused, OSError, ValueError):
+            return None
+        if result.exit_code != 0 or result.timed_out or result.stdout_truncated:
+            return None
+        return sha256_hex(result.stdout)
+
+    return probe
 
 
 def _guard_skip(rel: PurePosixPath) -> bool:
     return rel.as_posix() in GUARD_EXCLUDED_RELPATHS
 
 
+@dataclass(frozen=True)
+class GuardChange:
+    """What the tripwire saw. ``reason`` is ``"git_index"`` when the staged
+    content moved and ``"tree"`` otherwise. The index wins when both moved
+    (`git add` writes a loose object AND stages it): it is the more specific
+    and the more security-relevant of the two."""
+
+    reason: str
+    tree_after: str
+    index_digest_after: str | None
+
+
 @dataclass
 class SnapshotGuard:
-    """Tree-hash tripwire over the PRISTINE verification copy: a command
-    that changes it is recorded (``snapshot.violated``, the item's
-    ``violated`` flag) and verification stops for the run.
+    """Tripwire over the PRISTINE verification copy: a command that changes it
+    is recorded (``snapshot.violated``, the item's ``violated`` flag) and
+    verification stops for the run.
 
-    :data:`GUARD_EXCLUDED_RELPATHS` names the only exceptions."""
+    Two halves, because one cannot do the job:
+
+    * a tree hash over every byte except :data:`GUARD_EXCLUDED_RELPATHS`;
+    * a digest of the git index CONTENT (:data:`GIT_INDEX_DIGEST_ARGS`), which
+      is what `git ls-files`, `git diff` and `git status` report against - so
+      an index mutation changes what LATER evidence says.
+
+    Either one moving is a violation. With no usable git the guard FAILS
+    CLOSED: it drops the byte exclusion instead (``index_check ==
+    "bytes_fallback"``) and hashes `.git/index` like any other file, which
+    costs false positives on the stat refresh but never silently skips the
+    check."""
 
     root: Path
     baseline: str
+    index_digest: str | None = None
+    index_check: str = INDEX_CHECK_NONE
+    probe: IndexProbe | None = None
 
     @classmethod
-    def over(cls, root: Path) -> SnapshotGuard:
-        return cls(Path(root), tree_sha256(Path(root), skip=_guard_skip))
+    def over(cls, root: Path, *, probe: IndexProbe | None = None) -> SnapshotGuard:
+        root = Path(root)
+        if not (root / ".git").is_dir():
+            return cls(root, tree_sha256(root, skip=_guard_skip), None, INDEX_CHECK_NONE)
+        digest = probe(root) if probe is not None else None
+        if digest is None:  # fail closed: no semantic cover -> hash the bytes
+            return cls(root, tree_sha256(root), None, INDEX_CHECK_BYTES_FALLBACK)
+        return cls(root, tree_sha256(root, skip=_guard_skip), digest, INDEX_CHECK_SEMANTIC, probe)
 
-    def changed(self) -> str | None:
-        now = tree_sha256(self.root, skip=_guard_skip)
-        return None if now == self.baseline else now
+    @property
+    def _skip(self) -> Callable[[PurePosixPath], bool] | None:
+        return None if self.index_check == INDEX_CHECK_BYTES_FALLBACK else _guard_skip
+
+    def changed(self) -> GuardChange | None:
+        # A probe that stops working mid-run reads as a change, not as a pass.
+        index_now = self.probe(self.root) if self.probe is not None else None
+        tree_now = tree_sha256(self.root, skip=self._skip)
+        if self.index_check == INDEX_CHECK_SEMANTIC and index_now != self.index_digest:
+            return GuardChange("git_index", tree_now, index_now)
+        if tree_now != self.baseline:
+            return GuardChange("tree", tree_now, index_now)
+        return None
 
 
 PYTEST_ISOLATION_FLAGS: tuple[str, ...] = ("-p", "no:cacheprovider")
@@ -289,6 +411,8 @@ class RunOutcome:
     timed_out: bool
     violated: bool = False
     tree_after: str | None = None
+    violation_reason: str | None = None  # "tree" | "git_index"
+    index_digest_after: str | None = None
 
 
 @dataclass
@@ -339,7 +463,9 @@ class VerifyEnv:
             if changed is not None:
                 self.violated = True
                 outcome.violated = True
-                outcome.tree_after = changed
+                outcome.tree_after = changed.tree_after
+                outcome.violation_reason = changed.reason
+                outcome.index_digest_after = changed.index_digest_after
         return outcome
 
 
@@ -361,8 +487,14 @@ def _run_recorded(
             {
                 "argv": outcome.argv,
                 "source": source,
+                # which half of the tripwire moved, and what it is doing about
+                # `.git/index` this run (semantic / bytes_fallback / none)
+                "reason": outcome.violation_reason,
+                "index_check": env.guard.index_check if env.guard else None,
                 "tree_sha256_before": env.guard.baseline if env.guard else None,
                 "tree_sha256_after": outcome.tree_after,
+                "git_index_digest_before": env.guard.index_digest if env.guard else None,
+                "git_index_digest_after": outcome.index_digest_after,
             },
         )
     return outcome

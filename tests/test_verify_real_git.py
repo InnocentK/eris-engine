@@ -16,6 +16,15 @@ This is the second and last test allowed to spawn ``git``
 ``test_snapshot.py::test_snapshot_has_no_future``). It runs the real code
 path - ``build_evidence_pack`` -> ``run_allowlisted`` -> ``spawn`` - against a
 real one-commit repository.
+
+It also pins the M2c follow-up: the tripwire excludes ``.git/index`` BY BYTES
+(measured here on 2026-08-24: on a fresh copy the first command that reads the
+working tree - ``git diff``/``git diff HEAD`` - rewrites it, with or without
+``--no-optional-locks``), and covers it SEMANTICALLY with a digest of
+``git ls-files --stage``. Only a real ``git`` can show that the digest is blind
+to the stat refresh and sensitive to ``git add`` / ``git rm --cached`` - the
+second of which changes NOTHING else in the tree, so without the semantic
+digest it is invisible.
 """
 
 from __future__ import annotations
@@ -30,7 +39,14 @@ from typing import Any
 
 import pytest
 
-from eris.evidence import PACK_COMMANDS, SnapshotGuard, TaskSpec, VerifyEnv, build_evidence_pack
+from eris.evidence import (
+    PACK_COMMANDS,
+    SnapshotGuard,
+    TaskSpec,
+    VerifyEnv,
+    build_evidence_pack,
+    git_index_prober,
+)
 from eris.policy import Policy
 from eris.redact import Redactor
 from eris.sanitize import VERIFICATION_PROFILE, sanitize_snapshot
@@ -90,7 +106,7 @@ def _policy(tmp_path: Path, git: Path) -> Policy:
                     "git": {
                         "executable": str(git),
                         "executable_sha256": hashlib.sha256(git.read_bytes()).hexdigest(),
-                        "subcommands": ["rev-parse", "status", "ls-files", "log"],
+                        "subcommands": ["rev-parse", "status", "ls-files", "log", "diff"],
                         "literal_flags": ["--porcelain", "--oneline", "--no-color"],
                         "value_flags": {"-n": "^[0-9]{1,4}$"},
                         "positional": ["path", "^(HEAD(~[0-9]{1,3})?|[0-9a-f]{7,40})$"],
@@ -100,6 +116,32 @@ def _policy(tmp_path: Path, git: Path) -> Policy:
             },
         }
     )
+
+
+def _verify_env(policy: Policy, repo: Path, scratch_home: Path) -> VerifyEnv:
+    """Exactly what ``eval/run.py`` builds, including the semantic index probe."""
+    return VerifyEnv(
+        policy=policy,
+        snapshot_root=repo,
+        scratch_home=scratch_home,
+        popen=subprocess.Popen,
+        killpg=os.killpg,
+        guard=SnapshotGuard.over(repo, probe=git_index_prober(policy, scratch_home)),
+    )
+
+
+def _git(repo: Path, git: Path, *args: str) -> None:
+    """A raw git, NOT through the allowlist: it stands in for a verification
+    command that mutates the index (which the allowlist cannot reach today -
+    the guard is defence in depth for the day it is wrong or widened)."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(repo.parent / "git-home"),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    subprocess.run([str(git), *args], cwd=repo, env=env, check=True, capture_output=True)
 
 
 def test_the_default_battery_runs_clean_against_a_real_git_repository(tmp_path: Path) -> None:
@@ -113,14 +155,7 @@ def test_the_default_battery_runs_clean_against_a_real_git_repository(tmp_path: 
     repo = tmp_path / "verify-copy"
     sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
     policy = _policy(tmp_path, git)
-    env = VerifyEnv(
-        policy=policy,
-        snapshot_root=repo,
-        scratch_home=tmp_path / "verify-home",
-        popen=subprocess.Popen,
-        killpg=os.killpg,
-        guard=SnapshotGuard.over(repo),
-    )
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
     writer = RunWriter(tmp_path / "runs" / "r", Redactor(), run_id="r").open()
     task = TaskSpec.model_validate(
         {
@@ -167,3 +202,73 @@ def test_the_default_battery_runs_clean_against_a_real_git_repository(tmp_path: 
     assert by_label["git status --porcelain"].content == ""  # a clean tree
     assert set(by_label["git ls-files"].content.split()) == {"README.md", "calc.py"}
     assert "c1" in by_label["git log --oneline -n 20"].content
+
+
+def test_the_battery_plus_a_bare_git_diff_leaves_the_index_guard_quiet(tmp_path: Path) -> None:
+    """M2c index guard (a): with the semantic check armed, the whole default
+    battery AND a bare ``git diff`` - the command measured to rewrite
+    ``.git/index`` on a fresh copy, flag or no flag - run without a
+    violation. This is what the byte exclusion buys and must keep buying."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    baseline_digest = env.guard.index_digest
+
+    index_before = (repo / ".git" / "index").read_bytes()
+    for argv in [*(list(a) for a in PACK_COMMANDS), ["git", "diff"], ["git", "diff", "HEAD"]]:
+        outcome = env.run(argv)
+        assert outcome.violated is False, (argv, outcome.violation_reason)
+        assert outcome.exit_code == 0
+    assert env.violated is False
+    # the stat cache DID churn - which is precisely why it is excluded by bytes
+    assert (repo / ".git" / "index").read_bytes() != index_before
+    # ... and the staged content did not move an inch
+    assert env.guard.index_digest == baseline_digest
+    assert env.guard.changed() is None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "tree_also_moves"),
+    [
+        (("add", "calc.py"), True),  # writes a loose object AND stages it
+        (("rm", "--cached", "-q", "README.md"), False),  # NOTHING else in the tree moves
+    ],
+)
+def test_a_real_staging_change_trips_the_guard_with_reason_git_index(
+    tmp_path: Path, mutation: tuple[str, ...], tree_also_moves: bool
+) -> None:
+    """M2c index guard (b)/(c): ``git add`` and ``git rm --cached`` change what
+    ``git ls-files``/``git diff``/``git status`` report to LATER evidence. Both
+    must trip the tripwire, and both must name the index.
+
+    ``git rm --cached`` is the load-bearing case: it leaves every byte outside
+    ``.git/index`` alone, so the byte hash alone cannot see it at all."""
+    git = _git_executable()
+    source = tmp_path / "snapshot"
+    _make_repo(source, git)
+    repo = tmp_path / "verify-copy"
+    sanitize_snapshot(source, repo, profile=VERIFICATION_PROFILE, worker_id="verify")
+    # modify BEFORE the baseline: the guard must react to the STAGING, not to
+    # the edit (an edit of its own would be a plain `reason: "tree"`)
+    (repo / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b  # edited\n")
+    policy = _policy(tmp_path, git)
+    env = _verify_env(policy, repo, tmp_path / "verify-home")
+    assert env.guard is not None and env.guard.index_check == "semantic"
+    before = env.guard.index_digest
+    assert env.run(["git", "status", "--porcelain"]).violated is False
+
+    _git(repo, git, *mutation)
+
+    outcome = env.run(["git", "status", "--porcelain"])
+    assert outcome.violated is True
+    assert outcome.violation_reason == "git_index"
+    assert outcome.index_digest_after != before
+    assert (outcome.tree_after != env.guard.baseline) is tree_also_moves
+    assert env.violated is True  # verification is stopped for the run
+    with pytest.raises(PermissionError, match="verification is stopped"):
+        env.run(["git", "ls-files"])

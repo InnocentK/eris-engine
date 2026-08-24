@@ -362,12 +362,54 @@ the first invocation), and a symlink that is absolute, dangling or resolves
 outside the tree is dropped and recorded. File set, bytes, FILE AND
 DIRECTORY modes (the copy root included), kept symlink targets and `.git`
 itself are identical; a preserved read-only directory cannot wedge cleanup
-(owner write is restored on retry). `evidence.SnapshotGuard` compares
-the copy's tree hash after every command: a change is recorded
-(`snapshot.violated`, `EvidenceItem.violated`, the item's summary) and
-verification stops for the run; the original's tree hash is recorded in
-`run.started` and asserted unchanged at the end (`run.error
-snapshot_modified`). pytest always carries `-p no:cacheprovider`.
+(owner write is restored on retry). `evidence.SnapshotGuard` compares the
+copy after every command: a change is recorded (`snapshot.violated`,
+`EvidenceItem.violated`, the item's summary) and verification stops for the
+run; the original's tree hash is recorded in `run.started` and asserted
+unchanged at the end (`run.error snapshot_modified`). pytest always carries
+`-p no:cacheprovider`.
+
+The guard has two halves, because one cannot do the job.
+
+**The byte hash** covers every path in the copy except
+`GUARD_EXCLUDED_RELPATHS` = `{.git/index, .git/index.lock}`. That exclusion is
+forced: `.git/index` is git's stat cache, and on a freshly copied tree the
+recorded stat data never matches, so a read-only command rewrites it. Measured
+2026-08-24 on git 2.50.1: with `--no-optional-locks` on every invocation,
+`status --porcelain`, `ls-files`, `ls-files --stage`, `log --oneline`,
+`grep`, `blame`, `show` and `rev-parse` leave the file byte-identical, but the
+first command that reads the working tree against the index (`diff`,
+`diff HEAD`) refreshes it, flag or no flag. Hashing those bytes would trip the
+guard on a legitimate allowlisted command on every run. Everything else under
+`.git` - refs, objects, `HEAD`, `config`, `hooks` - stays in the hash, so a
+command that rewrites history or config is still caught.
+
+**The index digest** closes the hole that exclusion would otherwise open. The
+index is not inert: `git ls-files` reads it directly and `git diff`/`git
+status` compare against it, so a command that mutates it changes what LATER
+evidence reports. The guard therefore also digests
+`git --no-optional-locks ls-files --stage` (mode, blob sha, stage, path for
+every entry) before and after each command. Measured on the same day: the
+digest is stable across every read-only command and across the stat refresh,
+and moves on `git add` and on `git rm --cached`. `git rm --cached` changes
+nothing else in the tree at all, so without this digest it is invisible. Either
+half moving is `snapshot.violated`; the event names which (`reason: "tree"` or
+`"git_index"`, the index winning when both moved, as it does for `git add`) and
+records both digests before and after.
+
+The digest runs on the POLICY-PINNED `git` with a FIXED Eris-internal argv. It
+is deliberately not routed through the model-facing allowlist: it is neither
+proposed nor influenced by a model, and `check_command` would refuse `--stage`
+anyway. The pin is still enforced by hand - an unpinned, missing or
+since-changed binary yields no digest.
+
+If the copy has a `.git` directory and no digest can be taken (git unavailable,
+unpinned, non-zero exit, timeout, truncated output - including a probe that
+stops working part way through a run), the guard FAILS CLOSED: it drops the
+byte exclusion for that run and hashes `.git/index` like any other file, and
+the event records `index_check: "bytes_fallback"`. That costs false positives
+on the stat refresh; it never silently skips the check. A copy with no `.git`
+directory has no index to guard (`index_check: "none"`).
 
 ### The judge never sees the snapshot (item 2)
 The adjudicator/summarizer cwd - and agy's `--add-dir`, codex's `-C` - is an

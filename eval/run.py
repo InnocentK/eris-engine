@@ -57,7 +57,13 @@ from eris.arms import (
 )
 from eris.cache import Cache, CacheUnsupported
 from eris.doctor import run_doctor
-from eris.evidence import SnapshotGuard, TaskSpec, VerifyEnv, verify_scratch
+from eris.evidence import (
+    SnapshotGuard,
+    TaskSpec,
+    VerifyEnv,
+    git_index_prober,
+    verify_scratch,
+)
 from eris.launch import (
     KillPg,
     LaunchRefused,
@@ -933,7 +939,12 @@ def run_cell(
                 scratch_home=scratch_home,
                 popen=h.popen,
                 killpg=h.killpg,
-                guard=SnapshotGuard.over(verify_copy),
+                guard=SnapshotGuard.over(
+                    verify_copy,
+                    # semantic cover for `.git/index`, which the tree hash
+                    # excludes by bytes; no usable git falls back to bytes
+                    probe=git_index_prober(policy, scratch_home, popen=h.popen, killpg=h.killpg),
+                ),
             )
             ctx = StageContext(
                 writer=writer,

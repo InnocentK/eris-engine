@@ -111,6 +111,9 @@ verify:
   max_requests_per_run: 12        # model-proposed evidence requests executed per run
   max_wall_s: 1800                # wall-clock budget for all evidence requests of a run
   commands:
+    # `eris policy pin` must pin git: the pin gates BOTH model-proposed git
+    # commands and the tripwire's internal `ls-files --stage` index digest,
+    # which falls back to hashing `.git/index` bytes without a pinned git.
     git:
       executable: /usr/bin/git
       executable_sha256: UNPINNED
