@@ -530,3 +530,34 @@ Gate: exit 0, 1046 passed, 95.47%, pip-audit clean.
 **Pattern worth noting: three of the last four real defects were found by
 review, not by the gate or by me** - the advisor's replay/false-pairing catch,
 and both stop-gate findings. The suite has been green throughout.
+
+## Third stop-gate finding: the new protocol invariant was undocumented (2026-08-27)
+
+Correct, and it had a second half the flag did not name: **`docs/PROTOCOL.md`
+had become factually WRONG.** I wrote its ACCEPT paragraph after the first H3
+commit, then changed the rule twice (REFUTED counts; the claim must exist) and
+never revised the prose. It still said "an `ACCEPT` with no surviving
+`SUPPORTED` ruling", which describes neither the code nor the intent. That is
+exactly the doc-vs-code drift filed as an Informational finding in this same
+review - repeated, by me, in the fix for it.
+
+Fixed:
+
+- **`docs/PROTOCOL.md`** now states the real rule: an ACCEPT survives only when
+  some ruling survives as `SUPPORTED` **or** `REFUTED` **and** names a claim
+  that exists, with the reason each half is load-bearing.
+- **`docs/INVARIANTS.md`** gained the five missing do-not-break rows, each
+  naming its enforcing test, per AGENTS.md ("INVARIANTS for any new
+  do-not-break rule"): two validator rules (H3 origin, H3 verdict binding),
+  the H2 containment refusal, the defect-C absolute-path rule, and the C1
+  pairing guard.
+- The corrected PAIRED ABLATION row was itself stale - it still named
+  `invocation.reused` as the guard after that was replaced by
+  `stage.finished{stage: propose}.reused`. Fixed.
+
+Verified that all seven tests named in the new rows exist and pass. Gate: exit
+0, 1046 passed, 95.47%, pip-audit clean.
+
+**Running tally: four of five real defects this session came from review, not
+from the gate.** The suite was green for every one. Three came from the
+stop-gate alone (the `env_allow` mandate, the fabricated-claim hole, this).

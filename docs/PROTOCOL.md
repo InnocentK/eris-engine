@@ -136,9 +136,19 @@ Applied by `enforce_rulings` to every adjudication, after the model answers:
   `human_entered` `document_quote`s, so the weaker rule let a claim be
   SUPPORTED by the question that asked about it (`REF_NOT_MECHANICAL`).
 * Three or more cumulative downgrades force the verdict to `ESCALATE`.
-* **The verdict itself must rest on evidence.** An `ACCEPT` with no surviving
-  `SUPPORTED` ruling is forced to `ESCALATE` (`VERDICT_UNSUPPORTED`, 0.4.0).
-  Before this, `{"verdict": "ACCEPT", "rulings": []}` was recorded verbatim,
+* **The verdict itself must rest on evidence.** An `ACCEPT` is forced to
+  `ESCALATE` (`VERDICT_UNSUPPORTED`, 0.4.0) unless at least one ruling
+  **survives enforcement as `SUPPORTED` or `REFUTED` AND names a claim that
+  exists**. Each half is load-bearing:
+  - `REFUTED` counts because if every adverse claim is mechanically refuted the
+    proposed answer IS defensible; demanding `SUPPORTED` would escalate a
+    legitimate ACCEPT.
+  - the claim must exist because a ruling naming a claim nobody made is flagged
+    `CLAIM_MISSING` but deliberately NOT downgraded (its refs were fine), so
+    otherwise a judge could satisfy this whole rule by inventing a claim id and
+    citing real evidence at it.
+
+  Before 0.4.0, `{"verdict": "ACCEPT", "rulings": []}` was recorded verbatim,
   and a judge that self-declared every ruling `UNSUPPORTED` also reached
   ACCEPT - a self-declared `UNSUPPORTED` is not a *downgrade*, so the
   escalation guard never armed. The downgrade rule is applied FIRST, so when
