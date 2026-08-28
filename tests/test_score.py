@@ -815,6 +815,34 @@ def test_pairing_ignores_a_reused_event_whose_replay_was_rejected() -> None:
     cell = SimpleNamespace(view=view, arm_run=SimpleNamespace(propose_keys=[shared, respawned]))
     assert _reused_propose_keys(cell) == [shared]  # NOT both, despite two reused events
 
+    # RESUME: a key can finish twice. A stage whose blob does not re-hash is not
+    # trusted and the worker is re-run, so a stale `reused: True` can sit in the
+    # ledger ahead of the `reused: False` re-spawn that actually produced the
+    # kept proposal. The LAST event wins; "any True" would resurrect the stale
+    # outcome - the same attempt-vs-outcome error, one layer down.
+    view_resume = _View(
+        {
+            "stage.finished": [
+                {"stage": "propose", "idempotency_key": shared, "ok": True, "reused": True},
+                {"stage": "propose", "idempotency_key": shared, "ok": True, "reused": False},
+            ]
+        }
+    )
+    cell_r = SimpleNamespace(view=view_resume, arm_run=SimpleNamespace(propose_keys=[shared]))
+    assert _reused_propose_keys(cell_r) == []
+
+    # and the reverse order: a re-spawn later REPLACED by a genuine cache replay
+    view_resume2 = _View(
+        {
+            "stage.finished": [
+                {"stage": "propose", "idempotency_key": shared, "ok": True, "reused": False},
+                {"stage": "propose", "idempotency_key": shared, "ok": True, "reused": True},
+            ]
+        }
+    )
+    cell_r2 = SimpleNamespace(view=view_resume2, arm_run=SimpleNamespace(propose_keys=[shared]))
+    assert _reused_propose_keys(cell_r2) == [shared]
+
     # a propose that did not finish ok is never counted as shared
     view2 = _View(
         {

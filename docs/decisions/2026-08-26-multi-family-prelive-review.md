@@ -612,3 +612,32 @@ enforcing test could not fail. Four of these rows were invariants whose
 enforcing tests did not test the stated rule. "The named test exists and
 passes" is not evidence; "the named test fails when the rule is removed" is.
 Mutation-check any row added to INVARIANTS.md.
+
+## Fifth stop-gate finding: stale same-key outcomes after resume (2026-08-27)
+
+Correct, and it is the SAME attempt-vs-outcome error the advisor caught,
+one layer further down - in my fix for that very error.
+
+`_reused_propose_keys` collected keys with a set comprehension over every
+`stage.finished{stage: propose}` payload, so **any** event with `reused: True`
+marked the key shared. But a key can finish more than once: on resume a stage
+whose blob does not re-hash is not trusted and the worker is re-run
+(`arms.load_prior`, `test_resume_does_not_trust_a_tampered_blob`). A ledger can
+therefore hold `reused: True` from the first pass followed by `reused: False`
+from the re-spawn that actually produced the kept proposal - and the union would
+resurrect the stale outcome and report a pairing that did not happen.
+
+Fixed: the LAST `stage.finished` per idempotency key wins, and it must carry
+both `ok` and `reused`. The test now covers both orderings (stale True then
+False -> not shared; False then a genuine later replay -> shared) as well as the
+`ok: False` case. Mutation-checked: restoring the "any True" comprehension makes
+it fail. The INVARIANTS row states the last-wins rule.
+
+Gate: exit 0, 1048 passed, 95.50%, pip-audit clean.
+
+**Three times now the same error in the same fix**: pairing keyed on
+`invocation.reused` (an attempt) -> keyed on any `stage.finished.reused` (still
+an attempt when a key finishes twice) -> keyed on the last one (the outcome).
+When a guard asks "did X happen?", the answer must come from the FINAL state of
+X, and every ledger read must ask whether the event it reads can occur more than
+once per key.

@@ -409,12 +409,19 @@ def _reused_propose_keys(cell: CellData) -> list[str]:
     (`stages.invoke`). Pairing on the attempt rather than the outcome would
     report `paired: true` for a re-spawned proposal - the exact confound C1
     exists to prevent."""
+    # LAST event per key wins. A key can finish more than once: on resume a
+    # stage whose blob does not re-hash is NOT trusted and the worker is re-run
+    # (`arms.load_prior`, `test_resume_does_not_trust_a_tampered_blob`), so a
+    # ledger can hold `reused: True` from the first pass and `reused: False`
+    # from the re-spawn that replaced it. Taking "any True" would resurrect the
+    # stale outcome - the same attempt-vs-outcome error this guard exists to
+    # prevent, one layer down.
+    last: dict[str, dict[str, Any]] = {}
+    for p in cell.view.payloads("stage.finished"):
+        if p.get("stage") == "propose" and "idempotency_key" in p:
+            last[str(p["idempotency_key"])] = p
     return sorted(
-        {
-            str(p["idempotency_key"])
-            for p in cell.view.payloads("stage.finished")
-            if p.get("stage") == "propose" and p.get("ok") and p.get("reused") is True
-        }
+        {k for k, p in last.items() if p.get("ok") and p.get("reused") is True}
         & set(cell.arm_run.propose_keys)
     )
 
