@@ -770,3 +770,59 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
         for p in paired_deltas([cell("indep_verify", both), cell("indep_verify_critique", both)])
     }
     assert out["4-3"]["paired"] is True and out["4-3"]["delta_recall"] == 0.0
+
+
+def test_pairing_ignores_a_reused_event_whose_replay_was_rejected() -> None:
+    """C1, advisor finding: pair on the outcome KEPT, not on an attempt.
+
+    `stages.invoke` writes `invocation.reused` the moment a cache hit is
+    replayed. If that replayed output then fails to parse it writes
+    `stage.output_rejected` and falls through to a FRESH spawn. A ledger can
+    therefore hold `invocation.reused` for a proposal that was re-spawned, and
+    pairing on that event would report `paired: true` for two arms that did not
+    share a world - the exact confound C1 exists to prevent.
+
+    This exercises `_reused_propose_keys` against that adversarial ledger shape;
+    the other C1 test builds `CellScore` directly and so never reaches it.
+    """
+    from types import SimpleNamespace
+
+    from eval.score import _reused_propose_keys
+
+    shared, respawned = "a" * 64, "b" * 64
+
+    class _View:
+        def __init__(self, payloads: dict[str, list[dict[str, Any]]]) -> None:
+            self._p = payloads
+
+        def payloads(self, kind: str) -> list[dict[str, Any]]:
+            return self._p.get(kind, [])
+
+    view = _View(
+        {
+            # BOTH proposals were replayed from cache...
+            "invocation.reused": [
+                {"invocation_id": f"inv-{shared[:16]}-a1", "reused_from": "inv-x-a1"},
+                {"invocation_id": f"inv-{respawned[:16]}-a1", "reused_from": "inv-y-a1"},
+            ],
+            # ...but only one replay survived; the other was rejected and re-spawned
+            "stage.finished": [
+                {"stage": "propose", "idempotency_key": shared, "ok": True, "reused": True},
+                {"stage": "propose", "idempotency_key": respawned, "ok": True, "reused": False},
+            ],
+        }
+    )
+    cell = SimpleNamespace(view=view, arm_run=SimpleNamespace(propose_keys=[shared, respawned]))
+    assert _reused_propose_keys(cell) == [shared]  # NOT both, despite two reused events
+
+    # a propose that did not finish ok is never counted as shared
+    view2 = _View(
+        {
+            "invocation.reused": [{"invocation_id": f"inv-{shared[:16]}-a1", "reused_from": "z"}],
+            "stage.finished": [
+                {"stage": "propose", "idempotency_key": shared, "ok": False, "reused": True}
+            ],
+        }
+    )
+    cell2 = SimpleNamespace(view=view2, arm_run=SimpleNamespace(propose_keys=[shared]))
+    assert _reused_propose_keys(cell2) == []

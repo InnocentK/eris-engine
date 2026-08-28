@@ -1962,3 +1962,13 @@ def test_paths_handed_to_a_worker_must_be_absolute(tmp_path: Path) -> None:
                 tmpdir="cache/scratch/x/tmp",
             )
         )
+    with pytest.raises(LaunchRefused, match="home .* must be absolute"):
+        plan_call(
+            make_call(
+                tmp_path,
+                codex,
+                schema={"type": "object"},
+                scratch_dir=tmp_path / "s",
+                home="relative/home",
+            )
+        )

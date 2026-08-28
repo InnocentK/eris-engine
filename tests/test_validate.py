@@ -591,3 +591,33 @@ def test_a_fabricated_claim_id_cannot_satisfy_the_accept_rule() -> None:
         EVIDENCE,
     )
     assert enforced.verdict is Verdict.ACCEPT
+
+
+def test_accept_may_rest_on_a_mechanically_refuted_ruling_alone() -> None:
+    """H3, advisor finding: `REFUTED` satisfies the ACCEPT rule.
+
+    If every adverse claim is mechanically REFUTED the proposed answer IS
+    defensible, so demanding a SUPPORTED ruling would escalate a legitimate
+    ACCEPT. This is the half of the verdict rule that the other H3 tests, which
+    only exercise SUPPORTED, do not cover.
+    """
+    refuted = Ruling(claim_id="c_01", status=ClaimStatus.REFUTED, evidence_refs=["e_01"])
+    enforced, findings = enforce_rulings(
+        adjudication([refuted], verdict=Verdict.ACCEPT), CLAIMS, EVIDENCE
+    )
+    assert enforced.rulings[0].status is ClaimStatus.REFUTED  # survived enforcement
+    assert "VERDICT_UNSUPPORTED" not in codes(findings)
+    assert enforced.verdict is Verdict.ACCEPT
+
+    # but a REFUTED ruling that was DOWNGRADED cannot prop up ACCEPT
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [Ruling(claim_id="c_01", status=ClaimStatus.REFUTED, evidence_refs=["ghost"])],
+            verdict=Verdict.ACCEPT,
+        ),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert enforced.rulings[0].status is ClaimStatus.UNSUPPORTED
+    assert "VERDICT_UNSUPPORTED" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE

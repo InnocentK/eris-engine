@@ -561,3 +561,54 @@ Verified that all seven tests named in the new rows exist and pass. Gate: exit
 **Running tally: four of five real defects this session came from review, not
 from the gate.** The suite was green for every one. Three came from the
 stop-gate alone (the `env_allow` mandate, the fabricated-claim hole, this).
+
+## Fourth stop-gate finding: the invariant rows claimed coverage they did not have (2026-08-27)
+
+Correct on four counts. I had verified that each named test EXISTS and PASSES -
+which is not the same as verifying it tests the rule the row states. The gaps:
+
+1. The launcher row claimed `scratch_dir`, `tmpdir` **and `home`** are refused
+   when relative. `home` was never exercised: the HOME check was added on the
+   advisor's finding AFTER the test was written, and nothing was added to cover
+   it.
+2. The verdict row claimed `REFUTED` counts toward ACCEPT. Nothing tested it -
+   every H3 test used SUPPORTED. That half of the rule was implemented on the
+   advisor's finding and shipped untested.
+3. The scorer row claimed pairing reads `stage.finished{stage: propose}.reused`
+   from the ledger. `_reused_propose_keys` - the function that does the reading,
+   and the whole point of the C1 fix - had **no test**: the C1 scorer test
+   builds `CellScore` objects directly and never reaches it.
+4. `test_a_rejected_cache_replay_is_not_recorded_as_reused` **never exercised a
+   rejected cache replay.** It ran an ordinary propose and asserted
+   `reused is False`. The name asserted a guarantee the body did not test - the
+   precise failure mode C1 itself was.
+
+Fixed: the HOME case added; `test_accept_may_rest_on_a_mechanically_refuted_ruling_alone`
+(which also asserts a DOWNGRADED refuted ruling cannot prop up ACCEPT);
+`test_pairing_ignores_a_reused_event_whose_replay_was_rejected`, which drives
+`_reused_propose_keys` against the adversarial ledger shape - two
+`invocation.reused` events where only one replay survived - and asserts only the
+surviving key counts; and the mis-named stages test renamed to
+`test_propose_stage_finished_records_whether_the_kept_proposal_was_reused`,
+with a docstring pointing at where the adversarial case is actually covered.
+
+**Every 0.4.0 invariant test was then mutation-checked** - the rule was removed
+and the test re-run - to prove it can fail:
+
+| Rule removed | Result |
+|---|---|
+| HOME must be absolute | FAILS (good) |
+| REFUTED satisfies ACCEPT | FAILS (good) |
+| claim must EXIST | FAILS (good) |
+| containment refused at load | FAILS (good) |
+| mechanically_observed only | FAILS (good) |
+| pairing reads the kept outcome | FAILS (good) |
+
+All 9 tests named across the 5 rows verified to resolve to real functions.
+Gate: exit 0, 1048 passed, 95.49%, pip-audit clean.
+
+**This is the same defect as C1, one level up.** C1 was an invariant whose
+enforcing test could not fail. Four of these rows were invariants whose
+enforcing tests did not test the stated rule. "The named test exists and
+passes" is not evidence; "the named test fails when the rule is removed" is.
+Mutation-check any row added to INVARIANTS.md.

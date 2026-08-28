@@ -1002,16 +1002,14 @@ def test_claim_revised_at_is_the_invocations_finished_at(tmp_path: Path) -> None
     w2.writer.close()
 
 
-def test_a_rejected_cache_replay_is_not_recorded_as_reused(tmp_path: Path) -> None:
-    """C1, advisor finding: `invocation.reused` alone does NOT prove the kept
-    proposal came from the cache.
-
-    `invoke` writes `invocation.reused` as soon as a hit is replayed. If that
-    replayed output then fails to parse it writes `stage.output_rejected` and
-    falls through to a FRESH spawn - so the ledger holds a `reused` event for a
-    proposal that was actually re-spawned. The scorer pairs arms on
-    `stage.finished{stage: propose}.reused`, which describes the outcome kept,
-    so that field must be False here.
+def test_propose_stage_finished_records_whether_the_kept_proposal_was_reused(
+    tmp_path: Path,
+) -> None:
+    """C1: `stage.finished{stage: propose}` carries the `reused` flag the scorer
+    pairs on. This covers the FRESH-SPAWN case only (reused is False); the
+    adversarial case - a ledger that holds `invocation.reused` for a replay that
+    was then rejected and re-spawned - is covered where the guard actually lives,
+    in `test_score.py::test_pairing_ignores_a_reused_event_whose_replay_was_rejected`.
     """
     w = World(tmp_path, {("grok", "propose"): [GOOD_PROPOSAL]})
     out, prop = run_propose(w.ctx, "grok", w.pack)
