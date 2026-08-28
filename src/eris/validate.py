@@ -244,8 +244,15 @@ def enforce_rulings(
     # A REFUTED ruling counts: if every adverse claim was mechanically REFUTED,
     # the answer IS defensible and ACCEPT is well founded. Only rulings that
     # SURVIVED enforcement qualify - anything downgraded is now UNSUPPORTED.
+    #
+    # `r.claim_id in claims` is load-bearing: a ruling naming a claim NOBODY
+    # MADE is flagged CLAIM_MISSING but is deliberately NOT downgraded (its refs
+    # were fine), so without this test a judge could satisfy the whole rule by
+    # inventing a claim id and citing real evidence at it - an ACCEPT resting on
+    # a fabricated claim. A ruling about nothing supports nothing.
     if verdict is Verdict.ACCEPT and not any(
-        r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED) for r in new_rulings
+        r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED) and r.claim_id in claims
+        for r in new_rulings
     ):
         findings.append(
             _err(

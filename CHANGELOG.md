@@ -19,6 +19,10 @@ recorded before this version may score differently.
   runs FIRST so it keeps its own `ESCALATED` finding when both apply.
   Fired on its first live run: 4x `REF_NOT_MECHANICAL`, the judge having cited
   the question to support four claims.
+  The ACCEPT rule counts a ruling only when its claim EXISTS: a ruling naming a
+  claim nobody made is flagged `CLAIM_MISSING` but deliberately not downgraded
+  (its refs were fine), so without that test a judge could satisfy the whole
+  rule by inventing a claim id and citing real evidence at it.
 * **C1 (Critical) - the paired ablation no longer claims pairings it does not
   have.** Sharing across arms 3/3b/4 happens ONLY through the call cache, and
   `Cache.lookup` refuses any entry without `model_executed`, which

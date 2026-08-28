@@ -500,3 +500,33 @@ shell - accepted E1 posture), the two advisor items above, and the `env_allow`
 "required vs may" design gap. Critique is now proven live; the paired ablation
 is honest but codex/agy still cannot share proposals, so default-panel 3b-3 and
 4-3 pairs will correctly report `paired: false` until that is solved.
+
+## Second stop-gate finding, and it was right again (2026-08-27)
+
+"H3 can still ACCEPT a fabricated claim ID." **Confirmed by running it**, and it
+was a hole in the H3 fix itself, not in the original code:
+
+    rulings=[Ruling(claim_id="clm-deadbeef-9", status=SUPPORTED,
+                    evidence_refs=["e_01"])]      # e_01 IS mechanically observed
+    -> findings: ['CLAIM_MISSING']   ruling: SUPPORTED   VERDICT: ACCEPT
+
+A ruling naming a claim nobody made is flagged `CLAIM_MISSING` but is
+deliberately NOT downgraded - its refs were fine (`test_claim_missing`, a
+pre-existing documented decision, recorded as a Low in this review). H3's new
+rule asked only for "a surviving SUPPORTED/REFUTED ruling", so a judge could
+satisfy the entire evidence-binding guarantee by inventing a claim id and
+citing genuine evidence at it. ACCEPT would rest on a claim that does not exist.
+
+Fixed: the ACCEPT rule now requires the ruling's claim to EXIST
+(`r.claim_id in claims`). Same input now yields
+`['CLAIM_MISSING', 'VERDICT_UNSUPPORTED']` and `ESCALATE`. The ruling is still
+not downgraded - that documented behaviour is unchanged; it simply cannot prop
+up a verdict. Test:
+`test_a_fabricated_claim_id_cannot_satisfy_the_accept_rule`, which also asserts
+that one real evidenced ruling alongside the ghost still yields ACCEPT.
+
+Gate: exit 0, 1046 passed, 95.47%, pip-audit clean.
+
+**Pattern worth noting: three of the last four real defects were found by
+review, not by the gate or by me** - the advisor's replay/false-pairing catch,
+and both stop-gate findings. The suite has been green throughout.

@@ -562,3 +562,32 @@ def test_accept_without_a_supported_ruling_is_escalated() -> None:
         EVIDENCE,
     )
     assert enforced.verdict is Verdict.ACCEPT and codes(findings) == []
+
+
+def test_a_fabricated_claim_id_cannot_satisfy_the_accept_rule() -> None:
+    """H3, stop-gate finding: the ACCEPT rule must rest on a REAL claim.
+
+    A ruling naming a claim nobody made is flagged CLAIM_MISSING but is
+    deliberately NOT downgraded (see `test_claim_missing`: its refs were fine).
+    So a judge could invent a claim id, cite genuine mechanically_observed
+    evidence at it, and that ruling would satisfy "ACCEPT needs a surviving
+    evidenced ruling" - an ACCEPT resting on a claim that does not exist.
+    """
+    ghost = Ruling(claim_id="clm-deadbeef-9", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+    enforced, findings = enforce_rulings(
+        adjudication([ghost], verdict=Verdict.ACCEPT), CLAIMS, EVIDENCE
+    )
+    assert "CLAIM_MISSING" in codes(findings)
+    assert "VERDICT_UNSUPPORTED" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE
+    # the ruling itself is still not downgraded - that is the documented
+    # behaviour of test_claim_missing; it simply cannot prop up a verdict
+    assert enforced.rulings[0].status is ClaimStatus.SUPPORTED
+
+    # one real evidenced ruling alongside the ghost is enough for ACCEPT
+    enforced, _ = enforce_rulings(
+        adjudication([ghost, supported(refs=["e_01"])], verdict=Verdict.ACCEPT),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert enforced.verdict is Verdict.ACCEPT
