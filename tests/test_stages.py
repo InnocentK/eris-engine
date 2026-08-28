@@ -811,9 +811,13 @@ def test_summarizer_uses_its_own_prompt_file_and_records_raw_and_enforced(tmp_pa
     )
     assert res.raw is not None and res.enforced is not None
     assert res.raw.verdict is Verdict.ACCEPT and res.raw.downgrades == 0
-    assert (
-        res.enforced.downgrades == 2 and res.enforced.verdict is Verdict.ACCEPT
-    )  # 2 < 3: no escalation
+    # H3 (2026-08-27): 2 < ESCALATE_AT, so the downgrade rule alone would have
+    # let this stand - an ACCEPT whose every ruling was downgraded, i.e. with no
+    # SUPPORTED ruling left. That is exactly the hole H3 closes, and this
+    # fixture is a live example of it.
+    assert res.enforced.downgrades == 2
+    assert res.enforced.verdict is Verdict.ESCALATE and res.enforced.escalated_by_engine
+    assert any(f.code == "VERDICT_UNSUPPORTED" for f in res.findings)
     call = [c for c in w.spy.calls if c.stage is Stage.SUMMARIZE][0]
     assert "SUMMARIZER" in call.prompt and call.policy.tools == []
     w.writer.close()
@@ -996,3 +1000,27 @@ def test_claim_revised_at_is_the_invocations_finished_at(tmp_path: Path) -> None
     assert prop2.claims[0].revised_at == out.invocation.finished_at
     assert canonical_bytes(prop2) == fresh
     w2.writer.close()
+
+
+def test_a_rejected_cache_replay_is_not_recorded_as_reused(tmp_path: Path) -> None:
+    """C1, advisor finding: `invocation.reused` alone does NOT prove the kept
+    proposal came from the cache.
+
+    `invoke` writes `invocation.reused` as soon as a hit is replayed. If that
+    replayed output then fails to parse it writes `stage.output_rejected` and
+    falls through to a FRESH spawn - so the ledger holds a `reused` event for a
+    proposal that was actually re-spawned. The scorer pairs arms on
+    `stage.finished{stage: propose}.reused`, which describes the outcome kept,
+    so that field must be False here.
+    """
+    w = World(tmp_path, {("grok", "propose"): [GOOD_PROPOSAL]})
+    out, prop = run_propose(w.ctx, "grok", w.pack)
+    assert prop is not None and out.reused is False
+    finished = [
+        e["payload"]
+        for e in w.events()
+        if e["kind"] == "stage.finished" and e["payload"].get("stage") == "propose"
+    ]
+    assert finished and finished[-1]["reused"] is False
+    assert finished[-1]["idempotency_key"] == out.key
+    w.writer.close()

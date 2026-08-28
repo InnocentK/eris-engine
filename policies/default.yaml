@@ -1,7 +1,11 @@
 # Eris policy: declared workers, allowlists, budgets, vendors.
 #
 # - NO secrets here (a secret-shaped value refuses the load). Secrets go in .env;
-#   `env_allow` lists the NAMES that may be passed to a worker.
+#   `env_allow` lists the NAMES passed to a worker. Declaring a name makes it
+#   REQUIRED: if it is absent from .env the worker is REFUSED at launch
+#   ("env_allow names not provided"), it is not silently skipped
+#   (`launch.plan_call`, `test_launch.py::test_plan_call_builds_argv_env_cwd_...`).
+#   So a name declared here must exist on EVERY host that runs this policy.
 # - `executable_sha256: UNPINNED` is a placeholder. Run `eris policy pin` to
 #   write machine-specific hashes to policies/pins.yaml (gitignored). Unpinned
 #   workers load but are refused at launch.
@@ -80,6 +84,18 @@ workers:
     timeout_s: 600
     max_stdout_bytes: 10000000
     sanitize_snapshot: true       # E1: repo instruction injection observed once; strip the files
+    # REQUIRED, not optional: declaring a name here makes it mandatory on every
+    # host (see the header). Without XAI_API_KEY in .env grok is REFUSED at
+    # launch: "policy_terminal: status refused: env_allow names not provided:
+    # ['XAI_API_KEY']". Verified 2026-08-27, both directions.
+    # Verified on THIS machine (M2c live run): grok reads XAI_API_KEY,
+    # ~/.grok/auth.json is absent, and without it the from-{} env yields
+    # "Not signed in" - the same class as the USER defect.
+    # PORTABILITY (M2c-2): this is a machine-specific credential requirement in
+    # a TRACKED policy - the same wart as the absolute verify executables below.
+    # A host where grok authenticates another way (`grok login --device-code`
+    # implies a stored token; UNVERIFIED) must remove this line or add the key.
+    env_allow: [XAI_API_KEY]
   agy:                            # Antigravity CLI 1.1.18 (Google lineage; `gemini` CLI is gone)
     transport: cli
     cli: agy

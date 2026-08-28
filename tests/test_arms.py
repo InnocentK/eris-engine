@@ -418,8 +418,12 @@ def test_consensus_records_raw_and_enforced_and_summarizer_role(tmp_path: Path) 
     raw = view.last("adjudication.raw")
     enforced = view.last("adjudication.enforced")
     assert raw is not None and enforced is not None
-    assert raw["verdict"] == "ACCEPT" == enforced["verdict"]  # 1 downgrade: no escalation
+    # H3 (2026-08-27): the single ruling was downgraded, so the enforced record
+    # has no SUPPORTED ruling; an ACCEPT resting on nothing is now ESCALATE even
+    # though 1 < ESCALATE_AT.
+    assert raw["verdict"] == "ACCEPT" and enforced["verdict"] == "ESCALATE"
     assert enforced["downgrades"] == 1 and raw["downgrades"] == 0
+    assert enforced["escalated_by_engine"] is True
     assert record.final_adjudication_id == enforced["adjudication_id"]
     call = [c for c in fleet.spy.calls if c.stage is Stage.SUMMARIZE][0]
     assert "SUMMARIZER" in call.prompt and call.policy.tools == []

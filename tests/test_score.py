@@ -475,7 +475,13 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
 
 
 def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
-    def cell(arm: str, keys: list[str], included: bool = True, recall: float | None = 0.5) -> Any:
+    def cell(
+        arm: str,
+        keys: list[str],
+        included: bool = True,
+        recall: float | None = 0.5,
+        reused: list[str] | None = None,
+    ) -> Any:
         from eval.score import CellScore
 
         return CellScore(
@@ -507,6 +513,9 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             wall_ms=1,
             attempts=1,
             propose_keys=keys,
+            # default: every propose call was replayed from cache, i.e. the
+            # arms really did share a world (C1)
+            propose_reused_keys=list(keys) if reused is None else reused,
             contaminated=False,
             scan_incomplete=False,
             rescan_contaminated=False,
@@ -681,3 +690,83 @@ def test_the_repo_plumbing_control_task_is_marked_unscored() -> None:
     task_file = Path(__file__).resolve().parents[1] / "eval" / "corpus" / "plumbing-control"
     spec = TaskSpec.model_validate_json((task_file / "task.json").read_bytes())
     assert spec.task_id == "plumbing-control" and spec.scored is False
+
+
+def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> None:
+    """C1: identical propose_keys do NOT prove shared proposals.
+
+    The key excludes worker output, and `Cache.lookup` refuses any entry without
+    `model_executed` - which `parse_codex`/`parse_agy` never populate. So with
+    the default panel those two workers are re-spawned by every arm and return
+    DIFFERENT text while the keys stay identical. The scorer used to call that
+    `paired: true` and emit deltas confounded with proposal variance.
+
+    This test drives the production value the old ablation test could not: a
+    treatment arm whose propose calls were NOT replayed from cache.
+    """
+    from eval.score import CellScore
+
+    def cell(arm: str, reused: list[str]) -> Any:
+        return CellScore(
+            run_id=f"r-{arm}",
+            task_id="t",
+            arm=arm,
+            repeat_index=0,
+            category="control",
+            included=True,
+            exclusion=None,
+            verdict="REVISE",
+            verdict_basis="enforced",
+            precision=0.5,
+            recall=0.5,
+            tp=1,
+            fp=1,
+            fn=1,
+            distractor_hits=0,
+            unsupported_claim_rate=0.0,
+            downgrades=0,
+            confident_wrong=False,
+            abstained=False,
+            expected_abstain=False,
+            cost_spent_usd=1.0,
+            cost_attributed_usd=1.0,
+            cost_by_stage_spent={},
+            cost_by_stage_attributed={},
+            unknown_cost_records=0,
+            wall_ms=1,
+            attempts=1,
+            propose_keys=["a" * 64, "b" * 64],
+            propose_reused_keys=reused,
+            contaminated=False,
+            scan_incomplete=False,
+            rescan_contaminated=False,
+            containment=None,
+        )
+
+    both = ["a" * 64, "b" * 64]
+    # codex/agy case: one of the two proposers was re-spawned, not replayed
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [cell("indep_verify", both), cell("indep_verify_critique", ["a" * 64])]
+        )
+    }
+    assert out["4-3"]["paired"] is False
+    assert "proposals not shared" in out["4-3"]["reason"]
+    assert "1 of 2" in out["4-3"]["reason"]
+    assert out["4-3"]["unshared_propose_keys"] == ["b" * 64]
+    assert "delta_recall" not in out["4-3"]  # no delta is emitted for an unpaired cell
+
+    # nothing replayed at all
+    out = {
+        p["pair"]: p
+        for p in paired_deltas([cell("indep_verify", both), cell("indep_verify_iter", [])])
+    }
+    assert out["3b-3"]["paired"] is False and "2 of 2" in out["3b-3"]["reason"]
+
+    # genuine sharing still pairs
+    out = {
+        p["pair"]: p
+        for p in paired_deltas([cell("indep_verify", both), cell("indep_verify_critique", both)])
+    }
+    assert out["4-3"]["paired"] is True and out["4-3"]["delta_recall"] == 0.0

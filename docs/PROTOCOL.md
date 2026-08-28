@@ -127,11 +127,22 @@ Applied by `enforce_rulings` to every adjudication, after the model answers:
 
 * Each claim gets one of `SUPPORTED | REFUTED | CONTESTED | UNSUPPORTED`.
 * A `SUPPORTED` or `REFUTED` ruling is **downgraded to `UNSUPPORTED`** when it
-  cites no evidence, or when any cited evidence is missing, is
-  `model_asserted`, or (for `phase=verification` evidence only) was created
-  before the claim's current revision. Evidence-pack items legitimately
+  cites no evidence, or when any cited evidence is missing, is **not
+  `mechanically_observed`**, or (for `phase=verification` evidence only) was
+  created before the claim's current revision. Evidence-pack items legitimately
   predate every proposal and are never "stale".
+  Since 0.4.0 the origin rule is `mechanically_observed` ONLY, not merely "not
+  `model_asserted`": the pack carries the task question and any plan text as
+  `human_entered` `document_quote`s, so the weaker rule let a claim be
+  SUPPORTED by the question that asked about it (`REF_NOT_MECHANICAL`).
 * Three or more cumulative downgrades force the verdict to `ESCALATE`.
+* **The verdict itself must rest on evidence.** An `ACCEPT` with no surviving
+  `SUPPORTED` ruling is forced to `ESCALATE` (`VERDICT_UNSUPPORTED`, 0.4.0).
+  Before this, `{"verdict": "ACCEPT", "rulings": []}` was recorded verbatim,
+  and a judge that self-declared every ruling `UNSUPPORTED` also reached
+  ACCEPT - a self-declared `UNSUPPORTED` is not a *downgrade*, so the
+  escalation guard never armed. The downgrade rule is applied FIRST, so when
+  both apply the record keeps its `ESCALATED` finding.
   (Swapping the adjudicator lineage once before escalating is Milestone 2.)
 * "All models agree" with no evidence is `UNSUPPORTED`. Agreement is weak
   evidence; tool output, tests, repository facts and upstream documentation

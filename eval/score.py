@@ -384,12 +384,39 @@ class CellScore:
     wall_ms: int | None
     attempts: int
     propose_keys: list[str]
+    # C1 (2026-08-27): the propose keys whose invocation was actually SERVED
+    # FROM CACHE. Key equality alone does NOT mean two arms shared proposals -
+    # the key excludes worker output, and codex/agy report no `model_executed`
+    # so `Cache.lookup` refuses them and every arm re-spawns them with
+    # different text. Pairing needs positive evidence of sharing, not identical
+    # inputs.
+    propose_reused_keys: list[str]
     contaminated: bool
     scan_incomplete: bool
     rescan_contaminated: bool
     containment: str | None
     containment_basis: str = CONTAINMENT_BASIS
     missing_cells: list[dict[str, str]] = field(default_factory=list)
+
+
+def _reused_propose_keys(cell: CellData) -> list[str]:
+    """Propose keys whose KEPT proposal came from the cache.
+
+    Read from `stage.finished{stage: "propose"}`, which describes the outcome
+    that was actually used. An `invocation.reused` event is NOT sufficient: a
+    replayed cache hit whose output fails to parse writes `invocation.reused`,
+    then `stage.output_rejected`, then falls through to a FRESH spawn
+    (`stages.invoke`). Pairing on the attempt rather than the outcome would
+    report `paired: true` for a re-spawned proposal - the exact confound C1
+    exists to prevent."""
+    return sorted(
+        {
+            str(p["idempotency_key"])
+            for p in cell.view.payloads("stage.finished")
+            if p.get("stage") == "propose" and p.get("ok") and p.get("reused") is True
+        }
+        & set(cell.arm_run.propose_keys)
+    )
 
 
 def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellScore:
@@ -491,6 +518,7 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         wall_ms=wall,
         attempts=totals.attempts,
         propose_keys=list(ar.propose_keys),
+        propose_reused_keys=_reused_propose_keys(cell),
         contaminated=contaminated,
         scan_incomplete=scan_incomplete,
         rescan_contaminated=rescanned.contaminated,
@@ -562,9 +590,22 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
             if s_treat is None:
                 continue
             entry: dict[str, Any] = {"pair": label, "task_id": task_id, "repeat_index": repeat}
+            unshared = sorted(set(s_treat.propose_keys) - set(s_treat.propose_reused_keys))
             if sorted(s_treat.propose_keys) != sorted(s_base.propose_keys):
                 entry["paired"] = False
                 entry["reason"] = "propose_keys differ"
+            elif unshared:
+                # C1: identical keys, but the treatment arm RE-SPAWNED these
+                # proposers instead of replaying the base arm's proposals, so
+                # the two arms did not share a world and any delta between them
+                # is confounded with proposal variance. Refuse to call it paired.
+                entry["paired"] = False
+                entry["reason"] = (
+                    f"proposals not shared: {len(unshared)} of "
+                    f"{len(s_treat.propose_keys)} propose calls were re-spawned, "
+                    "not replayed from cache (no invocation.reused)"
+                )
+                entry["unshared_propose_keys"] = unshared
             elif not (s_treat.included and s_base.included):
                 entry["paired"] = False
                 entry["reason"] = f"excluded: {s_treat.exclusion or s_base.exclusion}"

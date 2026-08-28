@@ -293,7 +293,7 @@ def cmd_invoke(
     env_values = _read_env_values(Path(args.env_file))
     creds = load_credential_values(_credential_paths(loaded, home))  # raises if unparsable
     redactor = Redactor(list(env_values.values()) + creds.values)
-    scratch_root = Path(loaded.policy.scratch_dir)
+    scratch_root = Path(loaded.policy.scratch_dir).resolve()  # defect C: never relative
     if _is_under(scratch_root, Path(args.runs_dir)):
         raise LaunchRefused(f"scratch_dir {scratch_root} must not be under the runs dir")
     sweep_scratch(
@@ -481,7 +481,14 @@ class Harness:
 
     @property
     def scratch_dir(self) -> Path:
-        return Path(self.policy.scratch_dir)
+        """ABSOLUTE. The policy may declare a relative path (default
+        ``cache/scratch``); it is resolved against the HARNESS's cwd here,
+        once. Worker subprocesses run with cwd = the snapshot, so any relative
+        path that reached a worker's argv or env would resolve against the
+        SNAPSHOT and point at nothing - that is defect C (2026-08-27): codex
+        got ``--output-schema cache/scratch/.../schema.json``, could not read
+        it, and died before emitting a single JSONL event."""
+        return Path(self.policy.scratch_dir).resolve()
 
     def sweep(self, exclude: Sequence[str]) -> list[str]:
         """Sweep orphaned scratch, always naming the run ids of THIS command so
@@ -632,7 +639,9 @@ def load_harness(
     runs_dir = Path(getattr(args, "runs_dir", None) or loaded.policy.runs_dir)
     cache: Cache | None = None
     if not getattr(args, "no_cache", False):
-        cache_dir = Path(getattr(args, "cache_dir", None) or loaded.policy.cache_dir)
+        # resolve(): same reason as Harness.scratch_dir - a relative cache dir
+        # must never reach a worker, whose cwd is the snapshot (defect C).
+        cache_dir = Path(getattr(args, "cache_dir", None) or loaded.policy.cache_dir).resolve()
         try:
             cache = Cache(
                 cache_dir,

@@ -76,6 +76,7 @@ CODES: frozenset[str] = frozenset(
     {
         "REF_MISSING",
         "REF_MODEL_ASSERTED",
+        "REF_NOT_MECHANICAL",  # H3 (2026-08-27)
         "REF_PREDATES_CLAIM",
         "SUPPORTED_WITHOUT_REFS",
         "REFUTED_WITHOUT_REFS",
@@ -89,6 +90,7 @@ CODES: frozenset[str] = frozenset(
         "SCHEMA_VERSION",
         "MALFORMED_LINE",
         "ESCALATED",
+        "VERDICT_UNSUPPORTED",  # H3 (2026-08-27)
     }
 )
 
@@ -118,6 +120,21 @@ def _check_refs(
         if item.origin is Origin.MODEL_ASSERTED or item.kind is EvidenceKind.MODEL_ASSERTION:
             findings.append(
                 _err("REF_MODEL_ASSERTED", f"evidence {ref!r} is model_asserted", owner_id, ref)
+            )
+            bad = True
+            continue
+        # H3 (user decision 2026-08-27, STRICT): a ruling may rest ONLY on
+        # `mechanically_observed` evidence. Rejecting `model_asserted` alone was
+        # weaker than AGENTS.md's stated rule and let a claim be SUPPORTED by
+        # HUMAN_ENTERED text - including the task question that asked about it.
+        if item.origin is not Origin.MECHANICALLY_OBSERVED:
+            findings.append(
+                _err(
+                    "REF_NOT_MECHANICAL",
+                    f"evidence {ref!r} is {item.origin.value}, not mechanically_observed",
+                    owner_id,
+                    ref,
+                )
             )
             bad = True
             continue
@@ -218,6 +235,27 @@ def enforce_rulings(
                 adj.adjudication_id,
             )
         )
+    # H3 (user decision 2026-08-27, STRICT): bind the VERDICT to evidence, not
+    # just the individual rulings. Before this, `{"verdict": "ACCEPT",
+    # "rulings": []}` passed through untouched - an ACCEPT with zero evidence
+    # citations - and a judge that self-declared every ruling UNSUPPORTED also
+    # reached ACCEPT, because a self-declared UNSUPPORTED is not a *downgrade*
+    # and never armed the escalation guard.
+    # A REFUTED ruling counts: if every adverse claim was mechanically REFUTED,
+    # the answer IS defensible and ACCEPT is well founded. Only rulings that
+    # SURVIVED enforcement qualify - anything downgraded is now UNSUPPORTED.
+    if verdict is Verdict.ACCEPT and not any(
+        r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED) for r in new_rulings
+    ):
+        findings.append(
+            _err(
+                "VERDICT_UNSUPPORTED",
+                "ACCEPT with no evidenced SUPPORTED/REFUTED ruling; forced to ESCALATE",
+                adj.adjudication_id,
+            )
+        )
+        verdict = Verdict.ESCALATE
+        escalated = True
     enforced = adj.model_copy(
         update={
             "rulings": new_rulings,

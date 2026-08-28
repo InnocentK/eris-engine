@@ -233,7 +233,26 @@ class Policy(_Strict):
     # None = E1 accept-and-scan only (defect/ABSTAIN categories are not
     # scored); "container" is recorded on every ArmRun and is what the scorer
     # gates on. A declaration, not a verification, until M2c builds it.
+    #
+    # H2 (2026-08-27): until a container EXISTS, accepting this value would let
+    # one word in a YAML file satisfy the only gate protecting scored
+    # defect/ABSTAIN results, while workers still run through plain `Popen`.
+    # `grep -r docker|podman|nsjail|bubblewrap src/ eval/` finds nothing, so the
+    # declaration is currently always false. Refuse it at load rather than score
+    # contaminated runs as evidence. Delete this validator in the SAME change
+    # that builds the mechanism.
     containment: Literal["container"] | None = None
+
+    @model_validator(mode="after")
+    def _containment_is_implemented(self) -> Policy:
+        if self.containment is not None:
+            raise ValueError(
+                f"containment={self.containment!r} is declared but no containment mechanism "
+                "is implemented (M2c); the scorer gates on this declaration and cannot verify "
+                "it, so accepting it would score uncontained defect runs as evidence (H2). "
+                "Leave it unset until the container exists."
+            )
+        return self
 
     @model_validator(mode="after")
     def _cross_checks(self) -> Policy:

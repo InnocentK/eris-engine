@@ -1928,3 +1928,37 @@ def test_sigkill_sweep_persistent_eperm_is_a_refusal_and_closes_the_pipes(
         clock=time.monotonic,
     )
     assert res.status is WorkerStatus.REFUSED and "could not be signalled" in str(res.error)
+
+
+def test_paths_handed_to_a_worker_must_be_absolute(tmp_path: Path) -> None:
+    """Defect C (live run, 2026-08-27): a worker's cwd is the SNAPSHOT, so a
+    relative path in its argv/env resolves there and points at nothing.
+
+    codex was given a relative `--output-schema` built from the policy's
+    relative `scratch_dir`, could not read it, and exited 1 before emitting a
+    single JSONL event - three retries and no diagnosis. The hermetic fakes
+    could not catch it: they never resolve a path against a real subprocess cwd,
+    so relative and absolute look identical to them. This asserts the invariant
+    directly instead.
+    """
+    codex = make_policy(tmp_path, cli="codex", model="gpt-5.4")
+    with pytest.raises(LaunchRefused, match="scratch_dir .* must be absolute"):
+        plan_call(
+            make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=Path("cache/scratch"))
+        )
+    # absolute scratch is accepted
+    plan = plan_call(
+        make_call(tmp_path, codex, schema={"type": "object"}, scratch_dir=tmp_path / "s")
+    )
+    assert Path(plan.schema_path).is_absolute() and Path(plan.output_path).is_absolute()
+
+    with pytest.raises(LaunchRefused, match="tmpdir .* must be absolute"):
+        plan_call(
+            make_call(
+                tmp_path,
+                codex,
+                schema={"type": "object"},
+                scratch_dir=tmp_path / "s",
+                tmpdir="cache/scratch/x/tmp",
+            )
+        )

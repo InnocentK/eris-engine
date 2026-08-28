@@ -1152,6 +1152,24 @@ def plan_call(call: WorkerCall) -> Plan:
         if not w.model:
             raise LaunchRefused("grok requires a model in policy")
         argv = build_argv_grok(w.executable, call.prompt, model=w.model, schema_json=schema_json)
+    # DEFECT C (2026-08-27): a worker's cwd is the SNAPSHOT, never the harness's
+    # cwd, so any relative path handed to a worker resolves against the snapshot
+    # and points at nothing. codex got a relative `--output-schema`, could not
+    # read it, and died before emitting one JSONL event (rc 1) - three retries,
+    # no diagnosis. Refuse here so the class cannot recur silently: everything
+    # Eris hands a worker must already be absolute.
+    if call.scratch_dir is not None and not Path(call.scratch_dir).is_absolute():
+        raise LaunchRefused(
+            f"scratch_dir {call.scratch_dir!r} must be absolute: a worker's cwd is the "
+            "snapshot, so a relative path would resolve there (defect C)"
+        )
+    if not Path(call.home).is_absolute():
+        raise LaunchRefused(f"home {call.home!r} must be absolute (defect C)")
+    if not Path(call.tmpdir).is_absolute():
+        raise LaunchRefused(
+            f"tmpdir {call.tmpdir!r} must be absolute (defect C): a worker would resolve "
+            "it against the snapshot, not the harness cwd"
+        )
     missing = [n for n in w.env_allow if n not in call.secrets]
     if missing:
         raise LaunchRefused(f"env_allow names not provided: {missing}")

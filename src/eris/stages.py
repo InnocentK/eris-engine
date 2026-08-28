@@ -896,6 +896,13 @@ def run_propose(
             "prompt_sha256": out.prompt_sha256,
             "ok": proposal is not None,
             "record_id": proposal.proposal_id if proposal else None,
+            # C1: whether the proposal ACTUALLY used came from the cache. An
+            # `invocation.reused` event is NOT sufficient evidence of that: a
+            # replayed hit whose output fails to parse writes `reused`, then
+            # `stage.output_rejected`, then falls through to a FRESH spawn. The
+            # scorer pairs arms on this field, so it must describe the outcome
+            # that was kept, not an attempt.
+            "reused": out.reused,
             "blobs": _blob_shas(out),
         },
     )
