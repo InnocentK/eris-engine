@@ -75,6 +75,17 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             # Matching divider SHAPE anywhere let `| --- | --- |` sit in a table
             # BODY and be skipped - a row escaping validation by impersonating a
             # delimiter, which is exactly what position-based skipping prevents.
+            #
+            # ...but skipping the HEADER by position means a rule row placed
+            # directly above a divider is never validated either. The header
+            # must therefore BE a header: exactly `Rule | Test`.
+            header = _split_row(lines[n - 2])
+            if [c.lower() for c in header] != ["rule", "test"]:
+                malformed.append(
+                    f"line {n - 1}: the line above a divider must be exactly "
+                    f"`Rule | Test`, else a rule row in the header position is "
+                    f"never validated: {lines[n - 2].strip()[:60]}"
+                )
             in_table = True
             continue
         if not in_table:
@@ -213,17 +224,48 @@ def _gate_rejects(doc: str) -> bool:
     return False
 
 
+POSITIONS = {
+    "after_body": lambda hdr, good, bad: hdr + good + bad + "\n",
+    "first_body_row": lambda hdr, good, bad: hdr + bad + "\n" + good,
+    "between_body_rows": lambda hdr, good, bad: hdr + good + bad + "\n" + good,
+    "header_position": lambda hdr, good, bad: "## A section\n" + bad + "\n|---|---|\n" + good,
+}
+
+
 def test_the_gate_accepts_a_well_formed_table() -> None:
     """The net must not fire on a correct document, or it proves nothing."""
     assert not _gate_rejects(VALID_TABLE)
 
 
+@pytest.mark.parametrize("position", sorted(POSITIONS))
 @pytest.mark.parametrize("shape", sorted(MALFORMED_ROWS), ids=lambda s: s.replace(" ", "_"))
-def test_the_gate_rejects_every_known_malformed_row(shape: str) -> None:
-    """This gate regressed FOUR times, each time letting through a row shape a
-    previous round had not thought to plant. Every shape ever found is planted
-    here, INSIDE a table body, so a future simplification cannot quietly reopen
-    one. See the decision record for the sequence.
+def test_the_gate_rejects_every_known_malformed_row(shape: str, position: str) -> None:
+    """This gate regressed FIVE times, each time letting through a shape - or a
+    POSITION - a previous round had not thought to plant.
+
+    Every shape ever found is planted in every position a row can occupy. The
+    first version of this net planted each shape in ONE position (appended after
+    the body) and reported "all caught", which is the same single-position
+    blindness that let the hand-probes pass four times running: a rule sitting in
+    the HEADER position was skipped and validated by nothing.
     """
-    doc = VALID_TABLE + MALFORMED_ROWS[shape] + "\n"
-    assert _gate_rejects(doc), f"a {shape!r} row is not rejected"
+    hdr = "## A section\n| Rule | Test |\n|---|---|\n"
+    good = "| a real rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |\n"
+    doc = POSITIONS[position](hdr, good, MALFORMED_ROWS[shape])
+    assert _gate_rejects(doc), f"a {shape!r} row in the {position} position is not rejected"
+
+
+def test_a_rule_row_in_the_header_position_is_rejected() -> None:
+    """The header is skipped BY POSITION, so it must be provably a header.
+
+    Otherwise a rule row placed directly above a divider - an easy hand-edit
+    mistake in a register that is maintained by hand - carries a rule nothing
+    validates.
+    """
+    doc = (
+        "## A section\n"
+        "| a rule with a typo'd test | `::tets_typo` |\n"
+        "|---|---|\n"
+        "| a real rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |\n"
+    )
+    assert _gate_rejects(doc)

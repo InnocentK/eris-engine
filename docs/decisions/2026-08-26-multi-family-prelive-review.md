@@ -1011,3 +1011,43 @@ the shapes I had already thought of. Encoding the probe as a parametrised test
 converts a habit I demonstrably do not have into something the gate enforces -
 and it is what I should have done the first time I wrote "probe degenerate
 shapes" as a lesson rather than as code.
+
+## Fourteenth stop-gate finding: the regression NET had the same blind spot (2026-08-29)
+
+Correct, and it lands one level up from the last one. I built the net precisely
+because hand-probing had failed four times - and then built it with the identical
+defect: it planted each shape in exactly ONE position (appended after the body)
+and reported 11/11.
+
+A row can occupy four positions. Testing the matrix:
+
+| position | shapes missed |
+|---|---|
+| after the body (what the net tested) | none |
+| first body row, under the divider | none |
+| between two body rows | none |
+| **the header position** | **all 11** |
+
+The header is skipped BY POSITION - correctly, it is not a rule row - but that
+means a rule placed directly above a divider is validated by NOTHING. In a
+register maintained by hand that is an ordinary editing mistake, and it silently
+produces a rule with no enforcing test.
+
+Fixed on both sides:
+
+* the gate now requires the header to PROVABLY be a header - the line above a
+  divider must be exactly `Rule | Test` (every real header in the document
+  already is), so a rule row cannot occupy that slot unnoticed;
+* the net is parametrised over shape x position, **44 cases**, all rejected,
+  with the valid table still accepted. Removing the new header check makes the
+  net fail, so it is not decoration.
+
+Gate: exit 0, 1104 passed, 95.50%, pip-audit clean.
+
+**Five rounds, and the invariant across all of them is the same:** whatever
+mechanism I build to catch a class, I build it with one instance of that class
+inside it. Hand-probe -> single position. Regression net -> single position.
+The countermeasure that actually worked here was enumerating the DIMENSIONS of
+the input (shape x position) and taking their product, rather than listing cases
+I could think of. Where a guard skips something by position, that skip is itself
+an unvalidated hole and needs its own positive check.
