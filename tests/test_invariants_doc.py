@@ -4,11 +4,19 @@ times in one session - rows named tests that did not exist, rows stated rules
 their named tests did not exercise, and a rule was added with no citation at
 all - so the mechanical half is checked here rather than left to discipline.
 
-**This gate fails CLOSED.** Its first version skipped any citation it could not
-parse, so `:: test_foo` (a stray space) and `::tets_foo` (a typo) passed while
-being checked by nothing - the row still contained `::`, so the "names a test"
-check was satisfied by text the "test exists" check never looked at. Every `::`
-in a test column must now parse as a real citation or the gate fails.
+**Scope of the guarantee.** For anything that IS part of a table, this gate
+fails CLOSED: every line the table contains must parse as a rule row, the header
+must be exactly `Rule | Test`, every rule row must cite a test, and every `::` in
+a test column must parse as a real citation naming a test that exists. An earlier
+version skipped what it could not parse, so `:: test_foo` (a stray space) and
+`::tets_foo` (a typo) passed while being checked by nothing.
+
+**It does NOT fail closed on one path, deliberately.** A row that loses its pipes
+stops being a table line at all, and is therefore not checked. Four attempts to
+detect it each rejected valid Markdown - "prose ending in a citation" and "a rule
+row whose pipes were lost" are the same string - so the hazard is accepted and
+stated rather than chased. `test_a_lost_pipe_row_is_a_known_unreported_gap` pins
+it, so the limitation cannot quietly become prose nobody checks.
 
 What it deliberately does NOT check: whether a named test EXERCISES its rule.
 That is unautomatable and is what mutation-checking a new row is for. See
@@ -388,3 +396,27 @@ def test_the_gate_accepts_ordinary_markdown(shape: str) -> None:
     rows, malformed = _rule_rows(doc)
     assert not malformed, f"{shape!r} wrongly reported malformed: {malformed}"
     assert len(rows) == 1, f"{shape!r} changed how many rule rows were found: {rows}"
+
+
+def test_a_lost_pipe_row_is_a_known_unreported_gap() -> None:
+    """The one path this gate deliberately does NOT close.
+
+    A rule row whose pipes are lost is no longer a table line, so nothing
+    validates its citation. Four triggers were tried and each rejected valid
+    Markdown, because the line is textually identical to prose that ends in a
+    citation. The hazard is accepted: such a line renders as prose, so it is
+    visibly not a rule to a reader of the register.
+
+    This test exists so the limitation is EXECUTABLE rather than prose. If a
+    future change starts reporting these lines, this fails - and whoever changes
+    it must re-check the accept direction (`test_the_gate_accepts_ordinary_markdown`)
+    before claiming the gate fails closed everywhere.
+    """
+    doc = (
+        "## S\n| Rule | Test |\n|---|---|\n"
+        "| a real rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |\n"
+        "a rule whose pipes were lost `::tets_typo`\n"
+    )
+    rows, malformed = _rule_rows(doc)
+    assert not malformed, "this gap is documented as unreported; see the module docstring"
+    assert len(rows) == 1, "the intact row is still validated"

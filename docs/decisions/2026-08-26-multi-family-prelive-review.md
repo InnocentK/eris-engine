@@ -1237,3 +1237,32 @@ property being detected is not decidable from the text. Recognising that a check
 CANNOT be made correct - and choosing a documented limitation over an oscillating
 heuristic - is the engineering judgement I should have applied three rounds
 earlier, and had actually written down one round earlier without acting on it.
+
+## Twentieth stop-gate finding: the claim outlived the code (2026-08-29)
+
+Correct, and it is the defect class this entire review has been about, committed
+by me one commit earlier. `2c08c21` accepted a deliberate fail-open path - a row
+that loses its pipes is not reported - while both the module docstring and the
+`INVARIANTS.md` row still asserted, without qualification, that the gate **FAILS
+CLOSED**. A register whose whole purpose is that a stated rule is true was
+carrying a false statement about itself.
+
+Fixed by making the claim match the code exactly:
+
+* the guarantee is scoped - "fails CLOSED for everything that IS part of a
+  table", with the one deliberate exception named in the same sentence rather
+  than a paragraph away;
+* the exception is now **executable**:
+  `test_a_lost_pipe_row_is_a_known_unreported_gap` asserts the gap is NOT
+  reported. If someone later adds detection, that test fails and forces them to
+  re-check the accept direction before re-claiming fail-closed everywhere.
+  Reintroducing a detector fails 9 tests, including the accept direction.
+
+Gate: exit 0, 1127 passed, 95.50%, pip-audit clean.
+
+**Accepting a limitation is not finished until the claims are corrected.** I
+wrote the limitation into the register and left two absolute statements standing
+beside it, which is precisely the doc-vs-code drift filed as a finding at the
+start of this review and repeated by me at least three times since. A documented
+exception should be stated where the guarantee is stated - and pinned by a test,
+so the exception cannot rot into prose nobody checks.
