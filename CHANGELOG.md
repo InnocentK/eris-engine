@@ -19,6 +19,10 @@ recorded before this version may score differently.
   runs FIRST so it keeps its own `ESCALATED` finding when both apply.
   Fired on its first live run: 4x `REF_NOT_MECHANICAL`, the judge having cited
   the question to support four claims.
+  A claim may be ruled EXACTLY ONCE (`DUPLICATE_RULING`); a second ruling is a
+  validity error and leaves the claim unresolved, because coverage was a set
+  membership test and a bogus `SUPPORTED` duplicate paired with a real
+  `UNSUPPORTED` satisfied both ACCEPT conditions at once.
   An ACCEPT must also RESOLVE the panel's claims: every claim needs a ruling and
   none may be `CONTESTED` (`VERDICT_UNRESOLVED_CLAIMS`). A judge could otherwise
   rule on one claim, ignore the rest, and answer ACCEPT with no complaint at

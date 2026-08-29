@@ -788,3 +788,32 @@ evidence" is not "resolves the question", just as "an attempt was reused" was
 not "the arms used the same bytes". The generalisable check before shipping a
 guard: state the guarantee in one sentence, then ask what a hostile-but-valid
 input could do while satisfying the code and violating the sentence.
+
+## Seventh stop-gate finding: contradictory duplicate rulings bypassed ACCEPT (2026-08-29)
+
+Correct. Probed the shapes rather than reasoning about them, and found it:
+
+    c_01 SUPPORTED *and* UNSUPPORTED, c_02 SUPPORTED  ->  ACCEPT, findings []
+
+Coverage was a SET membership test (`ruled = {r.claim_id for r in ...}`), so one
+claim carrying two contradictory rulings satisfied BOTH new conditions at once:
+the claim id appears in `ruled` (so nothing is "unresolved") and the bogus
+`SUPPORTED` duplicate is an evidenced surviving ruling (so ACCEPT "rests on"
+something). A judge could pair every adverse ruling with a contradicting
+duplicate and reach ACCEPT with no complaint at all.
+
+Fixed: a claim may be ruled EXACTLY ONCE (`PROTOCOL.md` already said so).
+A repeat is a `DUPLICATE_RULING` error, the claim counts as UNRESOLVED, and a
+duplicated claim cannot be what ACCEPT rests on. Redundant identical duplicates
+are errors too - deciding which pairs "contradict" is a worse rule than
+requiring one ruling per claim.
+
+All three halves mutation-checked. Gate: exit 0, 1053 passed, 95.49%.
+
+**Seven findings, one shape, now stated as a rule.** Every one of my guards has
+been defeated by an input that satisfies its *encoding* while violating its
+*meaning*: a set test where a multiset was meant, an attempt where an outcome
+was meant, "rests on" where "resolves" was meant. Before shipping a guard,
+enumerate the DEGENERATE shapes of its inputs - empty, duplicated, contradictory,
+absent, repeated-after-resume - and run them. That is a five-minute probe and it
+has now found four of the last five defects.

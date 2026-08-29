@@ -694,3 +694,52 @@ def test_accept_cannot_leave_a_claim_unresolved() -> None:
     )
     assert "VERDICT_UNRESOLVED_CLAIMS" not in codes(findings)
     assert enforced.verdict is Verdict.REVISE
+
+
+def test_a_claim_ruled_twice_cannot_satisfy_the_accept_guard() -> None:
+    """H3, stop-gate finding: contradictory duplicate rulings bypassed ACCEPT.
+
+    Coverage was a SET membership test, so a judge could pair a real
+    `UNSUPPORTED` with a bogus `SUPPORTED` duplicate on the SAME claim and
+    satisfy both halves at once - "every claim is ruled" and "some ruling is
+    evidenced" - while the record said two contradictory things about that
+    claim. `PROTOCOL.md` gives each claim exactly one of SUPPORTED | REFUTED |
+    CONTESTED | UNSUPPORTED, so a second ruling is a validity error and the
+    claim counts as unresolved.
+    """
+    claims = {cid: claim(cid) for cid in ("c_01", "c_02")}
+    sup = Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+    uns = Ruling(claim_id="c_01", status=ClaimStatus.UNSUPPORTED)
+    other = Ruling(claim_id="c_02", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+
+    enforced, findings = enforce_rulings(
+        adjudication([sup, uns, other], verdict=Verdict.ACCEPT), claims, EVIDENCE
+    )
+    assert "DUPLICATE_RULING" in codes(findings)
+    assert "VERDICT_UNRESOLVED_CLAIMS" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE
+    dup = next(f for f in findings if f.code == "DUPLICATE_RULING")
+    assert dup.ref == "c_01" and "SUPPORTED" in dup.message and "UNSUPPORTED" in dup.message
+
+    # even a redundant identical duplicate is a validity error
+    enforced, findings = enforce_rulings(
+        adjudication([sup, sup, other], verdict=Verdict.ACCEPT), claims, EVIDENCE
+    )
+    assert "DUPLICATE_RULING" in codes(findings) and enforced.verdict is Verdict.ESCALATE
+
+    # a duplicated claim cannot be the thing ACCEPT rests on either
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [sup, uns, Ruling(claim_id="c_02", status=ClaimStatus.UNSUPPORTED)],
+            verdict=Verdict.ACCEPT,
+        ),
+        claims,
+        EVIDENCE,
+    )
+    assert "VERDICT_UNSUPPORTED" in codes(findings)
+
+    # one ruling per claim is untouched
+    enforced, findings = enforce_rulings(
+        adjudication([sup, other], verdict=Verdict.ACCEPT), claims, EVIDENCE
+    )
+    assert codes(findings) == [] and enforced.verdict is Verdict.ACCEPT

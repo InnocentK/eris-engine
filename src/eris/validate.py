@@ -92,6 +92,7 @@ CODES: frozenset[str] = frozenset(
         "ESCALATED",
         "VERDICT_UNSUPPORTED",  # H3 (2026-08-27)
         "VERDICT_UNRESOLVED_CLAIMS",  # H3 (2026-08-29)
+        "DUPLICATE_RULING",  # H3 (2026-08-29)
     }
 )
 
@@ -222,6 +223,30 @@ def enforce_rulings(
                 ruling = ruling.model_copy(update={"status": ClaimStatus.UNSUPPORTED, "note": note})
         new_rulings.append(ruling)
 
+    # A claim may carry exactly ONE ruling (`PROTOCOL.md`: "each claim gets one
+    # of SUPPORTED | REFUTED | CONTESTED | UNSUPPORTED"). Two rulings on one
+    # claim make the record self-contradictory - and they defeated the ACCEPT
+    # gate, because coverage was a SET membership test: a judge could pair a
+    # real UNSUPPORTED with a bogus SUPPORTED duplicate and satisfy both
+    # "every claim is ruled" and "some ruling is evidenced" at once.
+    seen_claims: set[str] = set()
+    duplicate_rulings: set[str] = set()
+    for r in new_rulings:
+        if r.claim_id in seen_claims:
+            duplicate_rulings.add(r.claim_id)
+        seen_claims.add(r.claim_id)
+    for cid in sorted(duplicate_rulings):
+        statuses = sorted({r.status.value for r in new_rulings if r.claim_id == cid})
+        findings.append(
+            _err(
+                "DUPLICATE_RULING",
+                f"claim {cid!r} carries {len([r for r in new_rulings if r.claim_id == cid])} "
+                f"rulings ({', '.join(statuses)}); a claim may be ruled exactly once",
+                adj.adjudication_id,
+                cid,
+            )
+        )
+
     total = adj.downgrades + downgrades
     verdict = adj.verdict
     escalated = adj.escalated_by_engine
@@ -255,7 +280,9 @@ def enforce_rulings(
         # not downgraded (its refs were fine), so without it a judge could
         # satisfy the rule by inventing a claim id and citing real evidence.
         if not any(
-            r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED) and r.claim_id in claims
+            r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED)
+            and r.claim_id in claims
+            and r.claim_id not in duplicate_rulings
             for r in new_rulings
         ):
             findings.append(
@@ -272,7 +299,8 @@ def enforce_rulings(
         # exists to prevent. A CONTESTED ruling is an open dispute, not a
         # resolution. UNSUPPORTED IS a resolution ("that claim was not backed"),
         # so it does not block ACCEPT.
-        ruled = {r.claim_id for r in new_rulings}
+        # a claim ruled twice is NOT resolved: the record says two things about it
+        ruled = {r.claim_id for r in new_rulings} - duplicate_rulings
         unruled = sorted(set(claims) - ruled)
         contested = sorted(r.claim_id for r in new_rulings if r.status is ClaimStatus.CONTESTED)
         if unruled or contested:

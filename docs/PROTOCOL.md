@@ -125,7 +125,12 @@ internal reasoning)". Eris never claims to reveal hidden chain-of-thought.
 
 Applied by `enforce_rulings` to every adjudication, after the model answers:
 
-* Each claim gets one of `SUPPORTED | REFUTED | CONTESTED | UNSUPPORTED`.
+* Each claim gets **exactly one** of `SUPPORTED | REFUTED | CONTESTED |
+  UNSUPPORTED`. A second ruling on the same claim is a validity error
+  (`DUPLICATE_RULING`, 0.4.0) and leaves that claim UNRESOLVED: a judge could
+  otherwise pair a real `UNSUPPORTED` with a bogus `SUPPORTED` duplicate and
+  satisfy both ACCEPT conditions at once while the record said two
+  contradictory things about the claim.
 * A `SUPPORTED` or `REFUTED` ruling is **downgraded to `UNSUPPORTED`** when it
   cites no evidence, or when any cited evidence is missing, is **not
   `mechanically_observed`**, or (for `phase=verification` evidence only) was
