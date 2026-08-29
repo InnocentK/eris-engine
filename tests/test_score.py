@@ -825,6 +825,19 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
     }
     assert out["4-3"]["paired"] is False
 
+    # DEGENERATE: an arm with no propose output at all must not pair. Empty key
+    # sets make "nothing differs" trivially true, which would report a
+    # controlled comparison between two cells that shared nothing.
+    empty = CellScore(
+        **{**cell("indep_verify", {}).__dict__, "propose_keys": [], "propose_blobs": {}}
+    )
+    empty_t = CellScore(
+        **{**cell("indep_verify_critique", {}).__dict__, "propose_keys": [], "propose_blobs": {}}
+    )
+    out = {p["pair"]: p for p in paired_deltas([empty, empty_t])}
+    assert out["4-3"]["paired"] is False
+    assert "no propose output" in out["4-3"]["reason"]
+
     # genuine sharing still pairs
     out = {
         p["pair"]: p

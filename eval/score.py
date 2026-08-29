@@ -637,7 +637,15 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                 if s_treat.propose_blobs.get(k) != s_base.propose_blobs.get(k)
                 or not s_treat.propose_blobs.get(k)
             )
-            if sorted(s_treat.propose_keys) != sorted(s_base.propose_keys):
+            if not s_treat.propose_blobs or not s_base.propose_blobs:
+                # Degenerate: an arm recorded no propose output at all (every
+                # worker absent, or the stage never finished ok). Empty key sets
+                # would otherwise make `differing` empty and report a controlled
+                # comparison between two cells that shared NOTHING - pairing on
+                # the absence of a difference rather than on evidence of sameness.
+                entry["paired"] = False
+                entry["reason"] = "no propose output recorded for one or both arms"
+            elif sorted(s_treat.propose_keys) != sorted(s_base.propose_keys):
                 entry["paired"] = False
                 entry["reason"] = "propose_keys differ"
             elif differing:

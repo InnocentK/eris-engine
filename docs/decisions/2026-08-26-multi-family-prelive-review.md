@@ -817,3 +817,21 @@ was meant, "rests on" where "resolves" was meant. Before shipping a guard,
 enumerate the DEGENERATE shapes of its inputs - empty, duplicated, contradictory,
 absent, repeated-after-resume - and run them. That is a five-minute probe and it
 has now found four of the last five defects.
+
+### Eighth finding, found by applying the rule instead of waiting for it
+
+Immediately after writing the degenerate-shapes rule above, I ran it against the
+pairing guard rather than waiting for the next stop-gate. It failed:
+
+    both arms recorded NO proposals at all  ->  paired: True
+
+Empty key sets make "nothing differs" trivially true, so the guard reported a
+controlled comparison between two cells that shared nothing because there was
+nothing to share. Pairing on the ABSENCE OF A DIFFERENCE rather than on evidence
+of sameness - the same inversion as every earlier instance.
+
+Fixed: an arm that recorded no propose output never pairs. Mutation-checked.
+Gate: exit 0, 1053 passed, 95.50%.
+
+The probe cost about two minutes and found a defect that seven rounds of review,
+a Codex advisor pass and a three-family panel had all missed.
