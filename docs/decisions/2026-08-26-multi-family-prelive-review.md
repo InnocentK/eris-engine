@@ -1199,3 +1199,41 @@ from "a sentence that mentions a test"; only the STRUCTURE can (where the
 citation sits in the line). When a guard oscillates between false positives and
 false negatives, the trigger is measuring the wrong thing, and adding more
 special cases will keep it oscillating.
+
+## Nineteenth stop-gate finding: the heuristic is removed, not patched again (2026-08-29)
+
+Correct - four more valid shapes were rejected: prose ending in a citation with
+no full stop, a bullet ending in one, a symbol reference at end of line, and a
+citation alone on a line.
+
+**I stopped patching it.** "Prose ending in a citation" and "a rule row whose
+pipes were lost" are the same string. No fifth trigger separates them, and the
+three previous attempts each traded a false negative for a false positive:
+
+| round | trigger | result |
+|---|---|---|
+| 16 | any divider-shaped line | rejected thematic breaks |
+| 17 | pipe-less line ends the table | lost-pipe rows escaped |
+| 18 | any `::` on that line | rejected prose citing a test |
+| 19 | citation anchored to end-of-line | rejected prose ending in a citation |
+
+The guard is **removed**, and the limitation is written into the register: a row
+that loses its pipes stops being a table row and is not reported. It renders as
+prose, so it is visibly not a rule to anyone reading the document. That is a
+smaller, bounded, *stated* hazard than a check that rejects correct
+documentation - which would be disabled, and would then protect nothing.
+
+What remains is entirely structural and unambiguous: every table line parses as
+a rule row; the header is exactly `Rule | Test`; every rule row cites at least
+one test; every `::` in a test column parses; every cited test exists; no
+table-shaped line sits outside a table. **50 malformed cases rejected, 15 valid
+documents accepted**, all mutation-checked.
+
+Gate: exit 0, 1126 passed, 95.50%, pip-audit clean.
+
+**The real lesson of rounds 16-19: know when to stop adding checks.** Each fix
+was locally correct and the sequence still converged nowhere, because the
+property being detected is not decidable from the text. Recognising that a check
+CANNOT be made correct - and choosing a documented limitation over an oscillating
+heuristic - is the engineering judgement I should have applied three rounds
+earlier, and had actually written down one round earlier without acting on it.

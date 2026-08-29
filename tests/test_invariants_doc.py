@@ -122,17 +122,16 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             # pipes were lost, and skipping it silently is fail-open. Prose
             # paragraphs that legitimately reference tests sit after a blank
             # line or heading, where `in_table` is already False.
-            # ...but only when the line has the SHAPE of a rule row that lost
-            # its pipes: the test column is last, so the citation sits at the
-            # END. Triggering on any `::` rejected ordinary prose that follows a
-            # table without a blank line ("See `test_x.py::test_y` for detail."),
-            # which is valid Markdown - failing closed on good input.
-            if re.search(r"`[^`]*::[^`]*`\s*$", line):
-                malformed.append(
-                    f"line {n}: ends the table but LOOKS like a rule row whose pipes "
-                    f"were lost (it ends in a test citation), so it is validated by "
-                    f"nothing: {stripped[:60]}"
-                )
+            # ACCEPTED LIMITATION: a row that loses its pipes stops being a
+            # table row and is not reported. Four rounds were spent trying to
+            # detect it - `"::" in line`, then a citation anchored to
+            # end-of-line - and each trigger rejected valid Markdown, because
+            # "prose ending in a citation" and "a rule row whose pipes were
+            # lost" are indistinguishable by text shape. A heuristic that
+            # oscillates between false positives and false negatives is worse
+            # than the hazard: this gate must never reject a correct document,
+            # or it gets disabled and protects nothing. Such a line renders as
+            # prose, so it is visibly not a rule to any reader of the register.
             in_table = False
             continue
         cells = _split_row(line)
@@ -322,15 +321,6 @@ MALFORMED_DOCS = {
     "bad row last line after a valid table": (
         f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n\n{BAD_ROW}"
     ),
-    "pipe-less line carrying a citation": (
-        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\na rule with no pipes `::tets_typo`\n"
-    ),
-    "indented pipe-less rule": (
-        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n    a rule `::tets_typo`\n"
-    ),
-    "pipe-less line, plausible citation": (
-        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\na rule `test_score.py::test_nope`\n"
-    ),
     "two tables with no separator": (
         f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n| Rule | Test |\n|---|---|\n{BAD_ROW}\n"
     ),
@@ -381,6 +371,10 @@ VALID_DOCS = {
     "prose citing a pytest id, no blank line": "See `test_x.py::test_y` for the details.\n",
     "bare :: in a sentence": "The judge uses stages::invoke here, which matters.\n",
     "prose ENDING in a citation": "The enforcing test is `test_x.py::test_y`.\n",
+    "prose ending in a citation, no period": "The enforcing test is `test_x.py::test_y`\n",
+    "bullet ending in a citation": "- covered by `test_x.py::test_y`\n",
+    "sentence ending in a symbol ref": "See `eris.validate::enforce_rulings`\n",
+    "a citation alone on a line": "`test_x.py::test_y`\n",
 }
 
 
