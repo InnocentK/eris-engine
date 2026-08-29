@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.0 - evidence actually binds the verdict; four pre-live findings closed (2026-08-27)
+
+A four-family review before live testing, plus the first live runs of the full
+arm, produced one Critical and three Highs. All four are closed here. Behaviour
+changes: adjudication verdicts and scorer pairing are both STRICTER, so runs
+recorded before this version may score differently.
+
+* **H3 (user decision: STRICT) - evidence now binds the verdict.**
+  `enforce_rulings` accepts only `mechanically_observed` evidence in support of
+  a ruling (`REF_NOT_MECHANICAL`); rejecting `model_asserted` alone let
+  HUMAN_ENTERED text support a claim - including the task question that asked
+  about it. An `ACCEPT` with no surviving `SUPPORTED` ruling is forced to
+  `ESCALATE` (`VERDICT_UNSUPPORTED`): previously `{"verdict": "ACCEPT",
+  "rulings": []}` passed through untouched, and a judge that self-declared every
+  ruling UNSUPPORTED also reached ACCEPT, because a self-declared UNSUPPORTED is
+  not a *downgrade* and never armed the escalation guard. The downgrade rule
+  runs FIRST so it keeps its own `ESCALATED` finding when both apply.
+  Fired on its first live run: 4x `REF_NOT_MECHANICAL`, the judge having cited
+  the question to support four claims.
+  The ACCEPT rule counts a ruling only when its claim EXISTS: a ruling naming a
+  claim nobody made is flagged `CLAIM_MISSING` but deliberately not downgraded
+  (its refs were fine), so without that test a judge could satisfy the whole
+  rule by inventing a claim id and citing real evidence at it.
+* **C1 (Critical) - the paired ablation no longer claims pairings it does not
+  have.** Sharing across arms 3/3b/4 happens ONLY through the call cache, and
+  `Cache.lookup` refuses any entry without `model_executed`, which
+  `parse_codex`/`parse_agy` never populate - so with the default panel those two
+  workers are re-spawned by every arm with different text while the idempotency
+  keys stay identical. `paired_deltas` now requires positive evidence of sharing
+  (`invocation.reused`) and reports `paired: false` with the unshared keys
+  otherwise. `docs/INVARIANTS.md`'s PAIRED ABLATION row was FALSE in production
+  and is corrected.
+* **Defect C (High, found by the live run) - paths handed to a worker must be
+  absolute.** `scratch_dir` defaults to the relative `cache/scratch`, but a
+  worker's cwd is the SNAPSHOT, so codex got a relative `--output-schema`, could
+  not read it, and exited 1 before emitting a single JSONL event - three retries
+  and no diagnosis. Resolved at the point of use, plus a `LaunchRefused` in
+  `plan_call` so the class cannot recur silently. `TMPDIR` was broken the same
+  way for every worker. No hermetic test could catch this: the fakes never
+  resolve a path against a real subprocess cwd.
+* **H2 (High) - `containment: container` is refused at policy load** until a
+  container exists. Nothing in the tree implements one, so the declaration was
+  always false, and it is the only gate protecting scored defect/ABSTAIN
+  results. Delete the validator in the same change that builds the mechanism.
+* `env_allow` documentation corrected: declaring a name makes it REQUIRED (the
+  worker is refused at launch if it is absent), which the header previously
+  described as "may be passed".
+
 ## 0.3.14 - the whole reporter body is guarded, not its last step (2026-08-24)
 
 Twelfth stop-time finding, and the third in a row on the same helper. Each

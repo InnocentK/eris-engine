@@ -462,7 +462,11 @@ def test_property_enforce_never_raises_and_is_idempotent(seed: int) -> None:
         if r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED):
             assert r.evidence_refs
             for ref in r.evidence_refs:
-                assert ref in ev and ev[ref].origin is not Origin.MODEL_ASSERTED
+                # H3 (strict): the surviving rule is mechanically_observed,
+                # not merely "not model_asserted"
+                assert ref in ev and ev[ref].origin is Origin.MECHANICALLY_OBSERVED
+    if once.verdict is Verdict.ACCEPT:
+        assert any(r.status is ClaimStatus.SUPPORTED for r in once.rulings)
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -489,3 +493,131 @@ def test_property_validate_events_never_raises(seed: int) -> None:
             lines[i] = lines[i][: rng.randrange(len(lines[i]))]
     findings = validate_events(lines)
     assert all(f.code in CODES and f.severity == "error" for f in findings)
+
+
+# --------------------------------------------------------------- H3 (strict, 2026-08-27)
+
+
+def test_supported_ruling_needs_mechanically_observed_evidence() -> None:
+    """H3a: rejecting only `model_asserted` was weaker than AGENTS.md's rule.
+
+    A HUMAN_ENTERED document quote - the task question itself is one, via
+    `build_evidence_pack` - could support a claim, so "the null guard is missing
+    at line 42" could be SUPPORTED by the question that asked about it.
+    """
+    human = {"e_h": evidence("e_h", origin=Origin.HUMAN_ENTERED, kind=EvidenceKind.DOCUMENT_QUOTE)}
+    enforced, findings = enforce_rulings(adjudication([supported(refs=["e_h"])]), CLAIMS, human)
+    assert codes(findings) == ["REF_NOT_MECHANICAL"]
+    assert enforced.rulings[0].status is ClaimStatus.UNSUPPORTED
+    assert enforced.downgrades == 1
+    # mechanically observed evidence is unaffected
+    enforced, findings = enforce_rulings(adjudication([supported(refs=["e_01"])]), CLAIMS, EVIDENCE)
+    assert codes(findings) == []
+    assert enforced.rulings[0].status is ClaimStatus.SUPPORTED
+
+
+def test_accept_without_a_supported_ruling_is_escalated() -> None:
+    """H3b: bind the VERDICT to evidence, not only the individual rulings.
+
+    `{"verdict": "ACCEPT", "rulings": []}` used to pass through untouched, and a
+    judge that self-declared every ruling UNSUPPORTED also reached ACCEPT - a
+    self-declared UNSUPPORTED is not a *downgrade*, so the escalation guard at
+    ESCALATE_AT never armed.
+    """
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [],
+            verdict=Verdict.ACCEPT,
+            residual_risks=[ResidualRisk(text="r", severity=Severity.LOW)],
+        ),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert "VERDICT_UNSUPPORTED" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE
+    assert enforced.escalated_by_engine is True
+
+    # self-declared UNSUPPORTED rulings: still no support, still escalated
+    r = Ruling(claim_id="c_01", status=ClaimStatus.UNSUPPORTED, evidence_refs=["e_01"])
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [r],
+            verdict=Verdict.ACCEPT,
+            residual_risks=[ResidualRisk(text="r", severity=Severity.LOW)],
+        ),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert enforced.verdict is Verdict.ESCALATE
+    assert enforced.downgrades == 0  # not a downgrade - that was the hole
+
+    # an ACCEPT that IS supported stands
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [supported(refs=["e_01"])],
+            verdict=Verdict.ACCEPT,
+            residual_risks=[ResidualRisk(text="r", severity=Severity.LOW)],
+        ),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert enforced.verdict is Verdict.ACCEPT and codes(findings) == []
+
+
+def test_a_fabricated_claim_id_cannot_satisfy_the_accept_rule() -> None:
+    """H3, stop-gate finding: the ACCEPT rule must rest on a REAL claim.
+
+    A ruling naming a claim nobody made is flagged CLAIM_MISSING but is
+    deliberately NOT downgraded (see `test_claim_missing`: its refs were fine).
+    So a judge could invent a claim id, cite genuine mechanically_observed
+    evidence at it, and that ruling would satisfy "ACCEPT needs a surviving
+    evidenced ruling" - an ACCEPT resting on a claim that does not exist.
+    """
+    ghost = Ruling(claim_id="clm-deadbeef-9", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+    enforced, findings = enforce_rulings(
+        adjudication([ghost], verdict=Verdict.ACCEPT), CLAIMS, EVIDENCE
+    )
+    assert "CLAIM_MISSING" in codes(findings)
+    assert "VERDICT_UNSUPPORTED" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE
+    # the ruling itself is still not downgraded - that is the documented
+    # behaviour of test_claim_missing; it simply cannot prop up a verdict
+    assert enforced.rulings[0].status is ClaimStatus.SUPPORTED
+
+    # one real evidenced ruling alongside the ghost is enough for ACCEPT
+    enforced, _ = enforce_rulings(
+        adjudication([ghost, supported(refs=["e_01"])], verdict=Verdict.ACCEPT),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert enforced.verdict is Verdict.ACCEPT
+
+
+def test_accept_may_rest_on_a_mechanically_refuted_ruling_alone() -> None:
+    """H3, advisor finding: `REFUTED` satisfies the ACCEPT rule.
+
+    If every adverse claim is mechanically REFUTED the proposed answer IS
+    defensible, so demanding a SUPPORTED ruling would escalate a legitimate
+    ACCEPT. This is the half of the verdict rule that the other H3 tests, which
+    only exercise SUPPORTED, do not cover.
+    """
+    refuted = Ruling(claim_id="c_01", status=ClaimStatus.REFUTED, evidence_refs=["e_01"])
+    enforced, findings = enforce_rulings(
+        adjudication([refuted], verdict=Verdict.ACCEPT), CLAIMS, EVIDENCE
+    )
+    assert enforced.rulings[0].status is ClaimStatus.REFUTED  # survived enforcement
+    assert "VERDICT_UNSUPPORTED" not in codes(findings)
+    assert enforced.verdict is Verdict.ACCEPT
+
+    # but a REFUTED ruling that was DOWNGRADED cannot prop up ACCEPT
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [Ruling(claim_id="c_01", status=ClaimStatus.REFUTED, evidence_refs=["ghost"])],
+            verdict=Verdict.ACCEPT,
+        ),
+        CLAIMS,
+        EVIDENCE,
+    )
+    assert enforced.rulings[0].status is ClaimStatus.UNSUPPORTED
+    assert "VERDICT_UNSUPPORTED" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE

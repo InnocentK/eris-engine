@@ -510,3 +510,15 @@ def test_scratch_retention_is_a_strict_bounded_int(tmp_path: Path) -> None:
     for bad in (60, "604800", 1.5, 40_000_000):
         with pytest.raises(PolicyError):
             load_policy(write(tmp_path, minimal_policy(scratch_retention_s=bad)))
+
+
+def test_containment_declaration_is_refused_until_a_mechanism_exists(tmp_path: Path) -> None:
+    """H2: the scorer gates defect/ABSTAIN categories on `containment ==
+    "container"` and cannot verify it. No container exists anywhere in the tree,
+    so accepting the declaration would let one YAML word satisfy the gate while
+    workers still run through plain Popen. Delete this test in the SAME change
+    that builds the mechanism."""
+    with pytest.raises(PolicyError, match="no containment mechanism"):
+        load_policy(write(tmp_path, minimal_policy(containment="container")))
+    # the unset case still loads
+    assert load_policy(write(tmp_path, minimal_policy())).policy.containment is None

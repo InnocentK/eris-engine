@@ -76,7 +76,10 @@ GATED_CATEGORIES: frozenset[TaskCategory] = frozenset(
 CONTAINMENT_ACCEPTED: frozenset[str] = frozenset({"container"})
 CONTAINMENT_BASIS = (
     "policy declaration (`containment` in the policy file, recorded on the ArmRun); the "
-    "scorer gates on the declaration and cannot verify it - M2c builds the container"
+    "scorer gates on the declaration and cannot verify it - M2c builds the container. "
+    "Since 0.4.0 (H2) a declaration is REFUSED at policy load AND refused here when it "
+    "appears in an older ledger, because no containment mechanism exists: until M2c, "
+    "revert/planted/insufficient cannot be scored at all"
 )
 PAIRS: tuple[tuple[str, Arm, Arm], ...] = (
     ("3b-3", Arm.INDEP_VERIFY_ITER, Arm.INDEP_VERIFY),
@@ -177,6 +180,27 @@ class CellData:
     finished_ts: str | None
 
 
+def _last_proposal_per_worker(view: LedgerView, arm_run: ArmRun) -> list[Proposal]:
+    """One proposal per worker: the LAST recorded.
+
+    A worker can record a proposal more than once in a cell. A crash between
+    `proposal.recorded` and `stage.finished` leaves the stage unfinished, so
+    resume does not trust it and re-runs that worker (`arms.load_prior`) -
+    leaving two rows for one worker. `predicted_findings` iterates every row, so
+    the duplicate would count that worker's findings twice and inflate tp/fp for
+    EVERY arm, not just `single`. `arms.load_prior` already keys proposals by
+    worker id; the scorer is the only reader that did not.
+    """
+    by_worker: dict[str, Proposal] = {}
+    for prop in view.records("proposal.recorded", Proposal):
+        by_worker[prop.worker_id] = prop
+    # ...and only workers the FINAL arm spec actually used. Resuming a run id
+    # with a different `--panel` leaves proposals from the old panel in the
+    # ledger; scoring them would credit the arm with a worker it did not run.
+    panel = set(arm_run.panel)
+    return [p for w, p in by_worker.items() if w in panel]
+
+
 def read_cell(run_dir: Path) -> CellData:
     view = LedgerView.from_path(run_dir / "events.jsonl")  # raises LedgerCorrupt
     arm_runs = view.records("arm.finished", ArmRun)
@@ -192,7 +216,7 @@ def read_cell(run_dir: Path) -> CellData:
         run_dir=run_dir,
         view=view,
         arm_run=arm_runs[-1],
-        proposals=view.records("proposal.recorded", Proposal),
+        proposals=_last_proposal_per_worker(view, arm_runs[-1]),
         raw=raws[-1] if raws else None,
         enforced=enforced[-1] if enforced else None,
         scan=scans[-1] if scans else None,
@@ -384,12 +408,45 @@ class CellScore:
     wall_ms: int | None
     attempts: int
     propose_keys: list[str]
+    # C1: propose key -> stdout blob shas of the KEPT proposal. Key equality
+    # alone does NOT mean two arms shared proposals - the key excludes worker
+    # output, and codex/agy report no `model_executed` so `Cache.lookup` refuses
+    # them and every arm re-spawns them with different text. Pairing requires
+    # byte-identical output, which is the only direct evidence of a shared world.
+    propose_blobs: dict[str, list[str]]
     contaminated: bool
     scan_incomplete: bool
     rescan_contaminated: bool
     containment: str | None
     containment_basis: str = CONTAINMENT_BASIS
     missing_cells: list[dict[str, str]] = field(default_factory=list)
+
+
+def _propose_blobs(cell: CellData) -> dict[str, list[str]]:
+    """Propose key -> the stdout blob shas of the proposal that was KEPT.
+
+    Blob equality is the real evidence that two arms shared a world: equal shas
+    mean byte-identical worker output. `reused: True` is NOT sufficient - a
+    treatment arm can replay a cached proposal A while the base arm was run with
+    `--fresh` and produced B, so the treatment "reused" something the base never
+    used. It is also not necessary: two spawns that produced identical bytes did
+    share a world.
+
+    LAST event per key wins. A key can finish more than once: on resume a stage
+    whose blob does not re-hash is NOT trusted and the worker is re-run
+    (`arms.load_prior`), so a ledger can hold the stale outcome ahead of the
+    re-spawn that replaced it.
+    """
+    last: dict[str, dict[str, Any]] = {}
+    for p in cell.view.payloads("stage.finished"):
+        if p.get("stage") == "propose" and "idempotency_key" in p:
+            last[str(p["idempotency_key"])] = p
+    out: dict[str, list[str]] = {}
+    for k, p in last.items():
+        if k in set(cell.arm_run.propose_keys) and p.get("ok"):
+            blobs = p.get("blobs")
+            out[k] = sorted(str(b) for b in blobs) if isinstance(blobs, list) else []
+    return out
 
 
 def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellScore:
@@ -418,6 +475,17 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         raise GateRefused(
             f"{cell.run_dir.name}: no ScanResult recorded for a {ar.category.value} cell; "
             "an unscanned defect/ABSTAIN result is not evidence"
+        )
+    # H2: a policy declaring `containment: container` is refused at LOAD, but a
+    # ledger written BEFORE that refusal still carries the declaration and the
+    # gate above would accept it. No container exists anywhere in the tree, so
+    # such a declaration is false by construction. Checked AFTER the scan gate
+    # so neither refusal makes the other unreachable.
+    if ar.category in GATED_CATEGORIES and ar.containment is not None:
+        raise GateRefused(
+            f"{cell.run_dir.name}: ArmRun declares containment={ar.containment!r}, but no "
+            "containment mechanism is implemented (H2) - the declaration cannot be true. "
+            "This ledger was written by a policy that predates the load-time refusal."
         )
     rescanned = rescan(cell, key, home=home, corpus=corpus)
     contaminated = ar.contaminated or (recorded_scan.contaminated if recorded_scan else False)
@@ -491,6 +559,7 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         wall_ms=wall,
         attempts=totals.attempts,
         propose_keys=list(ar.propose_keys),
+        propose_blobs=_propose_blobs(cell),
         contaminated=contaminated,
         scan_incomplete=scan_incomplete,
         rescan_contaminated=rescanned.contaminated,
@@ -562,9 +631,28 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
             if s_treat is None:
                 continue
             entry: dict[str, Any] = {"pair": label, "task_id": task_id, "repeat_index": repeat}
+            differing = sorted(
+                k
+                for k in set(s_treat.propose_keys) | set(s_base.propose_keys)
+                if s_treat.propose_blobs.get(k) != s_base.propose_blobs.get(k)
+                or not s_treat.propose_blobs.get(k)
+            )
             if sorted(s_treat.propose_keys) != sorted(s_base.propose_keys):
                 entry["paired"] = False
                 entry["reason"] = "propose_keys differ"
+            elif differing:
+                # C1: identical keys, but the two arms' proposals are not the
+                # same BYTES - the treatment re-spawned those proposers instead
+                # of replaying the base arm's output (or one arm ran --fresh).
+                # The arms did not share a world, so any delta between them is
+                # confounded with proposal variance. Refuse to call it paired.
+                entry["paired"] = False
+                entry["reason"] = (
+                    f"proposals not shared: {len(differing)} of "
+                    f"{len(s_treat.propose_keys)} propose calls produced different "
+                    "output bytes from the base arm (or recorded none)"
+                )
+                entry["unshared_propose_keys"] = differing
             elif not (s_treat.included and s_base.included):
                 entry["paired"] = False
                 entry["reason"] = f"excluded: {s_treat.exclusion or s_base.exclusion}"

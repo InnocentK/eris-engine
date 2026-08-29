@@ -475,7 +475,13 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
 
 
 def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
-    def cell(arm: str, keys: list[str], included: bool = True, recall: float | None = 0.5) -> Any:
+    def cell(
+        arm: str,
+        keys: list[str],
+        included: bool = True,
+        recall: float | None = 0.5,
+        blobs: dict[str, list[str]] | None = None,
+    ) -> Any:
         from eval.score import CellScore
 
         return CellScore(
@@ -507,6 +513,9 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             wall_ms=1,
             attempts=1,
             propose_keys=keys,
+            # default: identical output bytes for every key, i.e. the arms
+            # really did share a world (C1)
+            propose_blobs={k: ["sha-" + k] for k in keys} if blobs is None else blobs,
             contaminated=False,
             scan_incomplete=False,
             rescan_contaminated=False,
@@ -584,6 +593,44 @@ def test_cells_without_a_scan_result_are_refused_when_gated_and_plumbing_otherwi
         rw.append(e["kind"], e["payload"])
     rw.finalize({"arm": "single"})
     with pytest.raises(GateRefused, match="no ScanResult"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+
+def test_a_stale_containment_declaration_in_an_old_ledger_is_refused(tmp_path: Path) -> None:
+    """H2: a policy declaring `containment: container` is refused at LOAD, but a
+    ledger written BEFORE that refusal still carries the declaration and the E1
+    gate would accept it as satisfied. No container exists anywhere in the tree,
+    so such a declaration is false by construction and must be refused at score
+    time too - otherwise an uncontained defect run is scored as evidence.
+
+    Checked AFTER the no-ScanResult gate, so neither refusal makes the other
+    unreachable (that test asserts the scan message on the same shape).
+    """
+    from eris.redact import Redactor
+    from eris.writer import RunWriter as RW
+
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    cell = cdir / "t_01-r0-single-grok"
+    events = cell / "events.jsonl"
+    kept = [json.loads(line) for line in events.read_bytes().splitlines()]
+
+    task = json.loads(w["task"].read_text())
+    w["task"].write_text(json.dumps({**task, "category": "planted"}))
+    write_key(w, category="planted")
+    for e in kept:
+        if e["kind"] == "arm.finished":
+            e["payload"] = {**e["payload"], "category": "planted", "containment": "container"}
+    (cell / "manifest.json").unlink()
+    events.unlink()
+    (cell / ".lock").unlink(missing_ok=True)
+    rw = RW(cell, Redactor(), run_id="t_01-r0-single-grok").open()
+    for e in kept:
+        rw.append(e["kind"], e["payload"])
+    rw.finalize({"arm": "single"})
+
+    with pytest.raises(GateRefused, match="no containment mechanism is implemented"):
         score_campaign(cdir, w["corpus"], home=tmp_path / "home")
 
 
@@ -681,3 +728,209 @@ def test_the_repo_plumbing_control_task_is_marked_unscored() -> None:
     task_file = Path(__file__).resolve().parents[1] / "eval" / "corpus" / "plumbing-control"
     spec = TaskSpec.model_validate_json((task_file / "task.json").read_bytes())
     assert spec.task_id == "plumbing-control" and spec.scored is False
+
+
+def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> None:
+    """C1: identical propose_keys do NOT prove shared proposals.
+
+    The key excludes worker output, and `Cache.lookup` refuses any entry without
+    `model_executed` - which `parse_codex`/`parse_agy` never populate. So with
+    the default panel those two workers are re-spawned by every arm and return
+    DIFFERENT text while the keys stay identical. The scorer used to call that
+    `paired: true` and emit deltas confounded with proposal variance.
+
+    Pairing therefore requires byte-identical propose output, not merely a
+    cache hit: a treatment arm can replay a cached proposal A while the base
+    arm ran `--fresh` and produced B, so "the treatment reused something" does
+    not mean "the two arms shared a world".
+    """
+    from eval.score import CellScore
+
+    ka, kb = "a" * 64, "b" * 64
+
+    def cell(arm: str, blobs: dict[str, list[str]]) -> Any:
+        return CellScore(
+            run_id=f"r-{arm}",
+            task_id="t",
+            arm=arm,
+            repeat_index=0,
+            category="control",
+            included=True,
+            exclusion=None,
+            verdict="REVISE",
+            verdict_basis="enforced",
+            precision=0.5,
+            recall=0.5,
+            tp=1,
+            fp=1,
+            fn=1,
+            distractor_hits=0,
+            unsupported_claim_rate=0.0,
+            downgrades=0,
+            confident_wrong=False,
+            abstained=False,
+            expected_abstain=False,
+            cost_spent_usd=1.0,
+            cost_attributed_usd=1.0,
+            cost_by_stage_spent={},
+            cost_by_stage_attributed={},
+            unknown_cost_records=0,
+            wall_ms=1,
+            attempts=1,
+            propose_keys=[ka, kb],
+            propose_blobs=blobs,
+            contaminated=False,
+            scan_incomplete=False,
+            rescan_contaminated=False,
+            containment=None,
+        )
+
+    base = {ka: ["sha-a"], kb: ["sha-b"]}
+
+    # codex/agy case: one proposer re-spawned and produced different bytes
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [
+                cell("indep_verify", base),
+                cell("indep_verify_critique", {ka: ["sha-a"], kb: ["sha-DIFFERENT"]}),
+            ]
+        )
+    }
+    assert out["4-3"]["paired"] is False
+    assert "proposals not shared" in out["4-3"]["reason"]
+    assert "1 of 2" in out["4-3"]["reason"]
+    assert out["4-3"]["unshared_propose_keys"] == [kb]
+    assert "delta_recall" not in out["4-3"]  # no delta for an unpaired cell
+
+    # the `--fresh` hole: the treatment REPLAYED a cached proposal the base arm
+    # never used. A reuse-based guard called this paired; byte equality does not.
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [
+                cell("indep_verify", {ka: ["sha-FRESH-B"], kb: ["sha-b"]}),
+                cell("indep_verify_iter", base),  # replayed cached A
+            ]
+        )
+    }
+    assert out["3b-3"]["paired"] is False and out["3b-3"]["unshared_propose_keys"] == [ka]
+
+    # a cell that recorded no propose blob at all is never paired
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [cell("indep_verify", base), cell("indep_verify_critique", {ka: ["sha-a"]})]
+        )
+    }
+    assert out["4-3"]["paired"] is False
+
+    # genuine sharing still pairs
+    out = {
+        p["pair"]: p
+        for p in paired_deltas([cell("indep_verify", base), cell("indep_verify_critique", base)])
+    }
+    assert out["4-3"]["paired"] is True and out["4-3"]["delta_recall"] == 0.0
+
+
+def test_a_worker_that_recorded_twice_counts_once() -> None:
+    """M11 / multiplicity audit: one proposal per worker, the LAST recorded.
+
+    A crash between `proposal.recorded` and `stage.finished` leaves the stage
+    unfinished, so resume does not trust it and re-runs that worker - leaving
+    two `proposal.recorded` rows for one worker. `predicted_findings` iterates
+    every row, so the duplicate would count that worker's findings twice and
+    inflate tp/fp for EVERY arm. `arms.load_prior` already keys proposals by
+    worker id; the scorer was the only reader that did not.
+    """
+    from types import SimpleNamespace
+
+    from eval.score import _last_proposal_per_worker
+
+    golden = json.loads(
+        (Path(__file__).parent / "fixtures" / "records" / "0.1.5" / "proposal.json").read_text()
+    )
+
+    def prop(worker: str, desc: str) -> dict[str, Any]:
+        return {
+            **golden,
+            "worker_id": worker,
+            "findings": [
+                {
+                    **golden["findings"][0],
+                    "description": desc,
+                }
+            ],
+        }
+
+    class _View:
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self._rows = rows
+
+        def records(self, kind: str, model: Any) -> list[Any]:
+            return [model.model_validate(r) for r in self._rows]
+
+    # the stale first row and the re-spawn that replaced it
+    arm_run = SimpleNamespace(panel=["claude", "grok"])
+    out = _last_proposal_per_worker(
+        _View([prop("claude", "stale"), prop("claude", "kept"), prop("grok", "other")]), arm_run
+    )
+    assert len(out) == 2, "the duplicated worker must collapse to one proposal"
+    by_worker = {p.worker_id: p for p in out}
+    assert [f.description for f in by_worker["claude"].findings] == ["kept"]
+    assert [f.description for f in by_worker["grok"].findings] == ["other"]
+
+    # a worker left over from a resume with a DIFFERENT --panel is not scored:
+    # the arm did not run it, so crediting its findings would be fabrication
+    out = _last_proposal_per_worker(
+        _View([prop("claude", "stale-panel"), prop("grok", "kept")]),
+        SimpleNamespace(panel=["grok"]),
+    )
+    assert [p.worker_id for p in out] == ["grok"]
+
+
+def test_propose_blobs_read_the_kept_outcome_not_an_attempt() -> None:
+    """C1, at the ledger-reading layer: `_propose_blobs` must report the blob of
+    the proposal that was KEPT.
+
+    Two ways an attempt can be mistaken for the outcome:
+    * a cache hit is replayed (`invocation.reused` is written) and the replayed
+      output then fails to parse, so `stages.invoke` falls through to a FRESH
+      spawn - the ledger holds a reuse for a proposal that was re-spawned;
+    * on resume a stage whose blob does not re-hash is not trusted and the
+      worker is re-run, so a stale `stage.finished` precedes the one that
+      produced the kept proposal.
+    In both cases the LAST `stage.finished` per key is the truth.
+    """
+    from types import SimpleNamespace
+
+    from eval.score import _propose_blobs
+
+    k = "a" * 64
+
+    class _View:
+        def __init__(self, payloads: dict[str, list[dict[str, Any]]]) -> None:
+            self._p = payloads
+
+        def payloads(self, kind: str) -> list[dict[str, Any]]:
+            return self._p.get(kind, [])
+
+    def cell(rows: list[dict[str, Any]], reused: bool = False) -> Any:
+        p: dict[str, list[dict[str, Any]]] = {"stage.finished": rows}
+        if reused:
+            p["invocation.reused"] = [{"invocation_id": f"inv-{k[:16]}-a1", "reused_from": "x"}]
+        return SimpleNamespace(view=_View(p), arm_run=SimpleNamespace(propose_keys=[k]))
+
+    fin = {"stage": "propose", "idempotency_key": k, "ok": True}
+
+    # stale first pass, then the re-spawn that replaced it: the LAST wins
+    assert _propose_blobs(cell([{**fin, "blobs": ["stale"]}, {**fin, "blobs": ["kept"]}])) == {
+        k: ["kept"]
+    }
+    # an `invocation.reused` event does not override the kept outcome
+    assert _propose_blobs(cell([{**fin, "blobs": ["kept"]}], reused=True)) == {k: ["kept"]}
+    # a stage that did not finish ok contributes no blob, so it can never pair
+    assert _propose_blobs(cell([{**fin, "ok": False, "blobs": ["x"]}])) == {}
+    # a key the ArmRun never recorded is ignored
+    other = {"stage": "propose", "idempotency_key": "z" * 64, "ok": True, "blobs": ["z"]}
+    assert _propose_blobs(cell([{**fin, "blobs": ["kept"]}, other])) == {k: ["kept"]}
