@@ -1,12 +1,18 @@
 """`docs/INVARIANTS.md` is the project's do-not-break register, and AGENTS.md
-requires every rule to NAME its enforcing test. That contract was broken twice
-in one session - rows named tests that did not exist, and rows stated rules the
-named tests did not exercise - so the first half is checked mechanically here
-rather than left to reviewer discipline.
+requires every rule to NAME its enforcing test. That contract was broken three
+times in one session - rows named tests that did not exist, rows stated rules
+their named tests did not exercise, and a rule was added with no citation at
+all - so the mechanical half is checked here rather than left to discipline.
 
-The second half (does the test actually EXERCISE the rule?) cannot be checked
-this way; that is what mutation-checking a new row is for. See the decision
-record `docs/decisions/2026-08-26-multi-family-prelive-review.md`.
+**This gate fails CLOSED.** Its first version skipped any citation it could not
+parse, so `:: test_foo` (a stray space) and `::tets_foo` (a typo) passed while
+being checked by nothing - the row still contained `::`, so the "names a test"
+check was satisfied by text the "test exists" check never looked at. Every `::`
+in a test column must now parse as a real citation or the gate fails.
+
+What it deliberately does NOT check: whether a named test EXERCISES its rule.
+That is unautomatable and is what mutation-checking a new row is for. See
+`docs/decisions/2026-08-26-multi-family-prelive-review.md`.
 """
 
 from __future__ import annotations
@@ -18,39 +24,52 @@ REPO = Path(__file__).resolve().parent.parent
 INVARIANTS = REPO / "docs" / "INVARIANTS.md"
 TESTS = REPO / "tests"
 
-# `test_foo.py::test_bar`, a bare `::test_bar` continuing the previous module, or
-# a `::test_prefix_*` wildcard (the docs use it for parser/chain families).
-CITATION = re.compile(r"(?:(test_[a-z0-9_]+\.py))?::([a-z0-9_]+\*?)")
+# A citation is `test_foo.py::test_bar`, a bare `::test_bar` continuing the
+# module named earlier in the SAME cell, or a `::test_prefix_*` family wildcard.
+CITATION = re.compile(r"(test_[a-z0-9_]+\.py)?::(test_[a-z0-9_]*\*?)(?![a-z0-9_*])")
 
 
 def _defined_tests() -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    for f in sorted(TESTS.glob("test_*.py")):
-        out[f.name] = set(re.findall(r"^def (test_[a-z0-9_]+)", f.read_text(), re.M))
-    return out
+    return {
+        f.name: set(re.findall(r"^def (test_[a-z0-9_]+)", f.read_text(), re.M))
+        for f in sorted(TESTS.glob("test_*.py"))
+    }
 
 
-def _cited() -> list[tuple[str, str, str]]:
-    """(module, test, row-excerpt) for every test cited in a table row."""
-    cited: list[tuple[str, str, str]] = []
+def _rule_rows() -> list[list[str]]:
+    """Every rule row of every table, as its cells (header/divider excluded)."""
+    rows: list[list[str]] = []
     for line in INVARIANTS.read_text().splitlines():
-        if not line.startswith("|") or "::" not in line:
+        if not line.startswith("| ") or line.startswith("| Rule "):
             continue
-        module = ""
-        for mod, name in CITATION.findall(line):
-            if mod:
-                module = mod
-            if not module or not name.startswith("test_"):
-                continue  # a bare `module::function` prose reference, not a test
-            cited.append((module, name, line[:90]))
-    return cited
+        if set(line) <= set("|- "):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split(" | ")]
+        if len(cells) >= 2:
+            rows.append(cells)
+    return rows
+
+
+def _parse_test_column(cell: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """(citations, malformed). Every `::` must yield a citation."""
+    citations: list[tuple[str, str]] = []
+    module = ""
+    consumed = 0
+    for m in CITATION.finditer(cell):
+        if m.group(1):
+            module = m.group(1)
+        if not module:
+            return citations, [f"bare `::{m.group(2)}` with no module named before it"]
+        citations.append((module, m.group(2)))
+        consumed += 1
+    total = cell.count("::")
+    if consumed != total:
+        return citations, [f"{total - consumed} of {total} `::` did not parse as a citation"]
+    return citations, []
 
 
 def test_every_test_named_in_invariants_exists() -> None:
-    """A row may not cite a test that does not exist.
-
-    Caught twice by review in one session; now it fails the gate instead.
-    """
+    """A row may not cite a test that does not exist."""
     defined = _defined_tests()
 
     def resolves(mod: str, name: str) -> bool:
@@ -59,24 +78,28 @@ def test_every_test_named_in_invariants_exists() -> None:
             return any(n.startswith(name[:-1]) for n in names)
         return name in names
 
-    missing = [
-        f"{mod}::{name}  (row: {row}...)" for mod, name, row in _cited() if not resolves(mod, name)
-    ]
+    missing: list[str] = []
+    for cells in _rule_rows():
+        for mod, name in _parse_test_column(cells[-1])[0]:
+            if not resolves(mod, name):
+                missing.append(f"{mod}::{name}   (rule: {cells[0][:70]}...)")
     assert not missing, "docs/INVARIANTS.md cites tests that do not exist:\n" + "\n".join(missing)
 
 
-def test_invariants_rows_actually_cite_a_test() -> None:
-    """Every rule row must name at least one enforcing test.
+def test_invariants_citations_are_well_formed() -> None:
+    """FAIL CLOSED: a `::` in a test column that does not parse is a defect.
 
-    A row with an empty test column is a rule nothing protects.
+    Without this, `:: test_foo` and `::tets_foo` satisfied "the row names a
+    test" while being validated by nothing.
     """
-    offenders: list[str] = []
-    for line in INVARIANTS.read_text().splitlines():
-        if not line.startswith("| ") or line.startswith("| Rule ") or set(line) <= set("|- "):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split(" | ")]
-        if len(cells) < 2:
-            continue
-        if "::" not in cells[-1]:
-            offenders.append(cells[0][:100])
+    bad: list[str] = []
+    for cells in _rule_rows():
+        for problem in _parse_test_column(cells[-1])[1]:
+            bad.append(f"{problem}   (rule: {cells[0][:70]}...)")
+    assert not bad, "docs/INVARIANTS.md has malformed test citations:\n" + "\n".join(bad)
+
+
+def test_invariants_rows_actually_cite_a_test() -> None:
+    """Every rule row must name at least one enforcing test."""
+    offenders = [cells[0][:100] for cells in _rule_rows() if not _parse_test_column(cells[-1])[0]]
     assert not offenders, "INVARIANTS rows with no enforcing test named:\n" + "\n".join(offenders)

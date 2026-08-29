@@ -341,7 +341,7 @@ allow list is honoured. No other test may spawn `git`.
 ## Documentation contract (`docs/INVARIANTS.md` itself)
 | Rule | Test |
 |---|---|
-| Every rule row NAMES at least one enforcing test, and every test it names EXISTS (a `::test_prefix_*` wildcard is satisfied by any test with that prefix). Checked mechanically because it was broken twice in one session - rows cited tests that did not exist, and rows stated rules their named tests did not exercise. The SECOND half cannot be automated: whether a named test actually exercises its rule is established by MUTATION-CHECKING it (delete the rule, confirm the test fails) when the row is written | `test_invariants_doc.py::test_every_test_named_in_invariants_exists`, `::test_invariants_rows_actually_cite_a_test` |
+| Every rule row NAMES at least one enforcing test, and every test it names EXISTS (a `::test_prefix_*` wildcard is satisfied by any test with that prefix). Checked mechanically because it was broken three times in one session. The gate FAILS CLOSED: every `::` in a test column must parse as a real citation, because the first version SKIPPED what it could not parse, so `:: test_foo` (stray space) and `::tets_foo` (typo) satisfied "names a test" while being validated by nothing. The SECOND half cannot be automated: whether a named test actually exercises its rule is established by MUTATION-CHECKING it (delete the rule, confirm the test fails) when the row is written | `test_invariants_doc.py::test_every_test_named_in_invariants_exists`, `::test_invariants_citations_are_well_formed`, `::test_invariants_rows_actually_cite_a_test` |
 
 ## Gate
 `task ci` = ruff check + ruff format --check + mypy strict (src) + mypy (eval)

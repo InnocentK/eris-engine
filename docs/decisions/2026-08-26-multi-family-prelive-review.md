@@ -863,3 +863,40 @@ That is unautomatable and is what mutation-checking a new row is for. The
 register now carries a row for itself saying so.
 
 Gate: exit 0, 1056 passed, 95.50%, pip-audit clean.
+
+## Tenth stop-gate finding: the documentation gate itself failed open (2026-08-29)
+
+Correct, and the gate I had just written to close a class was an instance of it.
+Probed it the way the standing rule says to, and two shapes walked straight
+through:
+
+| planted citation | old gate |
+|---|---|
+| `:: test_foo` (stray space) | **MISSED** |
+| `::tets_foo` (typo, not `test_*`) | **MISSED** |
+| `tests/test_x.py::...` (path prefix) | caught |
+| `Test_X.py::...` (capitalised) | caught |
+| `::test_no_such_name` | caught |
+
+Both misses share one cause: the parser **skipped what it could not interpret**.
+A row still contained `::`, so "this row names a test" passed, while the text it
+named was validated by nothing. The `not name.startswith("test_")` guard existed
+to let prose references like `eval/score.py::score_cell` through, and it let
+typos through with them.
+
+Fixed by failing closed and by separating the two jobs structurally: prose
+references live in the RULE column and are ignored; the TEST column is parsed
+strictly, and **every `::` in it must yield a citation or the gate fails**
+(`test_invariants_citations_are_well_formed`). Re-probed: all eight shapes are
+now caught, including three I had not thought to try (`::` with nothing after
+it, a nonexistent wildcard family, an emptied test column). 18 prose references
+in rule columns are correctly unaffected.
+
+Gate: exit 0, 1057 passed, 95.50%, pip-audit clean.
+
+**Ten findings, and the shape never changed.** Guards that skip the input they
+cannot interpret; comparisons that read an attempt instead of an outcome; rules
+satisfied by their encoding rather than their meaning. The lesson is not "be
+careful" - it is that **a new guard is itself an artifact that must be probed
+with degenerate input before it is trusted**, and that includes a guard written
+to enforce this very discipline.
