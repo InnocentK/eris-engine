@@ -36,18 +36,35 @@ def _defined_tests() -> dict[str, set[str]]:
     }
 
 
-def _rule_rows() -> list[list[str]]:
-    """Every rule row of every table, as its cells (header/divider excluded)."""
+def _split_row(line: str) -> list[str]:
+    """Cells of a markdown table row, tolerant of `|a|b|`, `| a | b |` and tabs."""
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _rule_rows() -> tuple[list[list[str]], list[str]]:
+    """(rule rows as cells, malformed lines).
+
+    FAIL CLOSED at the ROW level too. The first version collected only the rows
+    it recognised - `line.startswith("| ")` plus a `" | "` split - and silently
+    dropped every other line beginning with `|`. A rule written `|rule|test|`
+    escaped validation completely, typo'd citation and all: the same
+    skip-what-you-cannot-parse defect as the citation parser, one layer up.
+    """
     rows: list[list[str]] = []
-    for line in INVARIANTS.read_text().splitlines():
-        if not line.startswith("| ") or line.startswith("| Rule "):
+    malformed: list[str] = []
+    for n, line in enumerate(INVARIANTS.read_text().splitlines(), 1):
+        if not line.lstrip().startswith("|"):
             continue
-        if set(line) <= set("|- "):
+        if set(line) <= set("|-: \t"):  # divider
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split(" | ")]
-        if len(cells) >= 2:
-            rows.append(cells)
-    return rows
+        cells = _split_row(line)
+        if [c.lower() for c in cells[:2]] == ["rule", "test"]:  # header
+            continue
+        if len(cells) < 2 or not cells[0] or not line.rstrip().endswith("|"):
+            malformed.append(f"line {n}: {line[:80]}")
+            continue
+        rows.append(cells)
+    return rows, malformed
 
 
 def _parse_test_column(cell: str) -> tuple[list[tuple[str, str]], list[str]]:
@@ -79,7 +96,7 @@ def test_every_test_named_in_invariants_exists() -> None:
         return name in names
 
     missing: list[str] = []
-    for cells in _rule_rows():
+    for cells in _rule_rows()[0]:
         for mod, name in _parse_test_column(cells[-1])[0]:
             if not resolves(mod, name):
                 missing.append(f"{mod}::{name}   (rule: {cells[0][:70]}...)")
@@ -93,7 +110,7 @@ def test_invariants_citations_are_well_formed() -> None:
     test" while being validated by nothing.
     """
     bad: list[str] = []
-    for cells in _rule_rows():
+    for cells in _rule_rows()[0]:
         for problem in _parse_test_column(cells[-1])[1]:
             bad.append(f"{problem}   (rule: {cells[0][:70]}...)")
     assert not bad, "docs/INVARIANTS.md has malformed test citations:\n" + "\n".join(bad)
@@ -101,5 +118,22 @@ def test_invariants_citations_are_well_formed() -> None:
 
 def test_invariants_rows_actually_cite_a_test() -> None:
     """Every rule row must name at least one enforcing test."""
-    offenders = [cells[0][:100] for cells in _rule_rows() if not _parse_test_column(cells[-1])[0]]
+    offenders = [
+        cells[0][:100] for cells in _rule_rows()[0] if not _parse_test_column(cells[-1])[0]
+    ]
     assert not offenders, "INVARIANTS rows with no enforcing test named:\n" + "\n".join(offenders)
+
+
+def test_every_table_line_parses_as_a_rule_row() -> None:
+    """FAIL CLOSED at the ROW level: a line that looks like a table row but does
+    not parse is a defect, not something to skip.
+
+    The first version of this gate collected only the rows it recognised, so a
+    rule written `|rule|test|` - or with a missing trailing pipe, or a single
+    cell - escaped every other check in this module.
+    """
+    malformed = _rule_rows()[1]
+    assert not malformed, (
+        "docs/INVARIANTS.md has lines that look like table rows but do not parse:\n"
+        + "\n".join(malformed)
+    )

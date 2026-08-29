@@ -900,3 +900,40 @@ satisfied by their encoding rather than their meaning. The lesson is not "be
 careful" - it is that **a new guard is itself an artifact that must be probed
 with degenerate input before it is trusted**, and that includes a guard written
 to enforce this very discipline.
+
+## Eleventh stop-gate finding: the fail-closed gate still failed open, one layer up (2026-08-29)
+
+Correct. My previous round closed the CITATION parser and I re-probed only that
+layer, so I confirmed the fix I had made and not the property I had claimed.
+Probing the ROW layer found it open:
+
+| planted row | previous gate |
+|---|---|
+| `\|A rule with no test\|` (no spaces) | **MISSED** |
+| `\| A rule \|` (single cell) | **MISSED** |
+| tab-separated cells | **MISSED** |
+| `\|A rule\|\`::tets_typo\`\|` | **MISSED** |
+| row with no trailing pipe | **MISSED** |
+
+`_rule_rows` collected only lines matching `startswith("| ")` split on `" | "`,
+and silently dropped everything else beginning with `|`. A rule written
+`|rule|test|` escaped EVERY check in the module - including the citation checks
+I had just hardened. Identical defect, one layer up: skip what you cannot parse.
+
+Fixed: any line beginning with `|` that is not a divider or header must parse as
+a rule row with >= 2 cells and a trailing pipe, or the gate fails
+(`test_every_table_line_parses_as_a_rule_row`). Splitting is now on `|` rather
+than `" | "`, so `|a|b|`, `| a | b |` and tab-padded rows all parse.
+
+Re-probed BOTH layers: 6 row shapes and 6 citation shapes, all CAUGHT, and the
+real document is unchanged by the probe. Gate: exit 0, 1058 passed, 95.50%.
+
+**The lesson I keep having to relearn, stated exactly:** after fixing a guard,
+re-probe the PROPERTY, not the PATCH. I probed ten citation shapes and declared
+the gate fail-closed, having never asked whether a row could avoid reaching the
+citation parser at all. "I fixed what you showed me" has now been the shape of
+eleven findings; the countermeasure is to name the guarantee ("no rule row
+escapes validation") and probe every layer that could violate it, not the layer
+the last finding named. That is the same lesson as commit eb4edce, "guard the
+whole reporter body, not the step the last finding named" - which is in this
+repository's own history, and which I have now re-derived twice.
