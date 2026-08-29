@@ -177,6 +177,23 @@ class CellData:
     finished_ts: str | None
 
 
+def _last_proposal_per_worker(view: LedgerView) -> list[Proposal]:
+    """One proposal per worker: the LAST recorded.
+
+    A worker can record a proposal more than once in a cell. A crash between
+    `proposal.recorded` and `stage.finished` leaves the stage unfinished, so
+    resume does not trust it and re-runs that worker (`arms.load_prior`) -
+    leaving two rows for one worker. `predicted_findings` iterates every row, so
+    the duplicate would count that worker's findings twice and inflate tp/fp for
+    EVERY arm, not just `single`. `arms.load_prior` already keys proposals by
+    worker id; the scorer is the only reader that did not.
+    """
+    by_worker: dict[str, Proposal] = {}
+    for prop in view.records("proposal.recorded", Proposal):
+        by_worker[prop.worker_id] = prop
+    return list(by_worker.values())
+
+
 def read_cell(run_dir: Path) -> CellData:
     view = LedgerView.from_path(run_dir / "events.jsonl")  # raises LedgerCorrupt
     arm_runs = view.records("arm.finished", ArmRun)
@@ -192,7 +209,7 @@ def read_cell(run_dir: Path) -> CellData:
         run_dir=run_dir,
         view=view,
         arm_run=arm_runs[-1],
-        proposals=view.records("proposal.recorded", Proposal),
+        proposals=_last_proposal_per_worker(view),
         raw=raws[-1] if raws else None,
         enforced=enforced[-1] if enforced else None,
         scan=scans[-1] if scans else None,

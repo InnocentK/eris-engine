@@ -854,3 +854,48 @@ def test_pairing_ignores_a_reused_event_whose_replay_was_rejected() -> None:
     )
     cell2 = SimpleNamespace(view=view2, arm_run=SimpleNamespace(propose_keys=[shared]))
     assert _reused_propose_keys(cell2) == []
+
+
+def test_a_worker_that_recorded_twice_counts_once() -> None:
+    """M11 / multiplicity audit: one proposal per worker, the LAST recorded.
+
+    A crash between `proposal.recorded` and `stage.finished` leaves the stage
+    unfinished, so resume does not trust it and re-runs that worker - leaving
+    two `proposal.recorded` rows for one worker. `predicted_findings` iterates
+    every row, so the duplicate would count that worker's findings twice and
+    inflate tp/fp for EVERY arm. `arms.load_prior` already keys proposals by
+    worker id; the scorer was the only reader that did not.
+    """
+    from eval.score import _last_proposal_per_worker
+
+    golden = json.loads(
+        (Path(__file__).parent / "fixtures" / "records" / "0.1.5" / "proposal.json").read_text()
+    )
+
+    def prop(worker: str, desc: str) -> dict[str, Any]:
+        return {
+            **golden,
+            "worker_id": worker,
+            "findings": [
+                {
+                    **golden["findings"][0],
+                    "description": desc,
+                }
+            ],
+        }
+
+    class _View:
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self._rows = rows
+
+        def records(self, kind: str, model: Any) -> list[Any]:
+            return [model.model_validate(r) for r in self._rows]
+
+    # the stale first row and the re-spawn that replaced it
+    out = _last_proposal_per_worker(
+        _View([prop("claude", "stale"), prop("claude", "kept"), prop("grok", "other")])
+    )
+    assert len(out) == 2, "the duplicated worker must collapse to one proposal"
+    by_worker = {p.worker_id: p for p in out}
+    assert [f.description for f in by_worker["claude"].findings] == ["kept"]
+    assert [f.description for f in by_worker["grok"].findings] == ["other"]

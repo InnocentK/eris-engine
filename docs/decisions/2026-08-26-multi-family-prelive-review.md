@@ -641,3 +641,40 @@ an attempt when a key finishes twice) -> keyed on the last one (the outcome).
 When a guard asks "did X happen?", the answer must come from the FINAL state of
 X, and every ledger read must ask whether the event it reads can occur more than
 once per key.
+
+## Multiplicity audit of every ledger read in the scorer (2026-08-29)
+
+Prompted by the pairing guard getting the attempt-vs-outcome error three times.
+Rather than chase the next instance, every ledger read in `eval/score.py` was
+enumerated and asked the same question: **can this event occur more than once
+per key, and does the consumer assume it cannot?**
+
+| Read | Can repeat? | Handling | Verdict |
+|---|---|---|---|
+| `records("arm.finished")` | yes (resume) | `arm_runs[-1]` | OK |
+| `manifest(run_dir)` | no (one file) | - | OK |
+| `records("adjudication.raw")` | yes (`adjudicate_iter`, cap 3) | `raws[-1]` | OK |
+| `records("adjudication.enforced")` | yes (same) | `enforced[-1]` | OK |
+| `records("scan.result")` | yes (scan + re-scan) | `scans[-1]` | OK |
+| `of_kind("run.started")` | yes (resume) | `started[0]` - deliberate, the run's ORIGINAL snapshot | OK |
+| `of_kind("arm.finished")` | yes | `finished[-1]` | OK |
+| `payloads("stage.finished")` | yes | last-per-key (fixed `db571a4`) | OK |
+| **`records("proposal.recorded")`** | **yes** | **whole list** | **DEFECT** |
+
+Seven of nine already took the last (or deliberately the first). One did not.
+
+**M11 confirmed and fixed.** A crash between `proposal.recorded` and
+`stage.finished` leaves the stage unfinished, so resume does not trust it and
+re-runs that worker - two rows for one worker. `predicted_findings` iterates
+every row (`sources = cell.proposals` in BOTH branches), so the duplicate
+counted that worker's findings twice and inflated tp/fp for **every arm**, not
+just `single` as originally filed. `arms.load_prior` already keys proposals by
+worker id (`prior.proposals[prop.worker_id] = prop`); the scorer was the only
+reader that did not. Fixed by `_last_proposal_per_worker`, one row per worker,
+last wins. Test `test_a_worker_that_recorded_twice_counts_once`,
+mutation-checked (removing the dedup makes it fail).
+
+Gate: exit 0, 1049 passed, 95.50%, pip-audit clean.
+
+This closes the multiplicity class in the scorer. The same audit has NOT been
+run over `eval/run.py` or `src/eris/arms.py` readers.
