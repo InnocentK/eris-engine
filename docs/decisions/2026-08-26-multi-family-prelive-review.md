@@ -1131,3 +1131,38 @@ Gate: exit 0, 1117 passed, 95.50%, pip-audit clean.
 in it asserted "the gate rejects X". A gate that rejected everything would have
 passed all 50. Any validator's regression net needs both halves - the inputs it
 must refuse AND the inputs it must accept - or it only measures strictness.
+
+## Seventeenth stop-gate finding: pipe-less termination was fail-open (2026-08-29)
+
+Correct, and it is the cost of last round's fix. Ending the table on a pipe-less
+line stopped the thematic-break false positive, but it also meant that line was
+never examined - so a rule row whose pipes were lost, carrying a citation to a
+test that does not exist, ended the table and left silently:
+
+    | Rule | Test |
+    |---|---|
+    | a real rule | `test_x.py::test_y` |
+    a rule with no pipes `::tets_typo`      <- ends the table, validated by NOTHING
+
+Fixed narrowly: a pipe-less line still ends the table (that is the GFM rule and
+what keeps `---` working), but if it cites a test it is reported - a rule that
+lost its pipes is exactly what that looks like. Prose paragraphs that reference
+tests legitimately sit after a blank line or heading, where the table has
+already ended, and three such paragraphs in the real document are unaffected.
+
+**The mutation check caught my test being right for the wrong reason.** The
+three new cases passed immediately, but removing the guard they were meant to
+pin changed nothing - because `GOOD_ROW` has no trailing newline, so each case
+concatenated into ONE line, was parsed as a table row, and was rejected by the
+citation checker instead. With the newline fixed, removing the guard fails all
+three. A test that passes is not evidence; a test that fails when its rule is
+deleted is.
+
+Gate: exit 0, 1121 passed, 95.50%, pip-audit clean.
+
+**Rounds 16 and 17 are one oscillation:** the fix for failing-open created a
+false positive, and the fix for THAT re-opened a narrower fail-open. Each was a
+real defect and each fix was correct in isolation. What stops the oscillation is
+holding both directions at once - the net now asserts 53 inputs must be rejected
+AND 7 must be accepted, so neither correction can be made without the other
+being re-checked.

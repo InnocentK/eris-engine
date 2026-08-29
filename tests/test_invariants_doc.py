@@ -116,6 +116,17 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             # table - it is not a malformed row. Without this a thematic break
             # (`---`) written directly under a table row was rejected as a bad
             # row: a false positive on valid Markdown.
+            #
+            # But ending the table must not become a way to SMUGGLE a rule past
+            # every check: a line here that cites a test is a rule row whose
+            # pipes were lost, and skipping it silently is fail-open. Prose
+            # paragraphs that legitimately reference tests sit after a blank
+            # line or heading, where `in_table` is already False.
+            if "::" in line:
+                malformed.append(
+                    f"line {n}: ends the table but cites a test - a rule row with "
+                    f"its pipes lost is validated by nothing: {stripped[:60]}"
+                )
             in_table = False
             continue
         cells = _split_row(line)
@@ -305,6 +316,15 @@ MALFORMED_DOCS = {
     "bad row last line after a valid table": (
         f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n\n{BAD_ROW}"
     ),
+    "pipe-less line carrying a citation": (
+        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\na rule with no pipes `::tets_typo`\n"
+    ),
+    "indented pipe-less rule": (
+        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n    a rule `::tets_typo`\n"
+    ),
+    "pipe-less line, plausible citation": (
+        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\na rule `test_score.py::test_nope`\n"
+    ),
     "two tables with no separator": (
         f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n| Rule | Test |\n|---|---|\n{BAD_ROW}\n"
     ),
@@ -348,6 +368,7 @@ VALID_DOCS = {
     "prose directly under a row": "Some prose paragraph.\n",
     "nothing after the table": "",
     "another section follows": "\n## Another section\n\nProse.\n",
+    "prose citing a test after a blank line": "\nSee `test_x.py::test_y` for context.\n",
 }
 
 
