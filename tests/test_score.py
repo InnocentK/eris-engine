@@ -825,19 +825,6 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
     }
     assert out["4-3"]["paired"] is False
 
-    # DEGENERATE: an arm with no propose output at all must not pair. Empty key
-    # sets make "nothing differs" trivially true, which would report a
-    # controlled comparison between two cells that shared nothing.
-    empty = CellScore(
-        **{**cell("indep_verify", {}).__dict__, "propose_keys": [], "propose_blobs": {}}
-    )
-    empty_t = CellScore(
-        **{**cell("indep_verify_critique", {}).__dict__, "propose_keys": [], "propose_blobs": {}}
-    )
-    out = {p["pair"]: p for p in paired_deltas([empty, empty_t])}
-    assert out["4-3"]["paired"] is False
-    assert "no propose output" in out["4-3"]["reason"]
-
     # genuine sharing still pairs
     out = {
         p["pair"]: p
@@ -947,3 +934,82 @@ def test_propose_blobs_read_the_kept_outcome_not_an_attempt() -> None:
     # a key the ArmRun never recorded is ignored
     other = {"stage": "propose", "idempotency_key": "z" * 64, "ok": True, "blobs": ["z"]}
     assert _propose_blobs(cell([{**fin, "blobs": ["kept"]}, other])) == {k: ["kept"]}
+
+
+def test_an_arm_with_no_propose_output_never_pairs() -> None:
+    """C1, degenerate shape: an arm that recorded NO propose output must not pair.
+
+    Empty key sets make "nothing differs" trivially true, so the guard would
+    report a controlled comparison between two cells that shared nothing because
+    there was nothing to share - pairing on the ABSENCE OF A DIFFERENCE rather
+    than on evidence of sameness. Reachable whenever every worker in an arm is
+    absent, or no propose stage finished ok.
+    """
+    from eval.score import CellScore
+
+    def cell(arm: str, keys: list[str], blobs: dict[str, list[str]]) -> Any:
+        return CellScore(
+            run_id=f"r-{arm}",
+            task_id="t",
+            arm=arm,
+            repeat_index=0,
+            category="control",
+            included=True,
+            exclusion=None,
+            verdict="REVISE",
+            verdict_basis="enforced",
+            precision=0.5,
+            recall=0.5,
+            tp=1,
+            fp=1,
+            fn=1,
+            distractor_hits=0,
+            unsupported_claim_rate=0.0,
+            downgrades=0,
+            confident_wrong=False,
+            abstained=False,
+            expected_abstain=False,
+            cost_spent_usd=1.0,
+            cost_attributed_usd=1.0,
+            cost_by_stage_spent={},
+            cost_by_stage_attributed={},
+            unknown_cost_records=0,
+            wall_ms=1,
+            attempts=1,
+            propose_keys=keys,
+            propose_blobs=blobs,
+            contaminated=False,
+            scan_incomplete=False,
+            rescan_contaminated=False,
+            containment=None,
+        )
+
+    k = "a" * 64
+    # neither arm produced a proposal
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [cell("indep_verify", [], {}), cell("indep_verify_critique", [], {})]
+        )
+    }
+    assert out["4-3"]["paired"] is False
+    assert "no propose output" in out["4-3"]["reason"]
+    assert "delta_recall" not in out["4-3"]
+
+    # only the BASE arm is empty
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [cell("indep_verify", [], {}), cell("indep_verify_critique", [k], {k: ["s"]})]
+        )
+    }
+    assert out["4-3"]["paired"] is False and "no propose output" in out["4-3"]["reason"]
+
+    # only the TREATMENT arm is empty
+    out = {
+        p["pair"]: p
+        for p in paired_deltas(
+            [cell("indep_verify", [k], {k: ["s"]}), cell("indep_verify_iter", [], {})]
+        )
+    }
+    assert out["3b-3"]["paired"] is False and "no propose output" in out["3b-3"]["reason"]

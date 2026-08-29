@@ -835,3 +835,31 @@ Gate: exit 0, 1053 passed, 95.50%.
 
 The probe cost about two minutes and found a defect that seven rounds of review,
 a Codex advisor pass and a three-family panel had all missed.
+
+## Ninth stop-gate finding: the empty-arm rule did not name its test (2026-08-29)
+
+Correct on the contract, though the rule WAS enforced (mutation-checked) - the
+assertion sat inside a test named for a different case, so `INVARIANTS.md`
+stated a rule no row could be traced to. Given two earlier findings of exactly
+this shape, precision here is not pedantry.
+
+Fixed twice over:
+
+1. The rule was extracted into its own named test,
+   `test_an_arm_with_no_propose_output_never_pairs` (covering neither-arm,
+   base-only and treatment-only empty), and the C1 row now cites it.
+2. **The contract is now self-enforcing.** `tests/test_invariants_doc.py`
+   asserts that every rule row names at least one test and that every test it
+   names exists (understanding the `::test_prefix_*` wildcard the docs already
+   used). Both failure modes were verified by planting them: a citation to a
+   nonexistent test, and a row with an empty test column - each is CAUGHT.
+
+Writing that check immediately paid: it flagged five citations, all of which
+turned out to be the wildcard convention my first regex did not understand. I
+would otherwise have "fixed" correct documentation.
+
+What it deliberately does NOT check: whether a named test EXERCISES its rule.
+That is unautomatable and is what mutation-checking a new row is for. The
+register now carries a row for itself saying so.
+
+Gate: exit 0, 1056 passed, 95.50%, pip-audit clean.
