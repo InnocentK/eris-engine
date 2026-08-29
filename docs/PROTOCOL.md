@@ -136,10 +136,19 @@ Applied by `enforce_rulings` to every adjudication, after the model answers:
   `human_entered` `document_quote`s, so the weaker rule let a claim be
   SUPPORTED by the question that asked about it (`REF_NOT_MECHANICAL`).
 * Three or more cumulative downgrades force the verdict to `ESCALATE`.
-* **The verdict itself must rest on evidence.** An `ACCEPT` is forced to
-  `ESCALATE` (`VERDICT_UNSUPPORTED`, 0.4.0) unless at least one ruling
-  **survives enforcement as `SUPPORTED` or `REFUTED` AND names a claim that
-  exists**. Each half is load-bearing:
+* **The verdict itself must rest on evidence, and must resolve the claims.**
+  An `ACCEPT` is forced to `ESCALATE` unless BOTH hold:
+  1. at least one ruling **survives enforcement as `SUPPORTED` or `REFUTED` AND
+     names a claim that exists** (`VERDICT_UNSUPPORTED`, 0.4.0); and
+  2. **every claim carries a ruling and none is `CONTESTED`**
+     (`VERDICT_UNRESOLVED_CLAIMS`, 0.4.0). `claims` is every claim from every
+     proposal, so a claim with no ruling was never adjudicated - silently
+     ignoring "there is a null deref at line 42" and answering ACCEPT is the
+     failure this engine exists to prevent. `CONTESTED` is an open dispute, not
+     a resolution; `UNSUPPORTED` IS one ("that claim was not backed") and does
+     not block ACCEPT.
+
+  For (1), each half is load-bearing:
   - `REFUTED` counts because if every adverse claim is mechanically refuted the
     proposed answer IS defensible; demanding `SUPPORTED` would escalate a
     legitimate ACCEPT.

@@ -754,3 +754,37 @@ The Google lens produced nothing on THREE attempts across two rounds (headless
 `agy` auto-denies `read_file` outside `--add-dir`, then `command` even inside
 it). **The test-enforcement lens was never covered by an independent family** -
 only by my own mutation checks. That is the weakest part of this review.
+
+## Sixth stop-gate finding: ACCEPT could ignore unresolved claims (2026-08-29)
+
+Correct, and it was a hole in H3's ACCEPT rule as merged. The rule asked whether
+ACCEPT **rested on** something evidenced; it never asked whether ACCEPT had
+**resolved** what the panel raised. Verified by running it:
+
+    3 claims exist; the judge rules on ONE and ignores two
+      -> verdict ACCEPT, findings []          (no complaint at all)
+    one claim ruled CONTESTED, the rest supported
+      -> verdict ACCEPT, findings [DISSENT_EMPTY_WITH_CONTEST]  (inert, M1)
+
+`claims` is every claim from every proposal (`stages.py:1049`), so a claim with
+no ruling was never adjudicated. A proposer asserting "there is a null deref at
+line 42" could be silently ignored and the answer declared defensible - the
+exact failure this engine exists to prevent. And `CONTESTED` is an open dispute,
+not a resolution; its only existing signal was a finding, and findings change
+nothing (M1, still open).
+
+Fixed: an `ACCEPT` is forced to `ESCALATE` unless BOTH (a) some ruling survives
+as SUPPORTED/REFUTED naming a real claim (`VERDICT_UNSUPPORTED`), and (b) every
+claim carries a ruling and none is `CONTESTED` (`VERDICT_UNRESOLVED_CLAIMS`).
+`UNSUPPORTED` IS a resolution - "that claim was not backed" - and does not
+block ACCEPT, which keeps the legitimate control-task path open.
+
+Both halves mutation-checked. Gate: exit 0, 1052 passed, 95.49%, pip-audit
+clean. PROTOCOL.md, INVARIANTS.md and CHANGELOG.md updated together.
+
+**Six stop-gate findings, and the shape has been consistent**: I fix the
+proposition I was shown and not the proposition that matters. "Rests on
+evidence" is not "resolves the question", just as "an attempt was reused" was
+not "the arms used the same bytes". The generalisable check before shipping a
+guard: state the guarantee in one sentence, then ask what a hostile-but-valid
+input could do while satisfying the code and violating the sentence.

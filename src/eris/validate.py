@@ -91,6 +91,7 @@ CODES: frozenset[str] = frozenset(
         "MALFORMED_LINE",
         "ESCALATED",
         "VERDICT_UNSUPPORTED",  # H3 (2026-08-27)
+        "VERDICT_UNRESOLVED_CLAIMS",  # H3 (2026-08-29)
     }
 )
 
@@ -241,28 +242,56 @@ def enforce_rulings(
     # citations - and a judge that self-declared every ruling UNSUPPORTED also
     # reached ACCEPT, because a self-declared UNSUPPORTED is not a *downgrade*
     # and never armed the escalation guard.
-    # A REFUTED ruling counts: if every adverse claim was mechanically REFUTED,
-    # the answer IS defensible and ACCEPT is well founded. Only rulings that
-    # SURVIVED enforcement qualify - anything downgraded is now UNSUPPORTED.
-    #
-    # `r.claim_id in claims` is load-bearing: a ruling naming a claim NOBODY
-    # MADE is flagged CLAIM_MISSING but is deliberately NOT downgraded (its refs
-    # were fine), so without this test a judge could satisfy the whole rule by
-    # inventing a claim id and citing real evidence at it - an ACCEPT resting on
-    # a fabricated claim. A ruling about nothing supports nothing.
-    if verdict is Verdict.ACCEPT and not any(
-        r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED) and r.claim_id in claims
-        for r in new_rulings
-    ):
-        findings.append(
-            _err(
-                "VERDICT_UNSUPPORTED",
-                "ACCEPT with no evidenced SUPPORTED/REFUTED ruling; forced to ESCALATE",
-                adj.adjudication_id,
+    # ---- ACCEPT preconditions (H3). ACCEPT asserts the proposed answer is
+    # defensible GIVEN the panel's claims and the available evidence, so it must
+    # rest on evidence AND leave nothing the panel raised unresolved.
+    if verdict is Verdict.ACCEPT:
+        accept_errors: list[str] = []
+        # (a) it must rest on something. A REFUTED ruling counts: if every
+        # adverse claim was mechanically refuted the answer IS defensible.
+        # Only rulings that SURVIVED enforcement qualify - anything downgraded
+        # is now UNSUPPORTED. `r.claim_id in claims` is load-bearing: a ruling
+        # naming a claim NOBODY MADE is flagged CLAIM_MISSING but deliberately
+        # not downgraded (its refs were fine), so without it a judge could
+        # satisfy the rule by inventing a claim id and citing real evidence.
+        if not any(
+            r.status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED) and r.claim_id in claims
+            for r in new_rulings
+        ):
+            findings.append(
+                _err(
+                    "VERDICT_UNSUPPORTED",
+                    "ACCEPT with no evidenced SUPPORTED/REFUTED ruling; forced to ESCALATE",
+                    adj.adjudication_id,
+                )
             )
-        )
-        verdict = Verdict.ESCALATE
-        escalated = True
+            accept_errors.append("unsupported")
+        # (b) it must leave nothing UNRESOLVED. A claim the judge never ruled on
+        # was not adjudicated at all - silently ignoring "there is a null deref
+        # at line 42" and returning ACCEPT is precisely the failure this engine
+        # exists to prevent. A CONTESTED ruling is an open dispute, not a
+        # resolution. UNSUPPORTED IS a resolution ("that claim was not backed"),
+        # so it does not block ACCEPT.
+        ruled = {r.claim_id for r in new_rulings}
+        unruled = sorted(set(claims) - ruled)
+        contested = sorted(r.claim_id for r in new_rulings if r.status is ClaimStatus.CONTESTED)
+        if unruled or contested:
+            detail = []
+            if unruled:
+                detail.append(f"{len(unruled)} claim(s) never ruled on: {unruled[:5]}")
+            if contested:
+                detail.append(f"{len(contested)} CONTESTED: {contested[:5]}")
+            findings.append(
+                _err(
+                    "VERDICT_UNRESOLVED_CLAIMS",
+                    "ACCEPT leaves claims unresolved (" + "; ".join(detail) + ")",
+                    adj.adjudication_id,
+                )
+            )
+            accept_errors.append("unresolved")
+        if accept_errors:
+            verdict = Verdict.ESCALATE
+            escalated = True
     enforced = adj.model_copy(
         update={
             "rulings": new_rulings,

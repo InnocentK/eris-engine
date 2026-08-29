@@ -19,6 +19,11 @@ recorded before this version may score differently.
   runs FIRST so it keeps its own `ESCALATED` finding when both apply.
   Fired on its first live run: 4x `REF_NOT_MECHANICAL`, the judge having cited
   the question to support four claims.
+  An ACCEPT must also RESOLVE the panel's claims: every claim needs a ruling and
+  none may be `CONTESTED` (`VERDICT_UNRESOLVED_CLAIMS`). A judge could otherwise
+  rule on one claim, ignore the rest, and answer ACCEPT with no complaint at
+  all - `claims` is every claim from every proposal, so an unruled claim was
+  never adjudicated. `UNSUPPORTED` is a resolution and does not block.
   The ACCEPT rule counts a ruling only when its claim EXISTS: a ruling naming a
   claim nobody made is flagged `CLAIM_MISSING` but deliberately not downgraded
   (its refs were fine), so without that test a judge could satisfy the whole

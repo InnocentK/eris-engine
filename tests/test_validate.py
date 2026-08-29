@@ -621,3 +621,76 @@ def test_accept_may_rest_on_a_mechanically_refuted_ruling_alone() -> None:
     assert enforced.rulings[0].status is ClaimStatus.UNSUPPORTED
     assert "VERDICT_UNSUPPORTED" in codes(findings)
     assert enforced.verdict is Verdict.ESCALATE
+
+
+def test_accept_cannot_leave_a_claim_unresolved() -> None:
+    """H3, stop-gate finding: ACCEPT must RESOLVE the panel's claims, not merely
+    rest on one of them.
+
+    `claims` is every claim from every proposal (`stages.py`: `{c.claim_id: c
+    for p in proposals for c in p.claims}`), so a claim with no ruling was never
+    adjudicated at all. Silently ignoring "there is a null deref at line 42" and
+    returning ACCEPT is exactly the failure this engine exists to prevent. A
+    CONTESTED ruling is an open dispute, not a resolution. UNSUPPORTED IS a
+    resolution - "that claim was not backed" - so it does not block ACCEPT.
+    """
+    claims = {cid: claim(cid) for cid in ("c_01", "c_02", "c_03")}
+
+    def supported_on(cid: str) -> Ruling:
+        return Ruling(claim_id=cid, status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+
+    # ruled on one of three: the other two were ignored
+    enforced, findings = enforce_rulings(
+        adjudication([supported_on("c_01")], verdict=Verdict.ACCEPT), claims, EVIDENCE
+    )
+    assert "VERDICT_UNRESOLVED_CLAIMS" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE and enforced.escalated_by_engine
+    assert "c_02" in findings[0].message and "c_03" in findings[0].message
+
+    # a CONTESTED claim is an open dispute
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [
+                supported_on("c_01"),
+                supported_on("c_02"),
+                Ruling(claim_id="c_03", status=ClaimStatus.CONTESTED, evidence_refs=["e_01"]),
+            ],
+            verdict=Verdict.ACCEPT,
+            dissent=[Dissent(dissent_id="d", position="p")],
+        ),
+        claims,
+        EVIDENCE,
+    )
+    assert "VERDICT_UNRESOLVED_CLAIMS" in codes(findings)
+    assert enforced.verdict is Verdict.ESCALATE
+
+    # UNSUPPORTED is a resolution, not an open question
+    enforced, findings = enforce_rulings(
+        adjudication(
+            [
+                supported_on("c_01"),
+                supported_on("c_02"),
+                Ruling(claim_id="c_03", status=ClaimStatus.UNSUPPORTED),
+            ],
+            verdict=Verdict.ACCEPT,
+        ),
+        claims,
+        EVIDENCE,
+    )
+    assert "VERDICT_UNRESOLVED_CLAIMS" not in codes(findings)
+    assert enforced.verdict is Verdict.ACCEPT
+
+    # every claim resolved: ACCEPT stands
+    enforced, findings = enforce_rulings(
+        adjudication([supported_on(c) for c in claims], verdict=Verdict.ACCEPT),
+        claims,
+        EVIDENCE,
+    )
+    assert enforced.verdict is Verdict.ACCEPT and codes(findings) == []
+
+    # a non-ACCEPT verdict is untouched by this rule
+    enforced, findings = enforce_rulings(
+        adjudication([supported_on("c_01")], verdict=Verdict.REVISE), claims, EVIDENCE
+    )
+    assert "VERDICT_UNRESOLVED_CLAIMS" not in codes(findings)
+    assert enforced.verdict is Verdict.REVISE
