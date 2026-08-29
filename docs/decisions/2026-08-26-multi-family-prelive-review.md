@@ -1166,3 +1166,36 @@ real defect and each fix was correct in isolation. What stops the oscillation is
 holding both directions at once - the net now asserts 53 inputs must be rejected
 AND 7 must be accepted, so neither correction can be made without the other
 being re-checked.
+
+## Eighteenth stop-gate finding: `ab46284` was itself a false positive (2026-08-29)
+
+Correct. The lost-pipe guard I added last round triggered on ANY `::` in the
+line that ends a table, which rejected ordinary prose written directly under a
+table without a blank line:
+
+    | a real rule | `test_x.py::test_y` |
+    See `eris.validate::enforce_rulings` for the implementation.   <- REJECTED
+
+Three valid shapes were affected: prose citing a symbol, prose citing a pytest
+id, and a bare `::` in a sentence. All are valid Markdown.
+
+Fixed by triggering on the SHAPE of the thing being guarded rather than on one
+of its characters. A rule row's test column is LAST, so a row that lost its
+pipes ends with its citation; prose continues past it. The trigger is now a
+backticked citation anchored to end-of-line. Six valid shapes accepted
+(including prose that ends in a citation followed by a full stop), three
+lost-pipe shapes still caught.
+
+Both directions are pinned by mutation: deleting the guard fails 3 tests,
+widening it back to `"::" in line` fails 4.
+
+Gate: exit 0, 1125 passed, 95.50%, pip-audit clean.
+
+**This is the third correction in a row on the same guard, and the pattern is
+now legible.** Each time I reached for the cheapest available signal - "contains
+`|`", "contains `::`" - rather than the property that actually distinguishes the
+two cases. A character test cannot separate "a rule row that lost its pipes"
+from "a sentence that mentions a test"; only the STRUCTURE can (where the
+citation sits in the line). When a guard oscillates between false positives and
+false negatives, the trigger is measuring the wrong thing, and adding more
+special cases will keep it oscillating.

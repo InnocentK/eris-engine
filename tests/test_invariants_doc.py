@@ -122,10 +122,16 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             # pipes were lost, and skipping it silently is fail-open. Prose
             # paragraphs that legitimately reference tests sit after a blank
             # line or heading, where `in_table` is already False.
-            if "::" in line:
+            # ...but only when the line has the SHAPE of a rule row that lost
+            # its pipes: the test column is last, so the citation sits at the
+            # END. Triggering on any `::` rejected ordinary prose that follows a
+            # table without a blank line ("See `test_x.py::test_y` for detail."),
+            # which is valid Markdown - failing closed on good input.
+            if re.search(r"`[^`]*::[^`]*`\s*$", line):
                 malformed.append(
-                    f"line {n}: ends the table but cites a test - a rule row with "
-                    f"its pipes lost is validated by nothing: {stripped[:60]}"
+                    f"line {n}: ends the table but LOOKS like a rule row whose pipes "
+                    f"were lost (it ends in a test citation), so it is validated by "
+                    f"nothing: {stripped[:60]}"
                 )
             in_table = False
             continue
@@ -369,6 +375,12 @@ VALID_DOCS = {
     "nothing after the table": "",
     "another section follows": "\n## Another section\n\nProse.\n",
     "prose citing a test after a blank line": "\nSee `test_x.py::test_y` for context.\n",
+    # directly after a table row, with NO blank line - all valid Markdown that a
+    # `"::" in line` trigger wrongly rejected
+    "prose citing a symbol, no blank line": "See `eris.validate::enforce_rulings` for detail.\n",
+    "prose citing a pytest id, no blank line": "See `test_x.py::test_y` for the details.\n",
+    "bare :: in a sentence": "The judge uses stages::invoke here, which matters.\n",
+    "prose ENDING in a citation": "The enforcing test is `test_x.py::test_y`.\n",
 }
 
 
