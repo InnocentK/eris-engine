@@ -37,31 +37,52 @@ def _defined_tests() -> dict[str, set[str]]:
 
 
 def _split_row(line: str) -> list[str]:
-    """Cells of a markdown table row, tolerant of `|a|b|`, `| a | b |` and tabs."""
+    """Cells of a GFM table row. Outer pipes are optional; padding is arbitrary."""
     return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_divider(line: str) -> bool:
+    return bool(line.strip()) and set(line) <= set("|-: \t")
 
 
 def _rule_rows() -> tuple[list[list[str]], list[str]]:
     """(rule rows as cells, malformed lines).
 
-    FAIL CLOSED at the ROW level too. The first version collected only the rows
-    it recognised - `line.startswith("| ")` plus a `" | "` split - and silently
-    dropped every other line beginning with `|`. A rule written `|rule|test|`
-    escaped validation completely, typo'd citation and all: the same
-    skip-what-you-cannot-parse defect as the citation parser, one layer up.
+    Rows are identified by TABLE MEMBERSHIP, not by a syntactic prefix. Three
+    earlier versions matched individual lines and skipped whatever did not fit,
+    so rules escaped validation entirely: `|rule|test|` (no padding), a row with
+    no LEADING pipe (valid GFM), and a body row whose first cells happened to
+    read "Rule"/"Test" (mistaken for a header). A table is a header line plus a
+    divider; every line after it, until the table ends, is a rule row and MUST
+    parse. The header and divider are skipped BY POSITION, so nothing in the
+    body can disguise itself as one.
     """
+    lines = INVARIANTS.read_text().splitlines()
     rows: list[list[str]] = []
     malformed: list[str] = []
-    for n, line in enumerate(INVARIANTS.read_text().splitlines(), 1):
-        if not line.lstrip().startswith("|"):
+    in_table = False
+    for n, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            in_table = False
             continue
-        if set(line) <= set("|-: \t"):  # divider
+        if _is_divider(line) and n >= 2 and "|" in lines[n - 2]:
+            in_table = True  # this is the divider; the line above was the header
+            continue
+        if not in_table:
+            # a stray table-looking line outside any table would never be
+            # validated, so it is a defect rather than something to ignore
+            if (
+                "|" in line
+                and not _is_divider(line)
+                and n < len(lines)
+                and not _is_divider(lines[n])
+            ):
+                malformed.append(f"line {n}: table-shaped line outside any table: {stripped[:70]}")
             continue
         cells = _split_row(line)
-        if [c.lower() for c in cells[:2]] == ["rule", "test"]:  # header
-            continue
-        if len(cells) < 2 or not cells[0] or not line.rstrip().endswith("|"):
-            malformed.append(f"line {n}: {line[:80]}")
+        if len(cells) < 2 or not cells[0]:
+            malformed.append(f"line {n}: does not parse as a rule row: {stripped[:70]}")
             continue
         rows.append(cells)
     return rows, malformed

@@ -937,3 +937,41 @@ escapes validation") and probe every layer that could violate it, not the layer
 the last finding named. That is the same lesson as commit eb4edce, "guard the
 whole reporter body, not the step the last finding named" - which is in this
 repository's own history, and which I have now re-derived twice.
+
+## Twelfth stop-gate finding: rows STILL escaped (2026-08-29)
+
+Correct a third consecutive time on the same gate, and my probe was the reason
+I missed it: I planted malformed rows before a heading - OUTSIDE any table -
+and separately hardened the citation parser. I never planted a malformed row
+INSIDE a table body, which is where a real one would live.
+
+Three more escapes:
+
+| planted row (inside a table) | previous gate |
+|---|---|
+| no LEADING pipe (valid GFM: `A rule \| test \|`) | **MISSED** |
+| no leading pipe and no test | **MISSED** |
+| body row whose first cells read `Rule`/`Test` | **MISSED** |
+
+Same root cause for the third time: rows were identified by a SYNTACTIC PREFIX
+(`startswith("|")`) and by CONTENT (`cells[:2] == ["rule","test"]` meant
+"header"), so anything not matching the prefix was skipped, and anything
+matching the header shape was skipped wherever it appeared.
+
+Fixed STRUCTURALLY: a table is a header line followed by a divider; every line
+until the table ends is a rule row and must parse. Header and divider are
+skipped **by position**, so no body row can disguise itself as either. Outer
+pipes are optional per GFM. A table-shaped line outside any table is itself a
+defect, because nothing would validate it.
+
+Re-probed with rows planted INSIDE a real table: 8 row shapes, 3 citation
+shapes, 2 outside-a-table shapes - **13 of 13 caught**, real document unchanged.
+Gate: exit 0, 1058 passed, 95.50%.
+
+**What actually went wrong three times running is the PROBE, not the fix.** Each
+round I probed the shape the previous finding named, in the position that was
+convenient, and read "all caught" as "the property holds". A probe that only
+exercises the case you already know about measures nothing. The property here
+was "no rule row escapes validation"; the probe must therefore place a bad row
+in every position a real row can occupy - inside a table, at its edges, outside
+one - not in the one position I happened to pick.
