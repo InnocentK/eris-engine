@@ -1088,3 +1088,46 @@ Gate: exit 0, 1111 passed, 95.50%, pip-audit clean.
 **A multi-hunk edit that asserts per hunk and writes once is all-or-nothing, and
 silently.** Verify the edit landed - grep for it - before measuring its effect;
 otherwise the measurement describes a file that was never changed.
+
+## Sixteenth stop-gate finding: the gate rejected valid Markdown (2026-08-29)
+
+Correct, and it is a regression I introduced LAST round with an edit that closed
+no hole. Removing the `"|" in lines[n-2]` precondition meant any line built from
+`|-: ` was treated as a table divider - including a **thematic break**:
+
+    ## S
+    | Rule | Test |
+    |---|---|
+    | a rule | `test_...` |
+
+    Prose.
+
+    ---            <- read as a table divider
+
+    More prose.    <- read as table rows
+
+The prose line above the break was rejected as a malformed header, and the prose
+below it parsed as rule rows. `docs/INVARIANTS.md` happens to contain no
+horizontal rule today, so the gate passed by luck; the next one would have
+blocked the gate on correct documentation.
+
+**This is the opposite failure mode and it is equally bad.** Fifteen rounds went
+into stopping this gate failing OPEN, and the fix for the last one made it fail
+CLOSED on valid input. A gate that rejects good documents is not "safe" - it
+gets disabled, and then it protects nothing.
+
+Fixed with the GFM rules rather than more special-casing:
+* a table delimiter row must contain a `|`; a thematic break does not;
+* a table row must contain a `|`, so a pipe-less line ENDS the table instead of
+  being reported as a malformed row.
+
+The permanent net now checks **both directions**: 50 malformed cases must be
+rejected, and 6 ordinary-Markdown shapes must be ACCEPTED with the rule-row
+count unchanged. Both new behaviours were verified by reverting them.
+
+Gate: exit 0, 1117 passed, 95.50%, pip-audit clean.
+
+**The net was one-sided, which is why I did not catch this myself.** Every case
+in it asserted "the gate rejects X". A gate that rejected everything would have
+passed all 50. Any validator's regression net needs both halves - the inputs it
+must refuse AND the inputs it must accept - or it only measures strictness.

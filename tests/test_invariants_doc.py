@@ -44,7 +44,16 @@ def _split_row(line: str) -> list[str]:
 
 
 def _is_divider(line: str) -> bool:
-    return bool(line.strip()) and set(line) <= set("|-: \t")
+    """A TABLE delimiter row, not a horizontal rule.
+
+    The `"|" in line` requirement is load-bearing: a thematic break (`---`,
+    `- - -`) is built from the same characters, and without it a horizontal rule
+    anywhere in the document was read as a table divider - the prose line above
+    it was then rejected as a malformed header and the prose below it parsed as
+    table rows. That is a false positive on valid Markdown, i.e. the gate
+    failing CLOSED, which is as broken as failing open.
+    """
+    return bool(line.strip()) and "|" in line and set(line) <= set("|-: \t")
 
 
 def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
@@ -101,6 +110,13 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             is_header = n < len(lines) and _is_divider(lines[n])
             if "|" in line and not _is_divider(line) and not is_header:
                 malformed.append(f"line {n}: table-shaped line outside any table: {stripped[:70]}")
+            continue
+        if "|" not in line:
+            # A GFM table row must contain a pipe, so a pipe-less line ENDS the
+            # table - it is not a malformed row. Without this a thematic break
+            # (`---`) written directly under a table row was rejected as a bad
+            # row: a false positive on valid Markdown.
+            in_table = False
             continue
         cells = _split_row(line)
         if len(cells) < 2 or not cells[0]:
@@ -318,3 +334,30 @@ def test_a_divider_under_a_bad_header_reports_the_header_problem() -> None:
     """
     _, malformed = _rule_rows("## S\nRule Test\n|---|---|\n| a rule | x |\n")
     assert any("must be exactly" in m for m in malformed), malformed
+
+
+# The net above only ever asked "does the gate REJECT bad input?". A gate that
+# rejects everything passes all of it. These pin the other direction: ordinary
+# Markdown that happens to share characters with a table delimiter must be
+# ACCEPTED. Treating a thematic break (`---`) as a table divider made the gate
+# reject valid documents - failing CLOSED, which is as broken as failing open.
+VALID_DOCS = {
+    "horizontal rule after a blank line": "\nProse.\n\n---\n\nMore prose.\n",
+    "spaced thematic break": "\nProse.\n\n- - -\n\nMore prose.\n",
+    "horizontal rule directly under a row": "---\n",
+    "prose directly under a row": "Some prose paragraph.\n",
+    "nothing after the table": "",
+    "another section follows": "\n## Another section\n\nProse.\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(VALID_DOCS), ids=lambda s: s.replace(" ", "_"))
+def test_the_gate_accepts_ordinary_markdown(shape: str) -> None:
+    """Valid Markdown around a valid table must not be rejected."""
+    doc = (
+        "## A section\n| Rule | Test |\n|---|---|\n"
+        "| a rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |\n"
+    ) + VALID_DOCS[shape]
+    rows, malformed = _rule_rows(doc)
+    assert not malformed, f"{shape!r} wrongly reported malformed: {malformed}"
+    assert len(rows) == 1, f"{shape!r} changed how many rule rows were found: {rows}"
