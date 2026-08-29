@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 INVARIANTS = REPO / "docs" / "INVARIANTS.md"
 TESTS = REPO / "tests"
@@ -45,7 +47,7 @@ def _is_divider(line: str) -> bool:
     return bool(line.strip()) and set(line) <= set("|-: \t")
 
 
-def _rule_rows() -> tuple[list[list[str]], list[str]]:
+def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
     """(rule rows as cells, malformed lines).
 
     Rows are identified by TABLE MEMBERSHIP, not by a syntactic prefix. Three
@@ -55,9 +57,11 @@ def _rule_rows() -> tuple[list[list[str]], list[str]]:
     read "Rule"/"Test" (mistaken for a header). A table is a header line plus a
     divider; every line after it, until the table ends, is a rule row and MUST
     parse. The header and divider are skipped BY POSITION, so nothing in the
-    body can disguise itself as one.
+    body can disguise itself as one - including a row that is itself
+    divider-SHAPED (`| --- | --- |`), which an earlier version skipped wherever
+    it appeared.
     """
-    lines = INVARIANTS.read_text().splitlines()
+    lines = (INVARIANTS.read_text() if text is None else text).splitlines()
     rows: list[list[str]] = []
     malformed: list[str] = []
     in_table = False
@@ -66,8 +70,12 @@ def _rule_rows() -> tuple[list[list[str]], list[str]]:
         if not stripped or stripped.startswith("#"):
             in_table = False
             continue
-        if _is_divider(line) and n >= 2 and "|" in lines[n - 2]:
-            in_table = True  # this is the divider; the line above was the header
+        if not in_table and _is_divider(line) and n >= 2 and "|" in lines[n - 2]:
+            # BY POSITION: a divider is only the line directly under a header.
+            # Matching divider SHAPE anywhere let `| --- | --- |` sit in a table
+            # BODY and be skipped - a row escaping validation by impersonating a
+            # delimiter, which is exactly what position-based skipping prevents.
+            in_table = True
             continue
         if not in_table:
             # a stray table-looking line outside any table would never be
@@ -158,3 +166,64 @@ def test_every_table_line_parses_as_a_rule_row() -> None:
         "docs/INVARIANTS.md has lines that look like table rows but do not parse:\n"
         + "\n".join(malformed)
     )
+
+
+# --------------------------------------------------------------- the gate's own regression net
+
+VALID_TABLE = (
+    "## A section\n"
+    "| Rule | Test |\n"
+    "|---|---|\n"
+    "| a real rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |\n"
+)
+
+MALFORMED_ROWS = {
+    "pure divider in the body": "| --- | --- |",
+    "divider with colons": "|:---|---:|",
+    "single dash row": "| - | - |",
+    "tab-padded divider": "|\t---\t|\t---\t|",
+    "empty cells": "| | |",
+    "no leading pipe": "a rule | `test_score.py::test_nope` |",
+    "no leading pipe, no test": "a rule with no test |",
+    "header-lookalike body row": "| Rule | Test | x |",
+    "tight pipes": "|a rule|`test_score.py::test_nope`|",
+    "single cell": "| a rule with no test column |",
+    "no trailing pipe": "| a rule | `test_score.py::test_nope`",
+}
+
+
+def _gate_rejects(doc: str) -> bool:
+    """True when SOME check in this module would fail on `doc`."""
+    rows, malformed = _rule_rows(doc)
+    if malformed:
+        return True
+    for cells in rows:
+        citations, bad = _parse_test_column(cells[-1])
+        if bad or not citations:
+            return True
+        for mod, name in citations:
+            defined = _defined_tests().get(mod, set())
+            ok = (
+                any(n.startswith(name[:-1]) for n in defined)
+                if name.endswith("*")
+                else name in defined
+            )
+            if not ok:
+                return True
+    return False
+
+
+def test_the_gate_accepts_a_well_formed_table() -> None:
+    """The net must not fire on a correct document, or it proves nothing."""
+    assert not _gate_rejects(VALID_TABLE)
+
+
+@pytest.mark.parametrize("shape", sorted(MALFORMED_ROWS), ids=lambda s: s.replace(" ", "_"))
+def test_the_gate_rejects_every_known_malformed_row(shape: str) -> None:
+    """This gate regressed FOUR times, each time letting through a row shape a
+    previous round had not thought to plant. Every shape ever found is planted
+    here, INSIDE a table body, so a future simplification cannot quietly reopen
+    one. See the decision record for the sequence.
+    """
+    doc = VALID_TABLE + MALFORMED_ROWS[shape] + "\n"
+    assert _gate_rejects(doc), f"a {shape!r} row is not rejected"

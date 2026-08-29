@@ -975,3 +975,39 @@ exercises the case you already know about measures nothing. The property here
 was "no rule row escapes validation"; the probe must therefore place a bad row
 in every position a real row can occupy - inside a table, at its edges, outside
 one - not in the one position I happened to pick.
+
+## Thirteenth stop-gate finding: a divider-shaped body row escaped (2026-08-29)
+
+Correct, and it is the mistake I had just written the fix FOR. The previous
+round's lesson was "skip the header and divider BY POSITION so nothing in a
+table body can disguise itself as one" - and the divider test I shipped matched
+divider SHAPE anywhere:
+
+    if _is_divider(line) and "|" in lines[n - 2]:   # <- no position constraint
+
+So `| --- | --- |` sitting in a table BODY was skipped as a delimiter. Five
+variants escaped: pure divider, colon-aligned, single dash, tab-padded, and
+`| | |`.
+
+Fixed by adding the position constraint the comment already claimed
+(`not in_table and _is_divider(...)`).
+
+**The durable change is that the probe is now a TEST, not a habit.** This gate
+regressed four consecutive times, each time letting through a shape the previous
+round had not thought to plant, and each time I re-probed by hand and reported
+"all caught". Every shape that ever escaped is now planted INSIDE a table body
+by `test_the_gate_rejects_every_known_malformed_row` (11 parametrised cases),
+with `test_the_gate_accepts_a_well_formed_table` guarding against a net that
+fires on everything. Both regressions were verified by reintroducing them:
+matching divider shape anywhere, and the prefix-based row filter - each is
+CAUGHT.
+
+Full re-probe: 21 shapes across three positions (inside a table, outside one,
+citation-level), 0 missed, document unchanged. Gate: exit 0, 1070 passed, 95.50%.
+
+**Four rounds on one gate is the real finding.** Hand-probing after each fix
+produced four consecutive false "all caught" reports, because I could only plant
+the shapes I had already thought of. Encoding the probe as a parametrised test
+converts a habit I demonstrably do not have into something the gate enforces -
+and it is what I should have done the first time I wrote "probe degenerate
+shapes" as a lesson rather than as code.
