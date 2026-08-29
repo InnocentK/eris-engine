@@ -1051,3 +1051,40 @@ The countermeasure that actually worked here was enumerating the DIMENSIONS of
 the input (shape x position) and taking their product, rather than listing cases
 I could think of. Where a guard skips something by position, that skip is itself
 an unvalidated hole and needs its own positive check.
+
+## Fifteenth stop-gate finding: the header guard was bypassable (2026-08-29)
+
+Correct. The bypass was an **off-by-one that fails open**: the stray-line check
+read
+
+    if "|" in line and not _is_divider(line) and n < len(lines) and not _is_divider(lines[n]):
+
+where `n < len(lines)` was meant to guard the lookahead, but instead **exempted
+the last line of the file from the check entirely**. A bad row placed at the end
+of the document escaped everything. Three probe shapes were the same bug:
+last line of file, last line after a valid table, and a pipe-less header (whose
+bad row also happened to be last). Rewritten as `is_header = n < len(lines) and
+_is_divider(lines[n])`, so a line with no successor is simply not a header.
+
+**Two corrections to my own account of this round**, both caught by writing the
+test rather than by reasoning:
+
+1. I first reported "two bypasses closed". Attribution by reverting each fix
+   independently shows the off-by-one closed ALL of them; removing the
+   `"|" in lines[n-2]` precondition closed nothing. It only improves the
+   diagnostic - a pipe-less header now reports the header rule instead of a
+   generic "outside any table" - and is pinned by its own message-level test.
+2. That precondition edit had **never actually been applied**. The edit script
+   asserted on a later hunk, raised, and discarded all three of its edits before
+   writing; my attribution probe then "confirmed" a no-op as a no-op, because
+   the string it tried to revert was not in the file. The failing message-level
+   test is what exposed it.
+
+Both fixes are now real and independently pinned: reverting the off-by-one fails
+2 tests, reverting the precondition fails 1.
+
+Gate: exit 0, 1111 passed, 95.50%, pip-audit clean.
+
+**A multi-hunk edit that asserts per hunk and writes once is all-or-nothing, and
+silently.** Verify the edit landed - grep for it - before measuring its effect;
+otherwise the measurement describes a file that was never changed.

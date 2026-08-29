@@ -70,7 +70,7 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
         if not stripped or stripped.startswith("#"):
             in_table = False
             continue
-        if not in_table and _is_divider(line) and n >= 2 and "|" in lines[n - 2]:
+        if not in_table and _is_divider(line):
             # BY POSITION: a divider is only the line directly under a header.
             # Matching divider SHAPE anywhere let `| --- | --- |` sit in a table
             # BODY and be skipped - a row escaping validation by impersonating a
@@ -79,7 +79,11 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             # ...but skipping the HEADER by position means a rule row placed
             # directly above a divider is never validated either. The header
             # must therefore BE a header: exactly `Rule | Test`.
-            header = _split_row(lines[n - 2])
+            # No `"|" in lines[n-2]` precondition: with one, a divider under a
+            # pipe-less line (or under nothing) was not recognised as a divider,
+            # so the table never started and the real problem was reported as a
+            # generic "outside any table". Closes no hole - diagnostics only.
+            header = _split_row(lines[n - 2]) if n >= 2 else []
             if [c.lower() for c in header] != ["rule", "test"]:
                 malformed.append(
                     f"line {n - 1}: the line above a divider must be exactly "
@@ -89,14 +93,13 @@ def _rule_rows(text: str | None = None) -> tuple[list[list[str]], list[str]]:
             in_table = True
             continue
         if not in_table:
-            # a stray table-looking line outside any table would never be
-            # validated, so it is a defect rather than something to ignore
-            if (
-                "|" in line
-                and not _is_divider(line)
-                and n < len(lines)
-                and not _is_divider(lines[n])
-            ):
+            # A table-shaped line outside a table is a defect UNLESS it is a
+            # header (the next line is its divider). Writing that as
+            # `n < len(lines) and not _is_divider(lines[n])` exempted the LAST
+            # line of the file from the check entirely - an off-by-one that
+            # fails OPEN, so a bad row placed at the end escaped everything.
+            is_header = n < len(lines) and _is_divider(lines[n])
+            if "|" in line and not _is_divider(line) and not is_header:
                 malformed.append(f"line {n}: table-shaped line outside any table: {stripped[:70]}")
             continue
         cells = _split_row(line)
@@ -269,3 +272,49 @@ def test_a_rule_row_in_the_header_position_is_rejected() -> None:
         "| a real rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |\n"
     )
     assert _gate_rejects(doc)
+
+
+# Whole-document shapes: a bad row can also escape via the table's FRAME - a
+# missing or pipe-less header, or simply being the last line of the file (an
+# off-by-one in the stray-line lookahead exempted it). Each of these was a live
+# bypass of the header guard.
+BAD_ROW = "| a rule with a typo'd test | `::tets_typo` |"
+GOOD_ROW = "| a real rule | `test_score.py::test_a_worker_that_recorded_twice_counts_once` |"
+
+MALFORMED_DOCS = {
+    "no header line at all": f"## S\n|---|---|\n{BAD_ROW}\n{GOOD_ROW}\n",
+    "header has no pipes": f"## S\nRule Test\n|---|---|\n{BAD_ROW}\n",
+    "blank line between header and divider": f"## S\n| Rule | Test |\n\n|---|---|\n{BAD_ROW}\n",
+    "bad row is the last line of the file": f"## S\n{BAD_ROW}",
+    "bad row last line after a valid table": (
+        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n\n{BAD_ROW}"
+    ),
+    "two tables with no separator": (
+        f"## S\n| Rule | Test |\n|---|---|\n{GOOD_ROW}\n| Rule | Test |\n|---|---|\n{BAD_ROW}\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(MALFORMED_DOCS), ids=lambda s: s.replace(" ", "_"))
+def test_the_gate_rejects_malformed_document_frames(shape: str) -> None:
+    """A row can escape via the table FRAME, not just its own text.
+
+    All six of these bypassed the header guard: the divider was only recognised
+    when the line above it contained a pipe, and the stray-line check exempted
+    the last line of the file via `n < len(lines)` - an off-by-one that fails
+    OPEN.
+    """
+    assert _gate_rejects(MALFORMED_DOCS[shape]), f"{shape!r} is not rejected"
+
+
+def test_a_divider_under_a_bad_header_reports_the_header_problem() -> None:
+    """Diagnostic quality, not a bypass.
+
+    Recognising a divider only when the line above it contained a pipe closed
+    NO hole - `test_the_gate_rejects_malformed_document_frames` passes either
+    way - but it made a pipe-less header fall through to the generic
+    "outside any table" message instead of naming the real problem. Pinned here
+    so the clearer diagnostic is not silently lost.
+    """
+    _, malformed = _rule_rows("## S\nRule Test\n|---|---|\n| a rule | x |\n")
+    assert any("must be exactly" in m for m in malformed), malformed
