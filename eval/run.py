@@ -779,6 +779,22 @@ class CellOutcome:
     error: str | None = None
 
 
+H3_MIN_VERSION = "0.4.0"
+
+
+def _predates_h3(version: str) -> bool:
+    """True when a ledger was written before the 0.4.0 adjudication rules.
+
+    An unparseable or absent version is treated as OLD: a ledger that cannot say
+    which rules produced it cannot be resumed safely.
+    """
+    try:
+        parts = tuple(int(x) for x in version.split(".")[:3])
+    except ValueError:
+        return True
+    return bool(parts) and parts < tuple(int(x) for x in H3_MIN_VERSION.split("."))
+
+
 def run_cell(
     h: Harness,
     spec: CellSpec,
@@ -847,6 +863,27 @@ def run_cell(
         prior: Prior | None = None
         if resume:
             view = LedgerView.from_path(writer.events_path)
+            # H3 x resume: `load_prior` REPLAYS a stored `adjudication.enforced`
+            # rather than re-running `enforce_rulings`, so a run recorded before
+            # 0.4.0 would keep a verdict enforced under the OLD rules - an
+            # ACCEPT that rested on human_entered evidence, or on no supported
+            # ruling at all. Enforcement is write-time, so the only safe answer
+            # is to refuse the resume rather than finish a cell under two
+            # different adjudication rules.
+            started = view.payloads("run.started")
+            prior_version = str(started[0].get("eris_version", "")) if started else ""
+            if _predates_h3(prior_version):
+                return CellOutcome(
+                    run_id,
+                    EXIT_CONFIG,
+                    "refused",
+                    error=(
+                        f"run was started by eris {prior_version or '<unknown>'}, which enforced "
+                        f"pre-{H3_MIN_VERSION} adjudication rules; its recorded verdicts are "
+                        "replayed on resume, not re-enforced. Refusing to finish one cell under "
+                        "two rule sets - score it as it stands or re-run it."
+                    ),
+                )
             prior = load_prior(view, writer, per_call_usd=policy.budgets.per_call_usd)
             killed = kill_stale_groups(prior.stale_pgids, killpg=h.killpg)
             removed = remove_stale_scratch(scratch)

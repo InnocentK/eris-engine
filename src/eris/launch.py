@@ -49,7 +49,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import IO, Any, Protocol
 
 from eris.policy import WorkerPolicy, sha256_file
@@ -476,6 +476,18 @@ def build_env(
             raise LaunchRefused("env USER is set by Eris from the OS; a secret may not supply it")
         env[name] = value
     assert_env_safe(env)
+    # Defect C, at the CHOKEPOINT. `plan_call` checks the call's own home/tmpdir,
+    # but a policy `env:` (or an env_allow secret) is merged AFTER the defaults
+    # above and can overwrite either - neither name is on a NEVER list. Checking
+    # only the call fields left the guard bypassable, so the FINAL env is what
+    # gets asserted: a worker's cwd is the snapshot, and a relative HOME/TMPDIR
+    # would resolve there.
+    for _name in ("HOME", "TMPDIR"):
+        if not PurePath(env[_name]).is_absolute():
+            raise LaunchRefused(
+                f"env {_name}={env[_name]!r} must be absolute (defect C): a worker resolves "
+                "it against the snapshot, not the harness cwd"
+            )
     env.update(GIT_HARDENING)
     # LAST, and only from the caller's OS-derived value (see resolve_user).
     if user:

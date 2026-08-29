@@ -1972,3 +1972,45 @@ def test_paths_handed_to_a_worker_must_be_absolute(tmp_path: Path) -> None:
                 home="relative/home",
             )
         )
+
+
+def test_a_policy_env_cannot_smuggle_a_relative_home_or_tmpdir(tmp_path: Path) -> None:
+    """Defect C at the CHOKEPOINT, not just at the call fields.
+
+    `plan_call` checks the call's own `home`/`tmpdir`, but `build_env` merges
+    the policy `env:` (and `env_allow` secrets) AFTER writing those defaults,
+    and neither name is on a NEVER list - so a policy could overwrite the value
+    that was just validated and hand a worker a relative path anyway. The final
+    env is what must be asserted.
+    """
+    for name in ("HOME", "TMPDIR"):
+        with pytest.raises(LaunchRefused, match=f"env {name}=.* must be absolute"):
+            build_env(
+                "grok",
+                path_env="/usr/bin",
+                home="/abs/home",
+                tmpdir="/abs/tmp",
+                user="u",
+                policy_env={name: "relative/path"},
+            )
+    # an absolute override is fine
+    env = build_env(
+        "grok",
+        path_env="/usr/bin",
+        home="/abs/home",
+        tmpdir="/abs/tmp",
+        user="u",
+        policy_env={"HOME": "/somewhere/else"},
+    )
+    assert env["HOME"] == "/somewhere/else"
+
+    # and the same via an env_allow secret
+    with pytest.raises(LaunchRefused, match="env TMPDIR=.* must be absolute"):
+        build_env(
+            "grok",
+            path_env="/usr/bin",
+            home="/abs/home",
+            tmpdir="/abs/tmp",
+            user="u",
+            secrets={"TMPDIR": "rel/tmp"},
+        )

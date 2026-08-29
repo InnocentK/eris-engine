@@ -678,3 +678,79 @@ Gate: exit 0, 1049 passed, 95.50%, pip-audit clean.
 
 This closes the multiplicity class in the scorer. The same audit has NOT been
 run over `eval/run.py` or `src/eris/arms.py` readers.
+
+# Pre-merge panel (2026-08-29)
+
+Three families, three complementary lenses, on the full 6-commit branch diff.
+I was excluded: I wrote all of it.
+
+| Family | Lens | Verdict |
+|---|---|---|
+| OpenAI `gpt-5.6-sol` | can each fix be DEFEATED? | **BLOCK**, 5 findings |
+| xAI `grok-4.6` | ledger semantics, resume, crash paths | **APPROVE MERGE** |
+| Google `gemini-3.1-pro-high` | do the tests enforce what the docs claim? | **NO OUTPUT** (headless auto-denied `command`) |
+
+**Dissent, resolved against evidence.** OpenAI blocked; xAI approved. I verified
+every OpenAI claim directly rather than counting votes. Four of five were real
+and are fixed; the fifth was real and is fixed too. xAI's approval rested on the
+narrower question it was asked (does this branch REGRESS resume?) - correct on
+its own terms, and it independently confirmed two things that mattered:
+`stage.finished.reused` is a backward-compatible optional payload key (an old
+ledger simply reads as unpaired - conservative), and the scorer's last-wins rule
+matches how `prior.finished` already behaves. It also found three PRE-EXISTING
+attempt/outcome holes in `eval/run.py` and `src/eris/arms.py` (budget seeded
+from a frozen view before the abandon cost is written; `_step_propose` treating
+an `ok: False` finish as intact; SIGINT attempt numbering after a cache replay).
+Those are recorded, not fixed - this branch does not touch those files.
+
+## What the panel found, all verified and fixed
+
+1. **Critical - the C1 guard could still false-pair.** "Treatment reused" does
+   not prove "treatment used what the BASE used": pre-seed the cache with
+   proposal A, run the base arm with `--fresh` so it spawns B (the write-once
+   cache keeps A), then run the treatment normally - it replays A, reports
+   `reused: True`, and the guard called it paired. **Fixed by changing the
+   criterion to byte equality**: two arms pair only when their propose output
+   blobs are identical, which is direct evidence of a shared world and is what
+   `INVARIANTS.md` always claimed. This subsumes the reuse check - reuse is
+   neither necessary (two spawns producing identical bytes DID share a world)
+   nor sufficient (the `--fresh` case).
+2. **High - the absolute-path guard was bypassable.** `plan_call` checked the
+   call's `home`/`tmpdir`, but `build_env` merges the policy `env:` and
+   `env_allow` secrets AFTER writing them, and neither name is on a NEVER list.
+   Fixed at the chokepoint: the FINAL env is asserted absolute.
+3. **High - H2 was bypassable through an existing ledger.** The load-time
+   refusal only affects new policies; a ledger written earlier still carried
+   `containment: container` and the E1 gate accepted it. The scorer now refuses
+   it too, checked AFTER the no-ScanResult gate so neither refusal makes the
+   other unreachable.
+4. **High - resume replays a pre-0.4.0 enforced adjudication** rather than
+   re-enforcing it, so a run started under the old rules would keep an ACCEPT
+   that H3 would now escalate. Resuming a ledger whose `run.started.eris_version`
+   predates 0.4.0 is now REFUSED (an absent or unparseable version counts as
+   old). Rated High by OpenAI and Info by xAI; refusing is cheap and settles it.
+5. **Medium - M11's dedup kept workers outside the final panel.** Resuming a run
+   id with a different `--panel` leaves the old panel's proposals in the ledger;
+   scoring them credits the arm with a worker it never ran. Proposals are now
+   filtered to `ArmRun.panel`.
+
+## Evidence
+
+- `task ci`: exit 0, **1051 passed**, 95.47%, pip-audit clean.
+- Every 0.4.0 invariant test mutation-checked (rule deleted -> test fails),
+  including the three added this round. One of them - the final-env assertion -
+  was found to have NO test by the mutation check and would otherwise have
+  shipped as decoration for the second time.
+- Live `indep_verify_critique` (r5): all six steps, **exit 0**, blobs recorded
+  per propose key, H3 fired (ESCALATE, 3 downgrades).
+- `eval/score.py` run against the real run ledgers for the first time: exit 0.
+  `read_cell`, `_propose_blobs` and `_last_proposal_per_worker` exercised
+  directly on three real ledgers - proposals filtered to panel, every ArmRun
+  propose key carries a blob. The payload assumptions hold against real data.
+
+## Coverage gap
+
+The Google lens produced nothing on THREE attempts across two rounds (headless
+`agy` auto-denies `read_file` outside `--add-dir`, then `command` even inside
+it). **The test-enforcement lens was never covered by an independent family** -
+only by my own mutation checks. That is the weakest part of this review.
