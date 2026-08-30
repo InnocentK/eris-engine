@@ -1062,6 +1062,11 @@ def run_adjudicate(
                     {
                         "code": f.code,
                         "severity": f.severity,
+                        # M1: did the engine CHANGE anything because of this
+                        # finding? Only the producer knows - a `REF_MISSING`
+                        # downgrades a SUPPORTED ruling but is inert on a
+                        # CONTESTED one. The scorer uses this, not the code.
+                        "acted": f.acted,
                         "message": f.message,
                         "record_id": f.record_id,
                         "ref": f.ref,

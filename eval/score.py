@@ -495,7 +495,18 @@ def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
         for f in payload.get("findings") or []:
             if isinstance(f, dict) and f.get("severity") == "error":
                 code = str(f.get("code", "?"))
-                if code not in UNHANDLED_CODES:
+                if "acted" in f:
+                    # The producer told us. Classifying by CODE is wrong:
+                    # `REF_MISSING` downgrades a SUPPORTED/REFUTED ruling but is
+                    # INERT on a CONTESTED or UNSUPPORTED one, since only those
+                    # two statuses are downgraded - so the same code is handled
+                    # in one ruling and ignored in the next.
+                    if f.get("acted"):
+                        continue
+                elif code not in UNHANDLED_CODES:
+                    # Legacy ledgers (<= 0.4.1) carry no `acted`. Fall back to
+                    # the code set, which is coarser: it calls every `REF_*`
+                    # handled and so under-reports on those ledgers.
                     continue
                 counts[code] = counts.get(code, 0) + 1
     return sum(counts.values()), dict(sorted(counts.items()))

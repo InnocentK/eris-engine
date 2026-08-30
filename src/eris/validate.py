@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from pydantic import ValidationError
@@ -93,6 +93,13 @@ class Finding:
     message: str
     record_id: str | None = None
     ref: str | None = None
+    # Did the engine CHANGE something because of this finding? Set by the
+    # producer, which is the only place that knows. Classifying by CODE is
+    # wrong: `REF_MISSING` downgrades a SUPPORTED/REFUTED ruling but is inert on
+    # a CONTESTED or UNSUPPORTED one, because only those two statuses are
+    # downgraded. `eval/score.py` treats an unacted error as evidence that the
+    # record is incoherent and nothing was done - which is M1.
+    acted: bool = False
 
 
 CODES: frozenset[str] = frozenset(
@@ -219,7 +226,12 @@ def enforce_rulings(
                 )
             )
         ref_findings, bad = _check_refs(ruling.evidence_refs, ruling.claim_id, claim, evidence)
-        findings.extend(ref_findings)
+        # Held, not appended: whether these were ACTED ON is only known after the
+        # downgrade decision below, and only a downgraded SUPPORTED/REFUTED
+        # ruling acts on them. A `REF_MISSING` on a CONTESTED or UNSUPPORTED
+        # ruling is flagged and then ignored - that is M1, and classifying by
+        # CODE would call it handled.
+        per_ruling: list[Finding] = list(ref_findings)
         status = ruling.status
         reasons = [f.code for f in ref_findings]
         if status in (ClaimStatus.SUPPORTED, ClaimStatus.REFUTED):
@@ -229,7 +241,7 @@ def enforce_rulings(
                     if status is ClaimStatus.SUPPORTED
                     else "REFUTED_WITHOUT_REFS"
                 )
-                findings.append(
+                per_ruling.append(
                     _err(
                         code,
                         f"{status.value} ruling on {ruling.claim_id!r} cites no evidence",
@@ -240,10 +252,12 @@ def enforce_rulings(
                 bad = True
             if bad:
                 downgrades += 1
+                per_ruling = [replace(f, acted=True) for f in per_ruling]
                 note = ruling.note
                 suffix = f"engine: downgraded {status.value}->UNSUPPORTED ({', '.join(reasons)})"
                 note = f"{note}; {suffix}" if note else suffix
                 ruling = ruling.model_copy(update={"status": ClaimStatus.UNSUPPORTED, "note": note})
+        findings.extend(per_ruling)
         new_rulings.append(ruling)
 
     # A claim may carry exactly ONE ruling (`PROTOCOL.md`: "each claim gets one
@@ -315,6 +329,7 @@ def enforce_rulings(
                     adj.adjudication_id,
                 )
             )
+            findings[-1] = replace(findings[-1], acted=True)
             accept_errors.append("unsupported")
         # (b) it must leave nothing UNRESOLVED. A claim the judge never ruled on
         # was not adjudicated at all - silently ignoring "there is a null deref
@@ -339,6 +354,7 @@ def enforce_rulings(
                     adj.adjudication_id,
                 )
             )
+            findings[-1] = replace(findings[-1], acted=True)
             accept_errors.append("unresolved")
         if accept_errors:
             verdict = Verdict.ESCALATE

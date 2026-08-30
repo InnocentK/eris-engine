@@ -868,3 +868,47 @@ def test_unhandled_codes_is_exactly_the_set_that_changes_nothing() -> None:
             f"outcome changed={changed} (downgrades={enforced.downgrades}, "
             f"verdict {adj.verdict.value}->{enforced.verdict.value})"
         )
+
+
+def test_a_finding_records_whether_the_engine_ACTED_on_it() -> None:
+    """M1, stop-gate finding: `REF_*` errors are not always consequential.
+
+    Only a SUPPORTED/REFUTED ruling is downgraded, so the SAME code is acted on
+    in one ruling and ignored in the next: `REF_MISSING` downgrades a SUPPORTED
+    ruling and is completely inert on a CONTESTED or UNSUPPORTED one. Classifying
+    findings by CODE therefore cannot be right - the property is per-finding, and
+    only the producer knows it.
+    """
+    r = lambda st: Ruling(claim_id="c_01", status=st, evidence_refs=["ghost"])  # noqa: E731
+
+    acted_by_status = {}
+    for status in (
+        ClaimStatus.SUPPORTED,
+        ClaimStatus.REFUTED,
+        ClaimStatus.CONTESTED,
+        ClaimStatus.UNSUPPORTED,
+    ):
+        enforced, findings = enforce_rulings(
+            adjudication([r(status)], dissent=[Dissent(dissent_id="d", position="p")]),
+            CLAIMS,
+            EVIDENCE,
+        )
+        ref = next(f for f in findings if f.code == "REF_MISSING")
+        acted_by_status[status] = ref.acted
+        # `acted` must agree with what actually happened
+        assert ref.acted is (enforced.downgrades > 0), status
+
+    assert acted_by_status[ClaimStatus.SUPPORTED] is True
+    assert acted_by_status[ClaimStatus.REFUTED] is True
+    assert acted_by_status[ClaimStatus.CONTESTED] is False, "inert on CONTESTED - this is M1"
+    assert acted_by_status[ClaimStatus.UNSUPPORTED] is False, "inert on UNSUPPORTED - this is M1"
+
+    # the verdict rules act on their own findings
+    enforced, findings = enforce_rulings(adjudication([], verdict=Verdict.ACCEPT), CLAIMS, EVIDENCE)
+    assert enforced.verdict is Verdict.ESCALATE
+    assert all(f.acted for f in findings if f.code.startswith("VERDICT_"))
+
+    # a clean adjudication produces no findings at all
+    good = Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+    _, findings = enforce_rulings(adjudication([good]), CLAIMS, EVIDENCE)
+    assert findings == []
