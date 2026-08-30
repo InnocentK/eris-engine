@@ -24,22 +24,28 @@ experiments showed, and what must still run before any scored corpus run.
   **Caveat (testing critic, recorded):** `plan` keys are as readable to a
   worker as the others; `plan` and `control` are scored without
   containment by user decision, and their results carry the same E1 risk.
-  **Malformation is first-class (M1, 0.4.1), and BINDING.** A cell whose FINAL
-  adjudication carries an error-severity finding the engine does NOT act on
-  (`validate.UNHANDLED_CODES`: `CLAIM_MISSING`, `DUPLICATE_RULING`,
-  `DISSENT_EMPTY_WITH_CONTEST`, `RESIDUAL_RISKS_EMPTY_ON_ACCEPT`) is EXCLUDED from
-  quality metrics and from paired deltas: a record the engine judged incoherent is
-  not evidence, and a delta against one is confounded with the malformation.
-  Excluding creates a NEW bias - only arm 4 passes critiques to the validator, so
-  only it can emit `DISSENT_EMPTY_WITH_CONTEST`, and an arm that drops its
-  malformed cells is left with a cleaner SUBSAMPLE. So `summary.comparison.blocked`
-  is set MECHANICALLY whenever any arm dropped cells for validator findings, and
-  **while it is set the decision rule may not be applied to the per-arm means** -
-  a gate, not advice, the same posture as the E1 containment gate.
-  Codes the engine already ACTS on (`REF_*` downgrades its ruling and is measured by
-  `unsupported_claim_rate`; `VERDICT_*` forces ACCEPT to ESCALATE) do NOT exclude -
-  that is the engine working, and excluding it would delete the denominator for the
-  very behaviour those metrics exist to report.
+  **Malformation is first-class (M1, 0.4.1), and BINDING.**
+  A cell whose FINAL adjudication carries an error-severity validator
+  finding that the engine did NOT act on is EXCLUDED from quality metrics
+  (`exclusion: validator_errors`) and from paired deltas: a record the
+  engine judged incoherent is not evidence, and a delta against one is
+  confounded with the malformation. Whether a finding was acted on is
+  recorded per finding as `Finding.acted`, NOT inferred from its code - only
+  SUPPORTED/REFUTED rulings are downgraded, so the same code (e.g.
+  `REF_MISSING`) is consequential on one ruling and inert on a CONTESTED or
+  UNSUPPORTED one. Excluding creates a new bias, because only arm 4 passes
+  critiques to the validator and so only it can emit
+  `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore
+  set MECHANICALLY whenever any arm dropped cells for validator findings,
+  and while it is set the decision rule may NOT be applied to the per-arm
+  means.
+  Findings the engine DID act on do not exclude - the `REF_*` family downgrades
+  its ruling and is measured by `unsupported_claim_rate`; `VERDICT_*` forces
+  ACCEPT to ESCALATE. That is the engine working, and excluding it would delete
+  the denominator for the very behaviour those metrics exist to report.
+  `test_score.py::test_the_binding_pre_registration_matches_the_scorer` asserts
+  the paragraph above is the scorer's own `M1_PRE_REGISTRATION` verbatim, so this
+  document cannot state a rule the code stopped implementing.
 
 * A campaign cell whose ledger is unreadable is reserved pessimistically
   (every planned call of that arm, judge iterations included, at the worst

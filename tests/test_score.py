@@ -1337,3 +1337,36 @@ def test_an_inert_REF_error_excludes_the_cell_even_though_its_code_is_handled() 
     legacy_claim = {"code": "CLAIM_MISSING", "severity": "error"}
     assert _validator_errors(cell([legacy_ref])) == (0, {})  # coarse: assumed handled
     assert _validator_errors(cell([legacy_claim])) == (1, {"CLAIM_MISSING": 1})
+
+
+def test_the_binding_pre_registration_matches_the_scorer() -> None:
+    """`docs/EVAL-PLAN.md` must carry the scorer's OWN rule, verbatim.
+
+    The pre-registration is binding on the experiment, so a rule stated there
+    that the code does not implement is worse than one stated nowhere. It
+    happened: after the exclusion rule moved from a code set to `Finding.acted`,
+    the plan still said cells were excluded by `UNHANDLED_CODES` and that `REF_*`
+    never excludes - both false, in the document the decision rule is read from.
+
+    Whitespace is normalised so the plan may wrap the text; nothing else may
+    differ. If the rule changes, this fails until the plan is updated too.
+    """
+    from eval.score import M1_PRE_REGISTRATION
+
+    plan = (Path(__file__).resolve().parent.parent / "docs" / "EVAL-PLAN.md").read_text()
+    norm = " ".join(plan.split())
+    canonical = " ".join(M1_PRE_REGISTRATION.split())
+    assert canonical in norm, (
+        "docs/EVAL-PLAN.md does not carry eval/score.py::M1_PRE_REGISTRATION verbatim.\n"
+        "The binding pre-registration must state the rule the scorer actually applies.\n"
+        f"expected:\n{canonical}"
+    )
+    # ...and INSIDE the binding bullet, not merely somewhere after its heading.
+    # The bullet runs from the heading to the next top-level `* ` item.
+    head = plan.index("**Pre-registration notes (binding for the scorer):**")
+    tail = plan.index("\n* ", head)
+    bullet = " ".join(plan[head:tail].split())
+    assert canonical in bullet, (
+        "the M1 rule is in the document but OUTSIDE the binding bullet - a rule the "
+        "decision maker is not obliged to read is advice again"
+    )

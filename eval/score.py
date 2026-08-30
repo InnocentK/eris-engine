@@ -824,6 +824,25 @@ def cell_dirs(campaign_dir: Path) -> list[Path]:
     return out
 
 
+# The BINDING M1 pre-registration rule, stated once. `docs/EVAL-PLAN.md` must
+# carry this text verbatim (whitespace-normalised) - asserted by
+# `test_score.py::test_the_binding_pre_registration_matches_the_scorer`, because
+# the plan previously kept stating a rule the scorer had stopped implementing.
+M1_PRE_REGISTRATION = (
+    "A cell whose FINAL adjudication carries an error-severity validator finding that the "
+    "engine did NOT act on is EXCLUDED from quality metrics (`exclusion: validator_errors`) "
+    "and from paired deltas: a record the engine judged incoherent is not evidence, and a "
+    "delta against one is confounded with the malformation. Whether a finding was acted on "
+    "is recorded per finding as `Finding.acted`, NOT inferred from its code - only "
+    "SUPPORTED/REFUTED rulings are downgraded, so the same code (e.g. `REF_MISSING`) is "
+    "consequential on one ruling and inert on a CONTESTED or UNSUPPORTED one. Excluding "
+    "creates a new bias, because only arm 4 passes critiques to the validator and so only it "
+    "can emit `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore set "
+    "MECHANICALLY whenever any arm dropped cells for validator findings, and while it is set "
+    "the decision rule may NOT be applied to the per-arm means."
+)
+
+
 def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
     """Whether the per-arm quality means may be compared at all.
 
@@ -907,11 +926,7 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         },
         "pre_registration_notes": [
             "arm consensus is scored on the RAW summarizer verdict (enforced is also recorded)",
-            "a cell whose FINAL adjudication carries an error-severity validator finding is "
-            "EXCLUDED from quality metrics (exclusion `validator_errors`) and from paired "
-            "deltas: a malformed adjudication is not evidence, and a delta against one is "
-            "confounded with the malformation (M1). The per-arm `validator` block reports the "
-            "rate; an arm with a higher malformed rate has not earned a better score",
+            M1_PRE_REGISTRATION,
             "categories revert/planted/insufficient require ArmRun.containment == container (E1)",
             "containment basis: " + CONTAINMENT_BASIS,
             "plan tasks are scored without containment by user decision; plan keys are as "
