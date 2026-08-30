@@ -66,6 +66,7 @@ from eris.schemas import (
     Verdict,
     parse_ts,
 )
+from eris.validate import UNHANDLED_CODES
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -414,6 +415,10 @@ class CellScore:
     # them and every arm re-spawns them with different text. Pairing requires
     # byte-identical output, which is the only direct evidence of a shared world.
     propose_blobs: dict[str, list[str]]
+    # M1: engine validator findings on the FINAL adjudication. `None` means the
+    # cell has no adjudication to judge - never conflate that with "clean".
+    validator_errors: int | None
+    validator_codes: dict[str, int]
     contaminated: bool
     scan_incomplete: bool
     rescan_contaminated: bool
@@ -447,6 +452,48 @@ def _propose_blobs(cell: CellData) -> dict[str, list[str]]:
             blobs = p.get("blobs")
             out[k] = sorted(str(b) for b in blobs) if isinstance(blobs, list) else []
     return out
+
+
+def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
+    """(error count, per-code counts) for the cell's FINAL adjudication.
+
+    Joined on `adjudication_id == ArmRun.final_adjudication_id`, not "the last
+    event": `adjudicate_iter` writes one `validate.findings` per judge call, so
+    a malformed early iteration that was superseded by a clean one must not
+    count - and a clean early iteration must not excuse a malformed final one.
+    Matching by id also survives resume, which replays a stored adjudication
+    rather than re-deriving it.
+
+    Only `severity == "error"` codes in `validate.UNHANDLED_CODES` count. That
+    set is the point of M1: every other error code already changes an outcome -
+    REF_NOT_MECHANICAL downgrades its ruling and is measured by
+    `unsupported_claim_rate`; VERDICT_* forces ACCEPT to ESCALATE. Excluding
+    cells for those would delete the denominator for normal, already-handled
+    behaviour (4 of the 6 real live runs carry REF_NOT_MECHANICAL) and would gut
+    the very metric that reports it. Findings are counted as a MULTISET - three
+    `CLAIM_MISSING`s are three errors, not one.
+
+    Returns `None` when the cell has no final adjudication, or none of its
+    findings events match it. A cell with no adjudication has not been shown to
+    be clean, and must never be reported as if it were.
+    """
+    final_id = cell.arm_run.final_adjudication_id
+    if final_id is None:
+        return None, {}
+    matched = [
+        p for p in cell.view.payloads("validate.findings") if p.get("adjudication_id") == final_id
+    ]
+    if not matched:
+        return None, {}
+    counts: dict[str, int] = {}
+    for payload in matched:
+        for f in payload.get("findings") or []:
+            if isinstance(f, dict) and f.get("severity") == "error":
+                code = str(f.get("code", "?"))
+                if code not in UNHANDLED_CODES:
+                    continue
+                counts[code] = counts.get(code, 0) + 1
+    return sum(counts.values()), dict(sorted(counts.items()))
 
 
 def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellScore:
@@ -492,6 +539,7 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
     scan_incomplete = (
         bool(recorded_scan and recorded_scan.scan_incomplete) or rescanned.scan_incomplete
     )
+    validator_errors, validator_codes = _validator_errors(cell)
     exclusion: str | None = None
     if recorded_scan is None:
         exclusion = "no_scan"  # plumbing only: never a quality metric
@@ -503,6 +551,13 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         ar.arm is not Arm.SINGLE and cell.enforced is None
     ):
         exclusion = "incomplete"
+    elif validator_errors:
+        # M1: the engine itself judged this adjudication malformed. Scoring it
+        # would let a cell whose record is internally broken contribute to
+        # precision/recall - a metric reading better than the adjudications it
+        # summarises, which is the C1 mistake. Excluded, and counted loudly as
+        # `malformed` in the per-arm block so the denominator drop is visible.
+        exclusion = "validator_errors"
     basis: str | None
     adj: Adjudication | None
     if ar.arm is Arm.CONSENSUS:
@@ -560,6 +615,8 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         attempts=totals.attempts,
         propose_keys=list(ar.propose_keys),
         propose_blobs=_propose_blobs(cell),
+        validator_errors=validator_errors,
+        validator_codes=validator_codes,
         contaminated=contaminated,
         scan_incomplete=scan_incomplete,
         rescan_contaminated=rescanned.contaminated,
@@ -589,7 +646,27 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             "included": len(inc),
             "excluded": {
                 k: len([s for s in cells if s.exclusion == k])
-                for k in ("contaminated", "missing", "incomplete", "ledger_invalid", "no_scan")
+                for k in (
+                    "contaminated",
+                    "missing",
+                    "incomplete",
+                    "ledger_invalid",
+                    "no_scan",
+                    "validator_errors",
+                )
+            },
+            # M1: first-class, not a footnote. `malformed` counts cells whose
+            # FINAL adjudication carried an error-severity validator finding;
+            # `unknown` counts cells with no adjudication to judge. An arm with
+            # a higher malformed rate has not earned a better precision.
+            "validator": {
+                "malformed": len([s for s in cells if s.validator_errors]),
+                "unknown": len([s for s in cells if s.validator_errors is None]),
+                "errors": sum(s.validator_errors or 0 for s in cells),
+                "codes": {
+                    c: sum(s.validator_codes.get(c, 0) for s in cells)
+                    for c in sorted({c for s in cells for c in s.validator_codes})
+                },
             },
             "precision": _mean([s.precision for s in inc]),
             "recall": _mean([s.recall for s in inc]),
@@ -661,6 +738,17 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                     "output bytes from the base arm (or recorded none)"
                 )
                 entry["unshared_propose_keys"] = differing
+            elif s_treat.validator_errors or s_base.validator_errors:
+                # M1: a paired delta attributes a difference to the TREATMENT.
+                # If either adjudication is malformed the difference is
+                # confounded with "this judge emitted CLAIM_MISSING", exactly as
+                # C1 was confounded with proposal variance. Both sides must be
+                # well formed before a delta means anything.
+                entry["paired"] = False
+                entry["reason"] = (
+                    f"validator errors: treatment {s_treat.validator_errors or 0}, "
+                    f"base {s_base.validator_errors or 0}"
+                )
             elif not (s_treat.included and s_base.included):
                 entry["paired"] = False
                 entry["reason"] = f"excluded: {s_treat.exclusion or s_base.exclusion}"
@@ -731,8 +819,22 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         "skipped": skipped,
         "per_arm": aggregate(scores),
         "paired": paired_deltas(scores),
+        "validator": {
+            "malformed_cells": len([s for s in scores if s.validator_errors]),
+            "unknown_cells": len([s for s in scores if s.validator_errors is None]),
+            "total_errors": sum(s.validator_errors or 0 for s in scores),
+            "codes": {
+                c: sum(s.validator_codes.get(c, 0) for s in scores)
+                for c in sorted({c for s in scores for c in s.validator_codes})
+            },
+        },
         "pre_registration_notes": [
             "arm consensus is scored on the RAW summarizer verdict (enforced is also recorded)",
+            "a cell whose FINAL adjudication carries an error-severity validator finding is "
+            "EXCLUDED from quality metrics (exclusion `validator_errors`) and from paired "
+            "deltas: a malformed adjudication is not evidence, and a delta against one is "
+            "confounded with the malformation (M1). The per-arm `validator` block reports the "
+            "rate; an arm with a higher malformed rate has not earned a better score",
             "categories revert/planted/insufficient require ArmRun.containment == container (E1)",
             "containment basis: " + CONTAINMENT_BASIS,
             "plan tasks are scored without containment by user decision; plan keys are as "

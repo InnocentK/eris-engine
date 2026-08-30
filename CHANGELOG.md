@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.1 - engine validator findings are consequential (M1) (2026-08-29)
+
+`enforce_rulings` emitted findings about malformed adjudications and **nothing
+read them** - not the exit code, not the scorer, not the verdict. A campaign
+could be full of incoherent adjudications and every metric would look clean.
+
+* **The scorer reads them, joined to the FINAL adjudication.** `_validator_errors`
+  matches `adjudication_id == ArmRun.final_adjudication_id`, never "the last
+  findings event": `adjudicate_iter` writes one per judge call, and resume
+  replays a stored adjudication rather than re-deriving it, so reading the last
+  event would count an ATTEMPT rather than the outcome the cell ended on.
+* **Only findings the engine does NOT act on exclude a cell.**
+  `validate.UNHANDLED_CODES` is that set (`CLAIM_MISSING`, `DUPLICATE_RULING`,
+  `DISSENT_EMPTY_WITH_CONTEST`, `RESIDUAL_RISKS_EMPTY_ON_ACCEPT`, and the two
+  validators that are never invoked). Codes the engine already handles - the
+  `REF_*` family downgrades its ruling, `VERDICT_*` forces ACCEPT to ESCALATE -
+  do NOT exclude. Running the change against the real ledgers is what caught
+  this: 4 of the 6 live runs carry `REF_NOT_MECHANICAL`, and excluding them
+  would have deleted the denominator for corrected behaviour and gutted
+  `unsupported_claim_rate`, the metric whose whole job is to report it.
+* A cell with an unhandled finding is excluded (`exclusion: validator_errors`)
+  and **can never pair**: a delta against a malformed adjudication is confounded
+  with the malformation, exactly as C1 was confounded with proposal variance.
+* Findings are counted as a **multiset**; `None` (no adjudication to judge) is
+  never reported as "clean".
+* `per_arm[*].validator` and a campaign-level `validator` block report the
+  malformed rate, unknown count and per-code totals. `docs/EVAL-PLAN.md` makes
+  it binding: **an arm with a higher malformed rate has not earned a better
+  score.**
+* `test_unhandled_codes_is_exactly_the_set_that_changes_nothing` pins the set
+  against measured behaviour, so it cannot drift from the code.
+
+Not done, deliberately: giving `CLAIM_MISSING` / `DISSENT_EMPTY_WITH_CONTEST`
+verdict powers is a protocol change of the same kind as H3 and belongs to the
+user. `validate_critique` and `validate_origin` are never invoked at all - a
+separate gap, recorded not fixed.
+
 ## 0.4.0 - evidence actually binds the verdict; four pre-live findings closed (2026-08-27)
 
 A four-family review before live testing, plus the first live runs of the full

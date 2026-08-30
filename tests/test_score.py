@@ -142,6 +142,9 @@ def test_score_imports_nothing_that_executes() -> None:
         "pydantic",
         "eris.ledger",
         "eris.scan",
+        # M1: pure, never raises, no subprocess - the single source of truth for
+        # which validator findings the engine acts on (`UNHANDLED_CODES`)
+        "eris.validate",
         "eris.schemas",
     }, names
     # eval/score.py itself may not even import os/shutil (no os.system, no rmtree)
@@ -420,7 +423,18 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
         "indep_verify_iter",
         "indep_verify_critique",
     }
-    assert all(c["included"] for c in by.values())
+    # M1: the critique fixture returns a contest with EMPTY DISSENT - a finding
+    # the engine emits and then does nothing about - so that cell is no longer
+    # scored as evidence. The consensus fixture's ACCEPT findings (VERDICT_*)
+    # are HANDLED (the verdict was forced to ESCALATE), so it stays included:
+    # excluding already-corrected behaviour would delete the denominator for
+    # something the engine got right.
+    assert by["indep_verify_critique"]["exclusion"] == "validator_errors"
+    assert by["indep_verify_critique"]["validator_codes"] == {"DISSENT_EMPTY_WITH_CONTEST": 1}
+    assert by["consensus"]["validator_errors"] == 0 and by["consensus"]["included"] is True
+    assert all(c["included"] for c in by.values() if c["arm"] != "indep_verify_critique")
+    # a cell with no adjudication at all is UNKNOWN, never "clean"
+    assert by["single"]["validator_errors"] is None
     # arm 1: findings from the proposal, no verdict
     assert (
         by["single"]["verdict"] is None
@@ -429,6 +443,10 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     )
     # arm 2: raw verdict (the summarizer's ACCEPT), confident-wrong since ACCEPT is off-key
     assert by["consensus"]["verdict_basis"] == "raw" and by["consensus"]["verdict"] == "ACCEPT"
+    # M1: the raw verdict is still RECORDED, but the cell is excluded, so it
+    # feeds no quality metric - `confident_wrong` is gated on `exclusion is
+    # None` exactly as it already was for contaminated/missing cells. The
+    # malformation is counted in the per-arm `validator` block instead.
     assert by["consensus"]["confident_wrong"] is True
     # judged arms: enforced verdict; unlinked finding rule (the proposal's finding links a claim
     # ruled nothing -> not asserted) -> recall 0 with tolerance
@@ -450,14 +468,27 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     )
     assert iv["attempts"] >= 2 and iv["wall_ms"] is not None and iv["wall_ms"] >= 0
     assert iv["containment"] is None and iv["propose_keys"] == ivc["propose_keys"]
-    # paired deltas exist for 3b-3 and 4-3 and are paired (identical propose keys)
+    # paired deltas exist for both pairs; 3b-3 pairs (both adjudications clean),
+    # 4-3 does NOT - its treatment arm's adjudication is malformed, so any delta
+    # would be confounded with the malformation rather than measuring critique.
     pairs = {p["pair"]: p for p in summary["paired"]}
-    assert set(pairs) == {"3b-3", "4-3"} and all(p["paired"] for p in pairs.values())
-    assert pairs["4-3"]["delta_recall"] == 0.0 and "delta_cost_spent_usd" in pairs["4-3"]
+    assert set(pairs) == {"3b-3", "4-3"}
+    assert pairs["3b-3"]["paired"] is True
+    assert pairs["4-3"]["paired"] is False and "validator errors" in pairs["4-3"]["reason"]
+    assert "delta_recall" not in pairs["4-3"]  # no delta is emitted for an unpaired cell
     per_arm = summary["per_arm"]
-    assert (
-        per_arm["single"]["recall"] == 1.0 and per_arm["consensus"]["confident_wrong_rate"] == 1.0
-    )
+    assert per_arm["single"]["recall"] == 1.0
+    # M1 reporting: the malformation is first-class per arm, and the campaign
+    # summary carries the same counts across all cells
+    assert per_arm["indep_verify_critique"]["validator"]["malformed"] == 1
+    assert per_arm["indep_verify_critique"]["excluded"]["validator_errors"] == 1
+    assert per_arm["consensus"]["confident_wrong_rate"] == 1.0
+    assert per_arm["indep_verify_critique"]["validator"]["codes"] == {
+        "DISSENT_EMPTY_WITH_CONTEST": 1
+    }
+    assert per_arm["single"]["validator"]["unknown"] == 1  # no adjudication to judge
+    assert summary["validator"]["malformed_cells"] == 1
+    assert summary["validator"]["total_errors"] == 1
     assert per_arm["indep_verify"]["abstention"]["neither"] == 1
     assert summary["pre_registration_notes"]
     # CLI
@@ -515,6 +546,8 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             propose_keys=keys,
             # default: identical output bytes for every key, i.e. the arms
             # really did share a world (C1)
+            validator_errors=0,
+            validator_codes={},
             propose_blobs={k: ["sha-" + k] for k in keys} if blobs is None else blobs,
             contaminated=False,
             scan_incomplete=False,
@@ -778,6 +811,8 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             wall_ms=1,
             attempts=1,
             propose_keys=[ka, kb],
+            validator_errors=0,
+            validator_codes={},
             propose_blobs=blobs,
             contaminated=False,
             scan_incomplete=False,
@@ -977,6 +1012,8 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             wall_ms=1,
             attempts=1,
             propose_keys=keys,
+            validator_errors=0,
+            validator_codes={},
             propose_blobs=blobs,
             contaminated=False,
             scan_incomplete=False,
@@ -1013,3 +1050,56 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
         )
     }
     assert out["3b-3"]["paired"] is False and "no propose output" in out["3b-3"]["reason"]
+
+
+def test_validator_errors_are_read_from_the_FINAL_adjudication_only() -> None:
+    """M1: engine validator findings must be consequential, and must describe the
+    adjudication the cell actually ended on.
+
+    `adjudicate_iter` writes one `validate.findings` event per judge call, and a
+    resumed run replays a stored adjudication rather than re-deriving it. Reading
+    "the last findings event" would therefore count an ATTEMPT; the join is on
+    `adjudication_id == ArmRun.final_adjudication_id`.
+    """
+    from types import SimpleNamespace
+
+    from eval.score import _validator_errors
+
+    class _View:
+        def __init__(self, payloads: list[dict[str, Any]]) -> None:
+            self._p = payloads
+
+        def payloads(self, kind: str) -> list[dict[str, Any]]:
+            return self._p if kind == "validate.findings" else []
+
+    def ev(adj_id: str, *codes: tuple[str, str]) -> dict[str, Any]:
+        return {
+            "adjudication_id": adj_id,
+            "findings": [{"code": c, "severity": s} for c, s in codes],
+        }
+
+    def cell(payloads: list[dict[str, Any]], final: str | None) -> Any:
+        return SimpleNamespace(
+            view=_View(payloads), arm_run=SimpleNamespace(final_adjudication_id=final)
+        )
+
+    # a malformed EARLY iteration superseded by a clean final one does not count
+    assert _validator_errors(
+        cell([ev("adj-1", ("CLAIM_MISSING", "error")), ev("adj-2")], "adj-2")
+    ) == (0, {})
+    # ...and a clean early iteration does not excuse a malformed final one
+    assert _validator_errors(
+        cell([ev("adj-1"), ev("adj-2", ("CLAIM_MISSING", "error"))], "adj-2")
+    ) == (1, {"CLAIM_MISSING": 1})
+    # info severity is not an error: ESCALATED accompanies every legitimate
+    # escalation and would otherwise mark every such cell malformed
+    assert _validator_errors(cell([ev("adj-1", ("ESCALATED", "info"))], "adj-1")) == (0, {})
+    # findings are a MULTISET - three of one code are three errors, not one
+    assert _validator_errors(cell([ev("adj-1", *[("CLAIM_MISSING", "error")] * 3)], "adj-1")) == (
+        3,
+        {"CLAIM_MISSING": 3},
+    )
+    # no adjudication at all is UNKNOWN, never "clean"
+    assert _validator_errors(cell([], None)) == (None, {})
+    # an adjudication whose findings event is absent is also UNKNOWN
+    assert _validator_errors(cell([ev("adj-other")], "adj-1")) == (None, {})

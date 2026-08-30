@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 from collections.abc import Sequence
+from typing import Any
 
 import pytest
 
@@ -743,3 +744,80 @@ def test_a_claim_ruled_twice_cannot_satisfy_the_accept_guard() -> None:
         adjudication([sup, other], verdict=Verdict.ACCEPT), claims, EVIDENCE
     )
     assert codes(findings) == [] and enforced.verdict is Verdict.ACCEPT
+
+
+def test_unhandled_codes_is_exactly_the_set_that_changes_nothing() -> None:
+    """M1: `UNHANDLED_CODES` must describe reality, not intent.
+
+    The scorer treats a cell as not-evidence when its final adjudication carries
+    one of these, so the set drifting from the code would either delete valid
+    cells or let broken ones through. This produces each finding `enforce_rulings`
+    can emit and asserts membership matches whether the outcome actually changed:
+    a code that downgrades a ruling or forces a verdict is HANDLED, one that
+    leaves the record untouched is not.
+    """
+    from eris.validate import UNHANDLED_CODES
+
+    C = {cid: claim(cid) for cid in ("c_01", "c_02")}
+    good = Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+    ev_human = {
+        **EVIDENCE,
+        "e_h": evidence("e_h", origin=Origin.HUMAN_ENTERED, kind=EvidenceKind.DOCUMENT_QUOTE),
+    }
+
+    # (code, rulings, kwargs, evidence) chosen so exactly that code appears
+    cases: list[tuple[str, list[Ruling], dict[str, Any], dict[str, Any]]] = [
+        (
+            "REF_MISSING",
+            [Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["ghost"])],
+            {},
+            EVIDENCE,
+        ),
+        (
+            "REF_NOT_MECHANICAL",
+            [Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_h"])],
+            {},
+            ev_human,
+        ),
+        (
+            "SUPPORTED_WITHOUT_REFS",
+            [Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=[])],
+            {},
+            EVIDENCE,
+        ),
+        (
+            "REFUTED_WITHOUT_REFS",
+            [Ruling(claim_id="c_01", status=ClaimStatus.REFUTED)],
+            {},
+            EVIDENCE,
+        ),
+        (
+            "CLAIM_MISSING",
+            [Ruling(claim_id="ghost", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])],
+            {},
+            EVIDENCE,
+        ),
+        ("DUPLICATE_RULING", [good, good], {}, EVIDENCE),
+        (
+            "DISSENT_EMPTY_WITH_CONTEST",
+            [Ruling(claim_id="c_01", status=ClaimStatus.CONTESTED, evidence_refs=["e_01"])],
+            {},
+            EVIDENCE,
+        ),
+        (
+            "RESIDUAL_RISKS_EMPTY_ON_ACCEPT",
+            [good, Ruling(claim_id="c_02", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])],
+            {"verdict": Verdict.ACCEPT, "residual_risks": []},
+            EVIDENCE,
+        ),
+    ]
+    for code, rulings, kw, ev in cases:
+        adj = adjudication(rulings, **kw)
+        enforced, findings = enforce_rulings(adj, C, ev)
+        assert code in codes(findings), f"{code} was not produced by its case"
+        changed = enforced.downgrades > 0 or enforced.verdict is not adj.verdict
+        assert (code in UNHANDLED_CODES) is not changed, (
+            f"{code}: UNHANDLED_CODES says unhandled={code in UNHANDLED_CODES} but the "
+            f"outcome changed={changed} (downgrades={enforced.downgrades}, "
+            f"verdict {adj.verdict.value}->{enforced.verdict.value})"
+        )
