@@ -924,14 +924,24 @@ UNREACHABLE_IN_VALIDATE = {
 }
 
 
-def _validate_reachability() -> tuple[set[str], set[str]]:
-    """(reachable, unreachable) module-level functions of `eris.validate`.
+def _validate_reachability() -> tuple[set[str], set[str], list[str]]:
+    """(reachable, unreachable, unmet_assumptions) for `eris.validate`.
 
-    Reachability is TRANSITIVE from the real entry points - the functions
-    something outside `eris.validate` actually uses. Checking only "has no
-    caller outside the module" is not the same thing and was the first version
-    of this test: a call from `enforce_rulings` (live, and in the same file)
-    would have satisfied it while making the target reachable.
+    Reachability is TRANSITIVE from the real entry points. A static analysis can
+    only PROVE this while its assumptions hold, so the assumptions are checked
+    and returned rather than relied on silently - an earlier version quietly
+    assumed all three and would have kept passing if any were violated:
+
+    1. every definition is a module-level `def` - an `async def` or a method
+       would be invisible to the scan, so its reachability would go unexamined;
+    2. module-level code is a caller too (it runs at import), so anything it
+       references is an entry point;
+    3. the module is never bound as an object (`import eris.validate`,
+       `from eris import validate`, `importlib`), which is what would make
+       `getattr(mod, name)` possible; a `getattr` with a matching string literal
+       counts as a use.
+
+    Tests are excluded deliberately: they are not a runtime entry point.
     """
     import ast
     from pathlib import Path
@@ -939,7 +949,18 @@ def _validate_reachability() -> tuple[set[str], set[str]]:
     root = Path(__file__).resolve().parent.parent
     vp = root / "src" / "eris" / "validate.py"
     tree = ast.parse(vp.read_text())
-    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    unmet: list[str] = []
+
+    defs = [n for n in tree.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+    funcs = {n.name: n for n in defs}
+    # assumption 1: nothing hides in a class or behind `async`
+    for n in tree.body:
+        if isinstance(n, ast.AsyncFunctionDef):
+            unmet.append(f"async def {n.name} - the reachability model does not cover it")
+        if isinstance(n, ast.ClassDef):
+            for m in n.body:
+                if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef):
+                    unmet.append(f"method {n.name}.{m.name} - not covered by the scan")
 
     def used(node: object) -> set[str]:
         names: set[str] = set()
@@ -950,15 +971,39 @@ def _validate_reachability() -> tuple[set[str], set[str]]:
                 names.add(x.attr)
             elif isinstance(x, ast.ImportFrom):
                 names.update(a.name for a in x.names)
+            elif (
+                isinstance(x, ast.Call)
+                and isinstance(x.func, ast.Name)
+                and x.func.id == "getattr"
+                and len(x.args) >= 2
+                and isinstance(x.args[1], ast.Constant)
+                and isinstance(x.args[1].value, str)
+            ):
+                names.add(x.args[1].value)  # assumption 3: literal dynamic access counts
         return names & set(funcs)
 
     graph = {name: used(node) - {name} for name, node in funcs.items()}
+
     entries: set[str] = set()
+    # assumption 2: module-level statements of validate.py execute on import
+    for n in tree.body:
+        if not isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            entries |= used(n)
     for pkg in ("src", "eval"):
         for f in (root / pkg).rglob("*.py"):
-            if f.resolve() == vp.resolve():
+            src = f.read_text()
+            if f.resolve() != vp.resolve():
+                entries |= used(ast.parse(src))
                 continue
-            entries |= used(ast.parse(f.read_text()))
+            # assumption 3: no module-object binding anywhere, which is what
+            # would allow `getattr(validate, <computed>)` to defeat this
+        for f in (root / pkg).rglob("*.py"):
+            src = f.read_text()
+            for pat in ("import eris.validate", "from eris import validate", "importlib"):
+                if pat in src and f.resolve() != vp.resolve():
+                    unmet.append(
+                        f"{f.relative_to(root)} contains {pat!r} - dynamic access possible"
+                    )
 
     reachable: set[str] = set()
     stack = list(entries)
@@ -968,7 +1013,7 @@ def _validate_reachability() -> tuple[set[str], set[str]]:
             continue
         reachable.add(fn)
         stack.extend(graph.get(fn, ()))
-    return reachable, set(funcs) - reachable
+    return reachable, set(funcs) - reachable, unmet
 
 
 def test_the_unreachable_parts_of_validate_are_exactly_the_recorded_set() -> None:
@@ -988,7 +1033,11 @@ def test_the_unreachable_parts_of_validate_are_exactly_the_recorded_set() -> Non
     `validate_origin` had no callers (it has three) and omitted
     `validate_adjudication`, `_record_id` and `has_errors` entirely.
     """
-    reachable, unreachable = _validate_reachability()
+    reachable, unreachable, unmet = _validate_reachability()
+    assert not unmet, (
+        "the reachability analysis can no longer PROVE its claim; its assumptions are "
+        "violated:\n  " + "\n  ".join(unmet)
+    )
     assert unreachable == UNREACHABLE_IN_VALIDATE, (
         "the unreachable set changed.\n"
         f"  newly reachable: {sorted(UNREACHABLE_IN_VALIDATE - unreachable)}\n"
