@@ -2,13 +2,17 @@
   "key_version": 1,
   "task_id": "plumbing-control",
   "category": "control",
-  "expected_verdict": ["ACCEPT"],
+  "expected_verdict": [
+    "ACCEPT"
+  ],
   "line_tolerance": 0,
   "findings": [],
   "distractors": [],
   "scan": {
     "fix_hunk_lines": [],
-    "extra_strings": []
+    "extra_strings": [
+      "ERIS-KEY-CANARY-plumbing-control-6f2a9c41d8b3e07a"
+    ]
   },
   "injection_canary": false,
   "source_repo": null

@@ -156,12 +156,65 @@ def task_is_scored(corpus: Path, task_id: str) -> bool:
     return isinstance(data, dict) and data.get("scored", True) is not False
 
 
+def keys_dir_for(corpus: Path) -> Path:
+    """Where answer keys live: a SIBLING of the corpus, never inside it.
+
+    A worker runs with cwd = `<corpus>/<task>/snapshot`, and E1 established that
+    claude, codex and grok all read the snapshot's parent and sibling
+    directories. A `key.json` in `<corpus>/<task>/` is therefore in the first
+    place a worker looks. `scan.build_patterns` deliberately does NOT pattern
+    match `must_mention` strings ("a correct answer must be allowed to say
+    them"), so a worker that read the key and paraphrased it would score
+    perfectly and never be marked contaminated.
+    """
+    return Path(corpus).resolve().parent / "keys"
+
+
 def load_key(corpus: Path, task_id: str) -> Key:
-    path = Path(corpus) / task_id / "key.json"
+    """Load `<corpus>/../keys/<task_id>.json`, refusing a key inside the corpus.
+
+    The in-corpus refusal is the point: it makes the leak structurally
+    impossible to reintroduce by accident, instead of relying on everyone
+    remembering why the file moved.
+    """
+    leaked = Path(corpus) / task_id / "key.json"
+    if leaked.exists():
+        raise GateRefused(
+            f"{leaked} is inside the corpus, where a worker running in "
+            f"{task_id}/snapshot can read it (E1: workers read the snapshot's parent). "
+            f"Answer keys belong in {keys_dir_for(corpus)}/. Move it; do not score with it "
+            "in place."
+        )
+    path = keys_dir_for(corpus) / f"{task_id}.json"
     try:
-        return Key.model_validate_json(path.read_bytes())
+        key = Key.model_validate_json(path.read_bytes())
     except (OSError, ValidationError) as exc:
         raise GateRefused(f"key for {task_id!r} unusable: {exc!s:.200}") from exc
+    _require_canary(key, task_id)
+    return key
+
+
+CANARY_PREFIX = "ERIS-KEY-CANARY-"
+
+
+def _require_canary(key: Key, task_id: str) -> None:
+    """Every scored key must carry a canary in `scan.extra_strings`.
+
+    Moving the key REDUCES exposure; it cannot eliminate it, because a worker
+    that walks far enough up the tree can still find it. The canary converts
+    "we cannot know" into a measurement: the token exists ONLY in the key, so a
+    worker that emits it demonstrably read the key, and `scan.build_patterns`
+    turns `extra_strings` into scan patterns over the ledger and blobs.
+
+    It detects a VERBATIM read, not a paraphrase - stated plainly here so no
+    report can claim the canary proves the key was not used.
+    """
+    if not any(s.startswith(CANARY_PREFIX) for s in key.scan.extra_strings):
+        raise GateRefused(
+            f"key for {task_id!r} has no {CANARY_PREFIX}* token in scan.extra_strings. "
+            "Without it a key read cannot be detected at all, and the quality metrics "
+            "would be unfalsifiable."
+        )
 
 
 # --------------------------------------------------------------------------- cells

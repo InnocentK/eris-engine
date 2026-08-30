@@ -165,7 +165,13 @@ def world(
             }
         )
     )
-    (corpus / "key.json").write_text(
+    # the key lives OUTSIDE the corpus: a worker runs in <task>/snapshot and
+    # E1 showed it reads the parent, so a key there is simply readable.
+    # NB `corpus` here is the TASK dir (tmp/corpus/t_01), so the corpus ROOT is
+    # corpus.parent and the keys dir is its SIBLING - one level further up.
+    keys = corpus.parent.parent / "keys"
+    keys.mkdir(parents=True, exist_ok=True)
+    (keys / "t_01.json").write_text(
         json.dumps(
             {
                 "key_version": 1,
@@ -1484,7 +1490,8 @@ def test_campaign_discovery_skips_an_unscored_plumbing_task(tmp_path: Path) -> N
     spec = json.loads((w["corpus"] / "t_01" / "task.json").read_text())
     spec.update({"task_id": "t_plumb", "scored": False, "diff_rev": None, "excerpts": []})
     (plumbing / "task.json").write_text(json.dumps(spec))
-    (plumbing / "key.json").write_text((w["corpus"] / "t_01" / "key.json").read_text())
+    _keys = w["corpus"].parent / "keys"
+    (_keys / "t_plumb.json").write_text((_keys / "t_01.json").read_text())
 
     assert [p.parent.name for p in discover_tasks(w["corpus"])] == ["t_01"]
 

@@ -688,9 +688,18 @@ def load_task(task_file: Path) -> tuple[TaskSpec, Path]:
 def scan_patterns_for(
     task_file: Path, snapshot: Path, home: Path, run_dir: Path, policy: Any
 ) -> PatternSet:
-    """Patterns from the sibling ``key.json`` (fix hunks, extra strings,
-    source repo) + the fixed markers. The key is opened for THIS ONLY."""
-    key_path = Path(task_file).resolve().parent / "key.json"
+    """Patterns from the task's answer key (fix hunks, extra strings, source
+    repo) + the fixed markers. The key is opened for THIS ONLY.
+
+    The key lives OUTSIDE the corpus - `<corpus>/../keys/<task_id>.json` - not
+    beside `task.json`. A worker runs with cwd = `<task>/snapshot`, and E1
+    established that claude, codex and grok read the snapshot's PARENT, so a key
+    there is simply readable by the thing being graded. Eris reads it here (Eris
+    is not the worker) and turns it into scan patterns; it never enters a
+    worker's environment.
+    """
+    task_dir = Path(task_file).resolve().parent
+    key_path = task_dir.parent.parent / "keys" / f"{task_dir.name}.json"
     fix_hunks: list[str] = []
     extra: list[str] = []
     source_repo: str | None = None

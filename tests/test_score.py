@@ -20,6 +20,7 @@ from eval.score import (
     Key,
     Predicted,
     aggregate,
+    keys_dir_for,
     load_key,
     match_findings,
     paired_deltas,
@@ -61,14 +62,23 @@ def key_dict(**over: Any) -> dict[str, Any]:
             }
         ],
         "distractors": [{"path": "src/app.py", "line_start": 30, "line_end": 32}],
-        "scan": {"fix_hunk_lines": [FIX_HUNK], "extra_strings": []},
+        "scan": {
+            "fix_hunk_lines": [FIX_HUNK],
+            "extra_strings": ["ERIS-KEY-CANARY-t01-testfixture"],
+        },
     }
     base.update(over)
     return base
 
 
 def write_key(w: dict[str, Path], **over: Any) -> None:
-    (w["corpus"] / "t_01" / "key.json").write_text(json.dumps(key_dict(**over)))
+    """Write the key OUTSIDE the corpus - a key inside it is readable by the
+    worker (E1) and `load_key` now refuses one it finds there."""
+    from eval.score import keys_dir_for
+
+    d = keys_dir_for(w["corpus"])
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "t_01.json").write_text(json.dumps(key_dict(**over)))
 
 
 def campaign(
@@ -218,7 +228,14 @@ def test_scorer_opens_nothing_outside_runs_and_corpus(
     monkeypatch.setattr(Path, "read_bytes", spy_read_bytes)
     summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
     assert summary["per_arm"]
-    allowed = (w["runs"].resolve(), w["corpus"].resolve())
+    # keys/ is a THIRD allowed root, deliberately: the answer key was moved out
+    # of the corpus because a worker running in <task>/snapshot reads the
+    # parent (E1). The scorer must still be able to read it.
+    allowed = (
+        w["runs"].resolve(),
+        w["corpus"].resolve(),
+        keys_dir_for(w["corpus"]).resolve(),
+    )
     for p in opened:
         rp = p.resolve()
         assert any(str(rp).startswith(str(a)) for a in allowed), p
@@ -1564,3 +1581,58 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
     assert "ledgers with no `finding.acted`" not in low
     assert "with no `finding.acted`" not in low
     assert block["per_arm"]["indep_verify_critique"]["coarsely_scored_cells"] == 1
+
+
+def test_a_key_inside_the_corpus_is_refused(tmp_path: Path) -> None:
+    """The answer key must not sit where the graded worker can read it.
+
+    A worker runs with cwd = `<task>/snapshot`, and E1 established that claude,
+    codex and grok all read the snapshot's PARENT and siblings. `key.json` in
+    `<corpus>/<task>/` is therefore the first place a worker looks - and
+    `scan.build_patterns` deliberately does NOT pattern-match `must_mention`
+    strings, so a worker that read the key and paraphrased it would score
+    perfectly and never be flagged. Refusing at load time makes the leak
+    structurally impossible to reintroduce by forgetting.
+    """
+    w = world(tmp_path)
+    write_key(w)  # correct location
+    assert load_key(w["corpus"], "t_01").task_id == "t_01"
+
+    (w["corpus"] / "t_01" / "key.json").write_text(json.dumps(key_dict()))
+    with pytest.raises(GateRefused, match="inside the corpus"):
+        load_key(w["corpus"], "t_01")
+
+
+def test_a_key_without_a_canary_is_refused(tmp_path: Path) -> None:
+    """Moving the key REDUCES exposure; it cannot eliminate it - a worker that
+    walks far enough up the tree still finds it. The canary makes a read
+    DETECTABLE: the token exists only in the key, and `scan.extra_strings`
+    becomes a scan pattern over the ledger and blobs, so a worker that emits it
+    demonstrably read the key.
+
+    It detects a VERBATIM read, not a paraphrase. Asserted here so the
+    requirement cannot be dropped as "noise" by someone who has forgotten why a
+    quality metric needs it.
+    """
+    w = world(tmp_path)
+    write_key(w, scan={"fix_hunk_lines": [], "extra_strings": []})
+    with pytest.raises(GateRefused, match="CANARY"):
+        load_key(w["corpus"], "t_01")
+
+    write_key(w, scan={"fix_hunk_lines": [], "extra_strings": ["ERIS-KEY-CANARY-x-1"]})
+    assert load_key(w["corpus"], "t_01").scan.extra_strings == ["ERIS-KEY-CANARY-x-1"]
+
+
+def test_the_shipped_key_is_outside_the_corpus_and_has_a_canary() -> None:
+    """The real corpus, not a fixture: the invariant must hold on disk."""
+    root = Path(__file__).resolve().parent.parent
+    corpus = root / "eval" / "corpus"
+    for task_dir in sorted(p for p in corpus.iterdir() if p.is_dir()):
+        assert not (task_dir / "key.json").exists(), (
+            f"{task_dir.name} has a key inside the corpus - readable by its own worker"
+        )
+    for key_file in sorted((root / "eval" / "keys").glob("*.json")):
+        body = json.loads(key_file.read_text())
+        assert any(
+            s.startswith("ERIS-KEY-CANARY-") for s in body.get("scan", {}).get("extra_strings", [])
+        ), f"{key_file.name} has no canary"
