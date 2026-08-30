@@ -347,3 +347,44 @@ def test_generated_bytecode_does_not_make_a_task_permanently_unrunnable(tmp_path
 
     (task / "files" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
     assert snapshot_matches_files(task) is False, "a real edit must still be caught"
+
+
+def test_every_keyed_finding_is_inside_the_evidence_the_task_declares() -> None:
+    """A task's `excerpts` are what the evidence pack puts in front of a worker.
+    A planted finding outside them is not a hard finding, it is an unfindable
+    one, and the recall it depresses is measuring the corpus rather than the
+    model.
+
+    The plan documents were rewritten to space their findings apart and grew
+    from 47 to 84 lines; the excerpts still said 1-47, leaving three of five
+    planted findings outside the declared evidence. The control excerpts had
+    been wrong in the other direction since the first draft, claiming more lines
+    than the file has (stop review, 2026-08-30).
+    """
+    corpus = REPO / "eval" / "corpus"
+    checked = 0
+    for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
+        spec = json.loads((task_dir / "task.json").read_text())
+        for e in spec.get("excerpts", []):
+            n = len((task_dir / "files" / e["path"]).read_text().splitlines())
+            assert e["line_end"] <= n, (
+                f"{task_dir.name}: excerpt {e['path']} claims line {e['line_end']} of a "
+                f"{n}-line file"
+            )
+            assert e["line_start"] >= 1
+        if spec.get("scored", True) is False:
+            continue
+        from eval.score import load_key
+
+        for f in load_key(corpus, task_dir.name).findings:
+            checked += 1
+            assert any(
+                e["path"] == f.path
+                and e["line_start"] <= f.line_start
+                and f.line_end <= e["line_end"]
+                for e in spec.get("excerpts", [])
+            ), (
+                f"{task_dir.name}: planted finding {f.id} at {f.path} L{f.line_start}-{f.line_end} "
+                "is outside every excerpt the task shows the worker - it cannot be found"
+            )
+    assert checked, "no scored task plants a finding - this test would check nothing"
