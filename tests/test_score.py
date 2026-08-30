@@ -24,6 +24,8 @@ from eval.score import (
     Predicted,
     _comparison_block,
     aggregate,
+    arm_key,
+    cell_dirs,
     keys_dir_for,
     load_key,
     match_findings,
@@ -94,7 +96,12 @@ def write_key(w: dict[str, Path], **over: Any) -> None:
 
 
 def campaign(
-    w: dict[str, Path], tmp_path: Path, arms: str, popen: Popen | None = None, cid: str = "c1"
+    w: dict[str, Path],
+    tmp_path: Path,
+    arms: str,
+    popen: Popen | None = None,
+    cid: str = "c1",
+    task_file: Path | None = None,
 ) -> Path:
     out = io.StringIO()
     rc = run_main(
@@ -109,6 +116,9 @@ def campaign(
             "1",
             "--arms",
             arms,
+            # discovery skips an unscored task on purpose; naming it explicitly
+            # is how a plumbing task is meant to be run
+            *(["--task-file", str(task_file)] if task_file else []),
         ],
         out=out,
         err=io.StringIO(),
@@ -324,7 +334,7 @@ def test_contaminated_missing_and_incomplete_cells_are_excluded_but_costed(tmp_p
     assert single["cost_spent_usd"] > 0  # counted in cost
     iv = by["t_01-r0-indep_verify"]
     assert iv["exclusion"] == "contaminated"  # the reused dirty proposal contaminates arm 3 too
-    per_arm = summary["per_arm"]["single"]
+    per_arm = summary["per_arm"]["single:grok"]
     assert (
         per_arm["included"] == 0
         and per_arm["excluded"]["contaminated"] == 1
@@ -445,9 +455,11 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
         popen=popen,
     )
     summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
-    by = {c["arm"]: c for c in summary["cells"]}
+    by = {c["arm_key"]: c for c in summary["cells"]}
     assert set(by) == {
-        "single",
+        # the single-model baseline is named by its lineage: workers answering
+        # alone are separate baselines, not one pooled "single"
+        "single:grok",
         "consensus",
         "indep_verify",
         "indep_verify_iter",
@@ -464,12 +476,12 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     assert by["consensus"]["validator_errors"] == 0 and by["consensus"]["included"] is True
     assert all(c["included"] for c in by.values() if c["arm"] != "indep_verify_critique")
     # a cell with no adjudication at all is UNKNOWN, never "clean"
-    assert by["single"]["validator_errors"] is None
+    assert by["single:grok"]["validator_errors"] is None
     # arm 1: findings from the proposal, no verdict
     assert (
-        by["single"]["verdict"] is None
-        and by["single"]["tp"] == 1
-        and by["single"]["recall"] == 1.0
+        by["single:grok"]["verdict"] is None
+        and by["single:grok"]["tp"] == 1
+        and by["single:grok"]["recall"] == 1.0
     )
     # arm 2: raw verdict (the summarizer's ACCEPT), confident-wrong since ACCEPT is off-key
     assert by["consensus"]["verdict_basis"] == "raw" and by["consensus"]["verdict"] == "ACCEPT"
@@ -505,7 +517,7 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     assert pairs["4-3"]["paired"] is False and "validator errors" in pairs["4-3"]["reason"]
     assert "delta_recall" not in pairs["4-3"]  # no delta is emitted for an unpaired cell
     per_arm = summary["per_arm"]
-    assert per_arm["single"]["recall"]["micro"] == 1.0
+    assert per_arm["single:grok"]["recall"]["micro"] == 1.0
     # M1 reporting: the malformation is first-class per arm, and the campaign
     # summary carries the same counts across all cells
     assert per_arm["indep_verify_critique"]["validator"]["malformed"] == 1
@@ -514,7 +526,7 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     assert per_arm["indep_verify_critique"]["validator"]["codes"] == {
         "DISSENT_EMPTY_WITH_CONTEST": 1
     }
-    assert per_arm["single"]["validator"]["unknown"] == 1  # no adjudication to judge
+    assert per_arm["single:grok"]["validator"]["unknown"] == 1  # no adjudication to judge
     assert summary["validator"]["malformed_cells"] == 1
     assert summary["validator"]["total_errors"] == 1
     assert per_arm["indep_verify"]["abstention"]["neither"] == 1
@@ -545,6 +557,8 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             run_id=f"r-{arm}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=included,
@@ -561,6 +575,11 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -599,7 +618,12 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
     out = paired_deltas(
         [cell("indep_verify", same, included=False), cell("indep_verify_critique", same)]
     )
-    assert out[0]["paired"] is False and "excluded" in out[0]["reason"]
+    rows = {p["pair"]: p for p in out}
+    assert rows["4-3"]["paired"] is False and "excluded" in rows["4-3"]["reason"]
+    # arm 3b never ran, so its pair is reported unpaired rather than omitted:
+    # a pair that is never iterated makes coverage look complete
+    assert rows["3b-3"]["paired"] is False
+    assert "no scored cell for arm(s): indep_verify_iter" in rows["3b-3"]["reason"]
     agg = aggregate([cell("indep_verify", same), cell("indep_verify", same, included=False)])
     assert agg["indep_verify"]["cells"] == 2 and agg["indep_verify"]["included"] == 1
     assert agg["indep_verify"]["excluded"]["contaminated"] == 1
@@ -612,6 +636,22 @@ def test_read_cell_and_load_key_errors(tmp_path: Path) -> None:
         load_key(w["corpus"], "nope")
     cell = read_cell(cdir / "t_01-r0-single-grok")
     assert cell.arm_run.arm.value == "single" and cell.enforced is None and cell.scan is not None
+
+
+def _unbind(event: dict[str, Any]) -> dict[str, Any]:
+    """Model a ledger written before `run.started` bound its task and key.
+
+    These tests rebuild a ledger by hand and then edit the corpus, which is what
+    a pre-0.4.3 ledger looks like from the scorer's side: no `task_sha256`, no
+    `key_sha256`, so `require_inputs_unchanged` has nothing to compare and the
+    cell is reported under `inputs_unbound` instead. Leaving STALE hashes in a
+    hand-built ledger would make these tests fail for a reason none of them is
+    about.
+    """
+    if event.get("kind") != "run.started":
+        return event
+    payload = {k: v for k, v in event["payload"].items() if k not in ("task_sha256", "key_sha256")}
+    return {**event, "payload": payload}
 
 
 def test_cells_without_a_scan_result_are_refused_when_gated_and_plumbing_otherwise(
@@ -628,7 +668,7 @@ def test_cells_without_a_scan_result_are_refused_when_gated_and_plumbing_otherwi
 
     # rebuild the ledger without its scan.result lines (a valid chain again)
     lines = [json.loads(line) for line in events.read_bytes().splitlines()]
-    kept = [e for e in lines if e["kind"] != "scan.result"]
+    kept = [_unbind(e) for e in lines if e["kind"] != "scan.result"]
     (cdir / "t_01-r0-single-grok" / "manifest.json").unlink()
     events.unlink()
     (cdir / "t_01-r0-single-grok" / ".lock").unlink(missing_ok=True)
@@ -639,7 +679,7 @@ def test_cells_without_a_scan_result_are_refused_when_gated_and_plumbing_otherwi
     summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
     cell = summary["cells"][0]
     assert cell["included"] is False and cell["exclusion"] == "no_scan"
-    assert summary["per_arm"]["single"]["excluded"]["no_scan"] == 1
+    assert summary["per_arm"]["single:grok"]["excluded"]["no_scan"] == 1
     # the same cell under a gated category is refused outright
     task = json.loads(w["task"].read_text())
     w["task"].write_text(json.dumps({**task, "category": "planted"}))
@@ -677,7 +717,7 @@ def test_a_stale_containment_declaration_in_an_old_ledger_is_refused(tmp_path: P
     cdir = campaign(w, tmp_path, "single")
     cell = cdir / "t_01-r0-single-grok"
     events = cell / "events.jsonl"
-    kept = [json.loads(line) for line in events.read_bytes().splitlines()]
+    kept = [_unbind(json.loads(line)) for line in events.read_bytes().splitlines()]
 
     task = json.loads(w["task"].read_text())
     w["task"].write_text(json.dumps({**task, "category": "planted"}))
@@ -700,16 +740,25 @@ def test_a_stale_containment_declaration_in_an_old_ledger_is_refused(tmp_path: P
 def test_key_must_match_the_ledger_task_and_category(tmp_path: Path) -> None:
     """Item 3: a gated task can never be scored behind a `control` ArmRun:
     key.task_id and key.category must equal what the ledger recorded."""
+    # each divergence is written BEFORE its campaign runs, so the ledger binds
+    # the key it actually used. Editing the key afterwards is a different fault
+    # and is refused by its own gate (`require_inputs_unchanged`); it must not
+    # be the reason this one appears to pass.
+    wc = world(tmp_path / "cat")
+    write_key(wc, category="planted")  # the key says planted; task.json says plan
+    cdir_c = campaign(wc, tmp_path / "cat", "single")
+    with pytest.raises(GateRefused, match="category"):
+        score_campaign(cdir_c, wc["corpus"], home=tmp_path / "cat" / "home")
+
+    wt = world(tmp_path / "tid")
+    write_key(wt, task_id="t_99")
+    cdir_t = campaign(wt, tmp_path / "tid", "single")
+    with pytest.raises(GateRefused, match="task_id"):
+        score_campaign(cdir_t, wt["corpus"], home=tmp_path / "tid" / "home")
+
     w = world(tmp_path)
     write_key(w)
     cdir = campaign(w, tmp_path, "single")
-    write_key(w, category="planted")  # the key says planted; the ledger recorded control
-    with pytest.raises(GateRefused, match="category"):
-        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
-    write_key(w, task_id="t_99")
-    with pytest.raises(GateRefused, match="task_id"):
-        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
-    write_key(w)
     summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
     assert summary["cells"][0]["containment_basis"].startswith("policy declaration")
     assert any("containment basis" in n for n in summary["pre_registration_notes"])
@@ -768,19 +817,33 @@ def test_scorer_skips_an_unscored_plumbing_task_and_says_so(tmp_path: Path) -> N
     scorer reports its cells under `skipped` with the reason, rather than
     silently dropping them or quietly folding them into the aggregates."""
     w = world(tmp_path)
-    cdir = campaign(w, tmp_path, "single")
     write_key(w, expected_verdict=["ACCEPT"])
+    cdir = campaign(w, tmp_path, "single")
     scored = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
     assert scored["cells"] and scored["skipped"] == []
 
-    spec = json.loads((w["corpus"] / "t_01" / "task.json").read_text())
+    # a SECOND world, unscored from the start. Flipping the flag on a task that
+    # has already run is a different thing entirely - it rewrites what a
+    # finished run is measured against, and `require_inputs_unchanged` refuses
+    # it (asserted below) rather than letting the task vanish into `skipped`.
+    u = world(tmp_path / "unscored")
+    write_key(u, expected_verdict=["ACCEPT"])
+    spec = json.loads((u["corpus"] / "t_01" / "task.json").read_text())
     spec["scored"] = False
-    (w["corpus"] / "t_01" / "task.json").write_text(json.dumps(spec))
-    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    (u["corpus"] / "t_01" / "task.json").write_text(json.dumps(spec))
+    ucdir = campaign(u, tmp_path / "unscored", "single", task_file=u["task"])
+    summary = score_campaign(ucdir, u["corpus"], home=tmp_path / "unscored" / "home")
     assert summary["cells"] == []
     assert [c["skipped"] for c in summary["skipped"]] == ["not a scored corpus task"]
     assert {c["task_id"] for c in summary["skipped"]} == {"t_01"}
     assert all(not v for v in summary["per_arm"].values()) or summary["per_arm"] is not None
+
+    # and the flip-after-the-fact is refused, not silently honoured
+    flipped = json.loads((w["corpus"] / "t_01" / "task.json").read_text())
+    flipped["scored"] = False
+    (w["corpus"] / "t_01" / "task.json").write_text(json.dumps(flipped))
+    with pytest.raises(GateRefused, match="changed after"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
 
 
 def test_the_repo_plumbing_control_task_is_marked_unscored() -> None:
@@ -814,6 +877,8 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             run_id=f"r-{arm}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=True,
@@ -830,6 +895,11 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -1018,6 +1088,8 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             run_id=f"r-{arm}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=True,
@@ -1034,6 +1106,11 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -1166,6 +1243,8 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             run_id=f"r-{arm}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=exclusion is None,
@@ -1182,6 +1261,11 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -1278,6 +1362,8 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             run_id=f"r-{arm}-{exclusion}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=exclusion is None,
@@ -1294,6 +1380,11 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -1479,6 +1570,8 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             run_id=f"r-{arm}-{basis}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=True,
@@ -1495,6 +1588,11 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -1557,6 +1655,8 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             run_id=f"r-{arm}",
             task_id="t",
             arm=arm,
+            panel=["w"],
+            arm_key=arm,
             repeat_index=0,
             category="control",
             included=True,
@@ -1573,6 +1673,11 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
+            run_errors=[],
+            post_scan_errors=0,
+            orphan_invocations=0,
+            downgrades_n=0,
+            rulings_n=0,
             downgrades=0,
             confident_wrong=False,
             abstained=False,
@@ -1831,6 +1936,7 @@ def _cs(**over: Any) -> CellScore:
         run_id="r",
         task_id="t",
         arm="single",
+        panel=["w"],
         repeat_index=0,
         category="control",
         included=True,
@@ -1847,6 +1953,11 @@ def _cs(**over: Any) -> CellScore:
         redundant=0,
         distractor_hits=0,
         unsupported_claim_rate=None,
+        run_errors=[],
+        post_scan_errors=0,
+        orphan_invocations=0,
+        downgrades_n=0,
+        rulings_n=0,
         downgrades=0,
         confident_wrong=False,
         abstained=False,
@@ -1869,6 +1980,9 @@ def _cs(**over: Any) -> CellScore:
         containment=None,
     )
     base.update(over)
+    # derived unless the caller pins it, so a test that overrides `arm` groups
+    # under that arm rather than silently under the default
+    base.setdefault("arm_key", arm_key(str(base["arm"]), [str(p) for p in base["panel"]]))
     return CellScore(**base)
 
 
@@ -1886,9 +2000,9 @@ def test_pooled_and_per_cell_rates_are_both_reported_and_named() -> None:
     agg = aggregate(
         [_cs(covered=1, fn=0, recall=1.0), _cs(covered=1, fn=8, recall=round(1 / 9, 4))]
     )
-    assert agg["single"]["recall"]["micro"] == 0.2
-    assert agg["single"]["recall"]["macro"] == 0.5555
-    assert agg["single"]["recall"]["cells_counted"] == 2
+    assert agg["single:w"]["recall"]["micro"] == 0.2
+    assert agg["single:w"]["recall"]["macro"] == 0.5555
+    assert agg["single:w"]["recall"]["cells_counted"] == 2
 
 
 def test_silent_cells_are_named_rather_than_dropped_from_precision() -> None:
@@ -1900,7 +2014,7 @@ def test_silent_cells_are_named_rather_than_dropped_from_precision() -> None:
     `cells_included`, and `silent_cells` outright.
     """
     agg = aggregate([_cs(tp=1, fp=0, precision=1.0), _cs(tp=0, fp=0, precision=None)])
-    p = agg["single"]["precision"]
+    p = agg["single:w"]["precision"]
     assert p["micro"] == 1.0 and p["macro"] == 1.0
     assert (p["cells_counted"], p["cells_included"], p["silent_cells"]) == (1, 2, 1)
 
@@ -1911,9 +2025,9 @@ def test_precision_with_redundant_back_in_the_denominator_is_published() -> None
     it is published rather than left for them to recompute from raw cells.
     """
     agg = aggregate([_cs(tp=1, fp=1, redundant=2, precision=0.5)])
-    p = agg["single"]["precision"]
+    p = agg["single:w"]["precision"]
     assert p["micro"] == 0.5 and p["micro_with_redundant"] == 0.25
-    assert agg["single"]["redundant"] == 2
+    assert agg["single:w"]["redundant"] == 2
 
 
 def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
@@ -1933,13 +2047,13 @@ def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
         _cs(category="control", fp=0),
         _cs(category="control", fp=0),
     ]
-    block = aggregate(ctl)["single"]["control"]
+    block = aggregate(ctl)["single:w"]["control"]
     assert (block["cells"], block["flagged_cells"], block["fpr"]) == (4, 1, 0.25)
     assert block["mean_false_positives"] == 1.0
 
     # an arm with the same sum(fp) spread across every control is distinguished
     spread = [_cs(category="control", fp=1, precision=0.0) for _ in range(4)]
-    other = aggregate(spread)["single"]["control"]
+    other = aggregate(spread)["single:w"]["control"]
     assert other["fpr"] == 1.0 and other["mean_false_positives"] == 1.0
 
     # `severe_cells` comes from the FALSE-POSITIVE severities, not from
@@ -1955,12 +2069,12 @@ def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
             # whole difference between the two
             _cs(category="control", fp=0, confident_wrong=True),
         ]
-    )["single"]["control"]
+    )["single:w"]["control"]
     assert sev["severe_cells"] == 2
 
     # an arm with no controls says so rather than reporting a reassuring 0.0,
     # and keeps the same SHAPE so a report cannot KeyError on it
-    empty = aggregate([_cs(category="planted", covered=1, recall=1.0)])["single"]["control"]
+    empty = aggregate([_cs(category="planted", covered=1, recall=1.0)])["single:w"]["control"]
     assert empty["fpr"] is None and empty["severe_cells"] is None
     assert set(empty) == set(sev)
 
@@ -1977,7 +2091,7 @@ def test_rates_are_stratified_by_category() -> None:
             _cs(category="planted", covered=2, fn=0, recall=1.0),
             _cs(category="revert", covered=0, fn=2, recall=0.0),
         ]
-    )["single"]
+    )["single:w"]
     assert agg["recall"]["micro"] == 0.5
     assert agg["by_category"]["planted"]["recall"]["micro"] == 1.0
     assert agg["by_category"]["revert"]["recall"]["micro"] == 0.0
@@ -2087,7 +2201,7 @@ def test_a_control_key_may_not_plant_findings() -> None:
     turned matching predictions into true positives while the same block still
     called the result a clean-control FPR - understated, with no warning.
     """
-    with pytest.raises(ValidationError, match="control"):
+    with pytest.raises(ValidationError, match="clean by definition"):
         Key.model_validate(key_dict(category="control"))
     assert Key.model_validate(key_dict(category="control", findings=[])).findings == []
     # every other category may plant
@@ -2112,6 +2226,8 @@ def test_comparison_is_blocked_when_arms_scored_different_cells() -> None:
     unequal.append(
         _cs(
             arm="indep_verify_critique",
+            panel=["w"],
+            arm_key="indep_verify_critique",
             task_id="t2",
             repeat_index=0,
             included=False,
@@ -2123,3 +2239,268 @@ def test_comparison_is_blocked_when_arms_scored_different_cells() -> None:
     assert "different set of (task, repeat)" in block["reason"]
     assert block["common_support"] == ["t1#0"]
     assert block["per_arm"]["indep_verify"]["outside_common_support"] == ["t2#0"]
+
+
+def test_editing_the_key_or_task_after_a_run_is_refused(tmp_path: Path) -> None:
+    """The scorer REREADS both files, so without a binding the answer can be
+    rewritten after the answering is done: delete a planted finding the run
+    missed and recall rises, flip `scored` to false and the task disappears into
+    `skipped`. Nothing in the output said the files had moved (stop review,
+    2026-08-30). `run.started` records both hashes; scoring compares them.
+    """
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    assert score_campaign(cdir, w["corpus"], home=tmp_path / "home")["inputs_unbound"] == []
+
+    key_file = keys_dir_for(w["corpus"]) / "t_01.json"
+    body = key_file.read_text()
+    # the edit that matters most: remove a finding the run did not report
+    key_file.write_text(json.dumps({**json.loads(body), "findings": []}))
+    with pytest.raises(GateRefused, match="changed after"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    key_file.write_text(body)
+
+    task = w["corpus"] / "t_01" / "task.json"
+    original = task.read_text()
+    task.write_text(json.dumps({**json.loads(original), "question": "a different question"}))
+    with pytest.raises(GateRefused, match="changed after"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    task.write_text(original)
+
+    assert score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"]
+
+
+def test_the_scored_cells_are_checked_against_the_declared_matrix(tmp_path: Path) -> None:
+    """Cells were discovered by listing finalized directories, never compared
+    with the matrix `campaign.started` recorded. A cell that never finished
+    vanished, an extra directory was scored as if it belonged, and duplicate
+    coordinates were all aggregated - an arm could be missing entirely and the
+    summary would read as complete.
+
+    Missing is reported and BLOCKS the comparison rather than refusing: a
+    budget-tripped cell is pre-registered as MISSING, a legitimate outcome.
+    Unexpected coordinates are refused, because no campaign produces them.
+    """
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert summary["matrix"]["missing"] == [] and summary["matrix"]["unexpected"] == []
+    assert summary["matrix"]["declared"] == summary["matrix"]["scored"]
+
+    # a declared cell that produced nothing: reported, and the comparison blocks.
+    # `cell_dirs` is the scorer's own notion of a cell, so the test cannot pick
+    # `blobs/` by accident and prove nothing.
+    cell = cell_dirs(cdir)[0]
+    moved = cdir.parent / ("stash-" + cell.name)
+    cell.rename(moved)
+    gone = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    assert gone["matrix"]["missing"], "a cell that never finished must not simply vanish"
+    assert gone["comparison"]["blocked"] is True
+    assert "declared cell" in gone["comparison"]["reason"]
+    moved.rename(cell)
+
+    # a cell directory the campaign never declared
+    import shutil
+
+    shutil.copytree(cell, cdir / "t_99-r0-single-grok")
+    with pytest.raises(GateRefused, match="never declared"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+
+def test_a_symlinked_key_file_is_refused(tmp_path: Path) -> None:
+    """`is_file()` and `read_bytes()` both follow links, so
+    `eval/keys/t.json -> ../corpus/t/ground-truth.json` loads perfectly while
+    the BYTES sit inside the task tree the worker reads, under a name no
+    filename check looks for. Moving the key out of the corpus means moving the
+    bytes, not the path that names them (stop review, 2026-08-30).
+    """
+    w = world(tmp_path)
+    write_key(w)
+    key_file = keys_dir_for(w["corpus"]) / "t_01.json"
+    body = key_file.read_text()
+
+    alias = w["corpus"] / "t_01" / "ground-truth.json"
+    alias.write_text(body)
+    key_file.unlink()
+    key_file.symlink_to(alias)
+    # matched on message text that cannot appear in a path: `tmp_path` is named
+    # after the test, so `match="symlink"` was satisfied by the temp DIRECTORY
+    # and the assertion held even with the check removed
+    with pytest.raises(GateRefused, match="must be a real file"):
+        load_key(w["corpus"], "t_01")
+
+    key_file.unlink()
+    key_file.write_text(body)
+    alias.unlink()
+    assert load_key(w["corpus"], "t_01").task_id == "t_01"
+
+
+def test_a_prediction_with_no_line_does_not_match_a_line_anchored_finding() -> None:
+    """A missing `line_start` defaulted to 1, so "something is wrong in this
+    file" scored a hit on any finding near the top of it - the stop review
+    reproduced precision and recall of 1.0 from a bare path. A key match is
+    defined as a location overlap; a prediction with no location makes no such
+    claim.
+    """
+    key = Key.model_validate(
+        key_dict(
+            line_tolerance=0,
+            findings=[
+                {
+                    "id": "k1",
+                    "path": "src/app.py",
+                    "line_start": 1,
+                    "line_end": 1,
+                    "severity": "high",
+                    "must_mention": ["null"],
+                }
+            ],
+        )
+    )
+    vague = match_findings([Predicted("src/app.py", None, None, Severity.HIGH, "null")], key)
+    assert (vague.covered, vague.tp, vague.fp, vague.recall) == (0, 0, 1, 0.0)
+
+    located = match_findings([Predicted("src/app.py", 1, 1, Severity.HIGH, "null")], key)
+    assert located.recall == 1.0
+
+
+def test_duplicate_key_finding_ids_are_refused() -> None:
+    """Coverage is a SET of ids and `fn` is a list length, so two findings
+    sharing an id disagree by construction: the stop review reproduced two fully
+    detected findings scoring recall 0.5, one counted as a redundant repeat of
+    the other.
+    """
+    two = [
+        {
+            "id": "same",
+            "path": "src/app.py",
+            "line_start": 1,
+            "line_end": 1,
+            "severity": "high",
+            "must_mention": ["alpha"],
+        },
+        {
+            "id": "same",
+            "path": "src/app.py",
+            "line_start": 9,
+            "line_end": 9,
+            "severity": "high",
+            "must_mention": ["beta"],
+        },
+    ]
+    with pytest.raises(ValidationError, match="understates recall"):
+        Key.model_validate(key_dict(findings=two))
+    two[1]["id"] = "other"
+    assert len(Key.model_validate(key_dict(findings=two)).findings) == 2
+
+
+def test_single_model_baselines_are_not_pooled_into_one_arm() -> None:
+    """The `single` arm expands to ONE CELL PER PANEL WORKER, and every one of
+    them carries `arm: "single"`. Aggregated by arm alone, three separate
+    single-model baselines became one number in which a strong lineage masks a
+    weak one - and `single` carried three times the weight of every other arm in
+    the support check, because three cells collapsed onto one `(task, repeat)`
+    coordinate (stop review, 2026-08-30).
+    """
+    cells = [
+        _cs(arm="single", panel=["grok"], task_id="t1", covered=2, fn=0, recall=1.0),
+        _cs(arm="single", panel=["codex"], task_id="t1", covered=0, fn=2, recall=0.0),
+        _cs(arm="indep_verify", panel=["grok", "codex"], task_id="t1", covered=1, fn=1, recall=0.5),
+    ]
+    agg = aggregate(cells)
+    assert set(agg) == {"single:grok", "single:codex", "indep_verify"}
+    assert agg["single:grok"]["recall"]["micro"] == 1.0
+    assert agg["single:codex"]["recall"]["micro"] == 0.0
+
+    # a multi-model arm keeps its plain name: it names its whole panel by design
+    assert arm_key("indep_verify", ["grok", "codex"]) == "indep_verify"
+    assert arm_key("single", ["grok"]) == "single:grok"
+
+
+def _rewrite_ledger(cell: Path, transform: Any) -> None:
+    """Rebuild a cell's ledger (a valid chain again) from transformed events.
+
+    Appending to a sealed ledger by hand would break the hash chain and be
+    rejected as corrupt for the wrong reason; this produces a ledger that is
+    internally sound and differs only in what it contains.
+    """
+    from eris.redact import Redactor
+    from eris.writer import RunWriter as RW
+
+    events = [json.loads(line) for line in (cell / "events.jsonl").read_bytes().splitlines()]
+    kept = transform([(e["kind"], e["payload"]) for e in events])
+    (cell / "manifest.json").unlink()
+    (cell / "events.jsonl").unlink()
+    (cell / ".lock").unlink(missing_ok=True)
+    rw = RW(cell, Redactor(), run_id=cell.name).open()
+    for kind, payload in kept:
+        rw.append(kind, payload)
+    rw.finalize({"arm": "single"})
+
+
+def test_a_cell_that_recorded_its_own_failure_is_not_scored(tmp_path: Path) -> None:
+    """`run.error` and `manifest.post_scan_errors` are written precisely because
+    something went wrong - a modified snapshot, a scratch directory that would
+    not clean up, an error raised after the seal - and `score_cell` looked at
+    neither. A complete, clean-scanned cell whose run exited non-zero still
+    contributed quality numbers (stop review, 2026-08-30).
+    """
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    assert score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"][0]["included"]
+
+    cell = cell_dirs(cdir)[0]
+    _rewrite_ledger(cell, lambda events: [*events, ("run.error", {"kind": "snapshot_modified"})])
+    scored = score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"][0]
+    assert scored["included"] is False and scored["exclusion"] == "run_error"
+    assert scored["run_errors"] == ["snapshot_modified"]
+
+
+def test_the_manifest_must_describe_the_ledger_that_is_there(tmp_path: Path) -> None:
+    """The manifest seals `event_count` and the sha256 of the final event line,
+    and the scorer merely loaded it. Events appended behind a seal, or a
+    finalized ledger with a torn tail, were read as sound.
+    """
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    cell = cell_dirs(cdir)[0]
+
+    manifest = json.loads((cell / "manifest.json").read_text())
+    (cell / "manifest.json").write_text(
+        json.dumps({**manifest, "event_count": manifest["event_count"] + 1})
+    )
+    with pytest.raises(GateRefused, match="nobody sealed"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+    (cell / "manifest.json").write_text(json.dumps({**manifest, "last_sha256": "0" * 64}))
+    with pytest.raises(GateRefused, match="seal is not of this file"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+    (cell / "manifest.json").write_text(json.dumps({**manifest, "torn_tail_truncated": True}))
+    with pytest.raises(GateRefused, match="cut off"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+    (cell / "manifest.json").write_text(json.dumps(manifest))
+    assert score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"]
+
+
+def test_the_unsupported_claim_rate_is_pooled_as_well_as_averaged() -> None:
+    """Per-cell ratios of 0/1 and 1/9 average to 0.0556 while the per-RULING
+    rate is 1/10 = 0.1, and a cell with no rulings vanishes from the mean
+    entirely. Both are published, each named, with the counts behind them.
+    """
+    agg = aggregate(
+        [
+            _cs(downgrades_n=0, rulings_n=1, unsupported_claim_rate=0.0),
+            _cs(downgrades_n=1, rulings_n=9, unsupported_claim_rate=round(1 / 9, 4)),
+            _cs(downgrades_n=0, rulings_n=0, unsupported_claim_rate=None),
+        ]
+    )["single:w"]["unsupported_claim_rate"]
+    assert agg["micro"] == 0.1
+    assert agg["macro"] == 0.0556
+    assert (agg["downgrades"], agg["rulings"]) == (1, 10)
+    assert (agg["cells_counted"], agg["cells_included"]) == (2, 3)

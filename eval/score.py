@@ -52,7 +52,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from eris.ledger import LedgerCorrupt, LedgerView, cost_totals
-from eris.scan import build_patterns, scan_run
+from eris.scan import build_patterns, fold, scan_run
 from eris.schemas import (
     Adjudication,
     Arm,
@@ -65,6 +65,7 @@ from eris.schemas import (
     TaskCategory,
     Verdict,
     parse_ts,
+    sha256_hex,
 )
 from eris.validate import UNHANDLED_CODES
 
@@ -137,6 +138,22 @@ class Key(_Strict):
     scan: KeyScan = Field(default_factory=KeyScan)
     injection_canary: bool | None = None
     source_repo: str | None = None
+
+    @model_validator(mode="after")
+    def _finding_ids_are_unique(self) -> Key:
+        """Coverage is a SET of finding ids and `fn` is a list length, so two
+        findings sharing an id disagree by construction: the stop review
+        reproduced two fully detected findings scoring recall 0.5, with one of
+        them counted as a redundant repeat of the other."""
+        ids = [f.id for f in self.findings]
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        if dupes:
+            raise ValueError(
+                f"duplicate key finding id(s) {', '.join(dupes)}. Ids identify WHICH planted "
+                "finding was caught, so a repeated id makes two findings indistinguishable and "
+                "understates recall."
+            )
+        return self
 
     @model_validator(mode="after")
     def _control_has_nothing_to_find(self) -> Key:
@@ -223,6 +240,81 @@ def find_leaked_keys(task_dir: Path) -> list[Path]:
     )
 
 
+MAX_LEAK_SCAN_BYTES = 8 << 20
+
+
+def find_key_content_in_task(task_dir: Path, canary: str) -> list[Path]:
+    """Files inside a corpus task that contain the key's canary token.
+
+    The name-based check is not enough, and its gap is not theoretical: a
+    symlink in `files/` pointing at the key is DEREFERENCED by
+    `shutil.copytree`, so the key's plaintext lands in `snapshot/` - the
+    worker's own cwd - under whatever name the link had, and nothing called
+    `key.json` exists to find. A symlinked directory inside the task is not
+    walked by `rglob` at all (stop review, 2026-08-30).
+
+    So this asks the question directly: does the token that appears ONLY in the
+    answer key appear anywhere the worker can reach in this task? Symlinks are
+    followed, because the worker follows them; already-visited real directories
+    are skipped so a cycle cannot hang the check. Files above
+    `MAX_LEAK_SCAN_BYTES` are reported as unreadable rather than skipped
+    silently - a check that quietly gives up is worse than none.
+    """
+    task_dir = Path(task_dir)
+    if not task_dir.is_dir() or not canary:
+        return []
+    needle = fold(canary)
+    hits: list[Path] = []
+    seen: set[tuple[int, int]] = set()
+    # `Path.walk`, not `os.walk`: `eval/score.py` keeps an explicit import
+    # allowlist asserted by an AST guard, and `os` carries `system`/`popen`/
+    # `execv` - the exact things a read-only scorer must not be able to reach.
+    for dirpath, dirnames, filenames in Path(task_dir).walk(follow_symlinks=True):
+        try:
+            st = dirpath.stat()
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) in seen:
+            dirnames[:] = []
+            continue
+        seen.add((st.st_dev, st.st_ino))
+        for name in sorted(filenames):
+            f = dirpath / name
+            try:
+                if f.stat().st_size > MAX_LEAK_SCAN_BYTES:
+                    hits.append(f)  # unreadable at this size: refuse, do not assume clean
+                    continue
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if needle in fold(text):
+                hits.append(f)
+    return sorted(set(hits))
+
+
+def require_real_key_file(path: Path) -> None:
+    """The key must be a real file in the keys directory, not an alias to one.
+
+    `is_file()` and `read_bytes()` both follow symlinks, so
+    `eval/keys/t.json -> ../corpus/t/ground-truth.json` loads perfectly while
+    the actual bytes sit inside the task tree the worker reads - under a name no
+    filename check looks for (stop review, 2026-08-30). Moving the key out of
+    the corpus means moving the BYTES, not the path that names them.
+    """
+    path = Path(path)
+    # The symlink test is the whole check, and deliberately so. A "does it
+    # resolve outside the keys directory" test sounds stronger and is dead: when
+    # the file itself is not a link, `path.resolve().parent` and
+    # `path.parent.resolve()` are equal for every shape, including a symlinked
+    # keys directory. A guard that cannot fire reads like protection and is not.
+    if path.is_symlink():
+        raise GateRefused(
+            f"{path} is a symlink to {path.readlink()}. The key must be a real file: a link "
+            f"leaves the bytes wherever they were, which is what moving the key out of the "
+            f"corpus was meant to change."
+        )
+
+
 def load_key(corpus: Path, task_id: str) -> Key:
     """Load `<corpus>/../keys/<task_id>.json`, refusing a key inside the corpus.
 
@@ -239,6 +331,7 @@ def load_key(corpus: Path, task_id: str) -> Key:
             "Move it; do not score with it in place."
         )
     path = keys_dir_for(corpus) / f"{task_id}.json"
+    require_real_key_file(path)
     try:
         key = Key.model_validate_json(path.read_bytes())
     except (OSError, ValidationError) as exc:
@@ -346,6 +439,108 @@ def read_cell(run_dir: Path) -> CellData:
     )
 
 
+def require_inputs_unchanged(cell: CellData, corpus: Path) -> None:
+    """The task and key on disk must be the ones this cell was measured against.
+
+    `run.started` records `task_sha256` and `key_sha256`. The scorer REREADS
+    both files, so without this check the answer key can be edited after
+    execution: delete a planted finding the run missed and recall rises, flip
+    `scored` to false and the whole task disappears into `skipped`. Nothing in
+    the output would say the files had moved (stop review, 2026-08-30).
+
+    A ledger written before 0.4.3 carries neither hash. Those cells are reported
+    `inputs_bound: false` rather than refused - they are real runs - but the
+    absence is stated in the summary instead of reading like a pass.
+    """
+    started = cell.view.payloads("run.started")
+    rec = started[0] if started else {}
+    task_id = cell.arm_run.task_id
+    task_file = Path(corpus) / task_id / "task.json"
+    key_file = keys_dir_for(corpus) / f"{task_id}.json"
+    for label, recorded, path in (
+        ("task.json", rec.get("task_sha256"), task_file),
+        ("key", rec.get("key_sha256"), key_file),
+    ):
+        if recorded is None:
+            continue
+        current = sha256_hex(path.read_bytes()) if path.is_file() else None
+        if current != recorded:
+            raise GateRefused(
+                f"{path} changed after {cell.run_dir.name} ran: recorded {recorded[:12]}, "
+                f"now {(current or 'missing')[:12]}. The scorer rereads the {label}, so an edit "
+                f"between running and scoring silently rewrites what the run is measured "
+                f"against."
+            )
+
+
+def inputs_are_bound(cell: CellData) -> bool:
+    """Whether this cell recorded the hashes `require_inputs_unchanged` checks."""
+    started = cell.view.payloads("run.started")
+    return bool(started) and started[0].get("task_sha256") is not None
+
+
+def require_manifest_agrees(cell: CellData) -> None:
+    """The finalized manifest must describe the ledger that is actually there.
+
+    The manifest carries `event_count`, `last_sha256` (the sha256 of the last
+    event LINE) and `torn_tail_truncated`, and the scorer merely loaded it -
+    every field unchecked. A truncated finalized ledger, or one with events
+    appended behind the manifest, was read as sound (stop review, 2026-08-30).
+
+    `LedgerView` already validates the hash chain, so this is not a second
+    integrity check of the same thing: it is the check that the SEAL matches
+    what was sealed.
+    """
+    m = cell.manifest
+    if not m:
+        return
+    if m.get("torn_tail_truncated"):
+        raise GateRefused(
+            f"{cell.run_dir.name}: the manifest records a torn tail. A finalized run whose "
+            "last event was cut off is not a complete record of what happened."
+        )
+    count = m.get("event_count")
+    if isinstance(count, int) and count != len(cell.view.events):
+        raise GateRefused(
+            f"{cell.run_dir.name}: the manifest seals {count} events, the ledger holds "
+            f"{len(cell.view.events)}. Events behind a manifest are events nobody sealed."
+        )
+    last = m.get("last_sha256")
+    if isinstance(last, str) and last:
+        lines = (cell.run_dir / "events.jsonl").read_bytes().splitlines()
+        if not lines or sha256_hex(lines[-1]) != last:
+            raise GateRefused(
+                f"{cell.run_dir.name}: the manifest's last_sha256 does not match the ledger's "
+                "final event. The seal is not of this file."
+            )
+
+
+def run_health(cell: CellData) -> dict[str, Any]:
+    """Failures the cell recorded about ITSELF, which scoring ignored entirely.
+
+    `run.error` (a modified snapshot, a scratch directory that would not clean
+    up) and `manifest.post_scan_errors` are written precisely because something
+    went wrong, and a clean-scanned cell carrying one was still contributing
+    quality numbers. Counted here and turned into an exclusion by `score_cell`.
+
+    `orphan_invocations` is separate and cheap: cost totals are derived from
+    `cost` records alone, and `attempts` is their count, so an
+    `invocation.finished` whose cost record never landed reads as zero cost and
+    zero attempts rather than as unknown. The two appends are separate
+    statements, so a crash between them is possible even though every ledger in
+    this repository pairs them 1:1.
+    """
+    errors = [str(p.get("kind", "run.error")) for p in cell.view.payloads("run.error")]
+    post = cell.manifest.get("post_scan_errors") or []
+    inv = {p.get("invocation_id") for p in cell.view.payloads("invocation.finished")} - {None}
+    costed = {p.get("invocation_id") for p in cell.view.payloads("cost")} - {None}
+    return {
+        "run_errors": sorted(errors),
+        "post_scan_errors": len(post) if isinstance(post, list) else 0,
+        "orphan_invocations": len(inv - costed),
+    }
+
+
 def rescan(cell: CellData, key: Key, *, home: Path, corpus: Path) -> ScanResult:
     """Read-only re-scan with the CURRENT key; the pre-fix tree is consulted
     only when the recorded snapshot lies inside the corpus."""
@@ -431,7 +626,14 @@ def _overlap(a_start: int, a_end: int, b_start: int, b_end: int, tolerance: int)
 def _matches(pred: Predicted, kf: KeyFinding, tolerance: int) -> bool:
     if pred.path is None or pred.path != kf.path:
         return False
-    ps = pred.line_start or 1
+    if pred.line_start is None:
+        # A prediction that names no line is not a location claim, and the key
+        # match is defined as a location overlap. Defaulting the missing line to
+        # 1 silently turned "something is wrong in this file" into a hit on any
+        # finding at the top of it - mechanically reproduced by the stop review:
+        # a bare path scored precision and recall 1.0 against a line-1 key.
+        return False
+    ps = pred.line_start
     pe = pred.line_end or ps
     if not _overlap(ps, pe, kf.line_start, kf.line_end, tolerance):
         return False
@@ -558,6 +760,14 @@ class CellScore:
     run_id: str
     task_id: str
     arm: str
+    # The `single` arm expands to ONE CELL PER PANEL WORKER, and every one of
+    # them carries `arm: "single"`. Aggregated by arm alone, three separate
+    # single-model baselines became one number in which a strong lineage masks a
+    # weak one, and `single` carried three times the weight of every other arm
+    # in the support check (stop review, 2026-08-30). `arm_key` is what the
+    # aggregate groups on.
+    panel: list[str]
+    arm_key: str
     repeat_index: int
     category: str
     included: bool
@@ -577,6 +787,16 @@ class CellScore:
     # wrong ACCEPT and is therefore a different question
     fp_severities: list[str]
     unsupported_claim_rate: float | None
+    # the counts behind that rate. Without them the aggregate could only average
+    # per-cell ratios, which answers a different question than "of every ruling,
+    # how many were downgraded" and drops cells with no rulings entirely
+    downgrades_n: int
+    rulings_n: int
+    # failures the cell recorded about itself, and invocations whose cost record
+    # never landed (which would otherwise read as zero cost, zero attempts)
+    run_errors: list[str]
+    post_scan_errors: int
+    orphan_invocations: int
     downgrades: int
     confident_wrong: bool
     abstained: bool
@@ -727,6 +947,17 @@ def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
     return sum(counts.values()), dict(sorted(counts.items()))
 
 
+def arm_key(arm: str, panel: Sequence[str]) -> str:
+    """How an arm is named in the aggregate.
+
+    `single` is not one arm: it is one cell per panel worker, each a different
+    model lineage answering alone, and pooling them answers no question anyone
+    asked. Reported as `single:<worker>` so the three baselines stay three.
+    Every other arm names its whole panel by design and keeps its plain name.
+    """
+    return f"{arm}:{panel[0]}" if arm == Arm.SINGLE.value and len(panel) == 1 else arm
+
+
 def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellScore:
     ar = cell.arm_run
     # the key must be the key OF THIS LEDGER: a gated task can never be scored
@@ -771,8 +1002,18 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         bool(recorded_scan and recorded_scan.scan_incomplete) or rescanned.scan_incomplete
     )
     validator_errors, validator_codes = _validator_errors(cell)
+    health = run_health(cell)
     exclusion: str | None = None
-    if recorded_scan is None:
+    if health["run_errors"] or health["post_scan_errors"]:
+        # The cell recorded a failure about ITSELF - a modified snapshot, a
+        # scratch dir that would not clean up, an error raised after the seal -
+        # and scoring looked at none of them, so a clean-scanned cell with a
+        # `snapshot_modified` error still contributed quality numbers even
+        # though its run exited non-zero (stop review, 2026-08-30). Excluding is
+        # safe to do late: the support check blocks any comparison whose arms
+        # lost different cells.
+        exclusion = "run_error"
+    elif recorded_scan is None:
         exclusion = "no_scan"  # plumbing only: never a quality metric
     elif contaminated or rescanned.contaminated or scan_incomplete:
         exclusion = "contaminated"
@@ -828,6 +1069,8 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         run_id=cell.run_dir.name,
         task_id=ar.task_id,
         arm=ar.arm.value,
+        panel=list(ar.panel),
+        arm_key=arm_key(ar.arm.value, ar.panel),
         repeat_index=ar.repeat_index,
         category=ar.category.value,
         included=exclusion is None,
@@ -844,6 +1087,11 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         fp_severities=list(matching.fp_severities),
         distractor_hits=matching.distractor_hits,
         unsupported_claim_rate=rate,
+        run_errors=list(health["run_errors"]),
+        post_scan_errors=int(health["post_scan_errors"]),
+        orphan_invocations=int(health["orphan_invocations"]),
+        downgrades_n=enforced.downgrades if enforced is not None else 0,
+        rulings_n=len(enforced.rulings) if enforced is not None else 0,
         downgrades=enforced.downgrades if enforced else 0,
         confident_wrong=confident_wrong,
         abstained=verdict is Verdict.ABSTAIN,
@@ -989,8 +1237,9 @@ def _by_category(inc: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
 
 def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
-    for arm in sorted({s.arm for s in scores}):
-        cells = [s for s in scores if s.arm == arm]
+    # grouped on `arm_key`, so the three `single` lineages stay three
+    for arm in sorted({s.arm_key for s in scores}):
+        cells = [s for s in scores if s.arm_key == arm]
         inc = [s for s in cells if s.included]
         out[arm] = {
             "cells": len(cells),
@@ -1003,6 +1252,7 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                     "incomplete",
                     "ledger_invalid",
                     "no_scan",
+                    "run_error",
                     "validator_errors",
                     "validator_unknown",
                 )
@@ -1037,7 +1287,21 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             # precision without having chosen which one.
             "precision": _rates(inc, "precision"),
             "recall": _rates(inc, "recall"),
-            "unsupported_claim_rate": _mean([s.unsupported_claim_rate for s in inc]),
+            # pooled AND per-cell, like precision and recall: the per-cell mean
+            # of 0/1 and 1/9 is 0.0556 while the per-RULING rate is 1/10 = 0.1,
+            # and cells with no rulings silently vanish from the mean
+            "unsupported_claim_rate": {
+                "micro": (
+                    round(sum(s.downgrades_n for s in inc) / sum(s.rulings_n for s in inc), 4)
+                    if sum(s.rulings_n for s in inc)
+                    else None
+                ),
+                "macro": _mean([s.unsupported_claim_rate for s in inc]),
+                "downgrades": sum(s.downgrades_n for s in inc),
+                "rulings": sum(s.rulings_n for s in inc),
+                "cells_counted": len([s for s in inc if s.unsupported_claim_rate is not None]),
+                "cells_included": len(inc),
+            },
             "confident_wrong_rate": _mean([float(s.confident_wrong) for s in inc]),
             "distractor_hits": sum(s.distractor_hits for s in inc),
             # Predictions that repeated a key finding another prediction was
@@ -1078,12 +1342,27 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
         (s.task_id, s.repeat_index, s.arm): s for s in scores
     }
     out: list[dict[str, Any]] = []
+    # every (task, repeat) either arm reached, so a pair whose members are not
+    # both present is reported as unpaired instead of never being iterated. A
+    # missing treatment used to `continue` and a treatment without a base was
+    # never looked at, so pair coverage could read complete while half the cells
+    # were absent (stop review, 2026-08-30).
+    coords = sorted({(s.task_id, s.repeat_index) for s in scores})
     for label, treat, base in PAIRS:
-        for (task_id, repeat, arm), s_base in sorted(by.items()):
-            if arm != base.value:
-                continue
+        for task_id, repeat in coords:
+            s_base = by.get((task_id, repeat, base.value))
             s_treat = by.get((task_id, repeat, treat.value))
-            if s_treat is None:
+            if s_base is None or s_treat is None:
+                missing = [a.value for a, s in ((base, s_base), (treat, s_treat)) if s is None]
+                out.append(
+                    {
+                        "pair": label,
+                        "task_id": task_id,
+                        "repeat_index": repeat,
+                        "paired": False,
+                        "reason": f"no scored cell for arm(s): {', '.join(missing)}",
+                    }
+                )
                 continue
             entry: dict[str, Any] = {"pair": label, "task_id": task_id, "repeat_index": repeat}
             differing = sorted(
@@ -1197,7 +1476,9 @@ M1_PRE_REGISTRATION = (
 )
 
 
-def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
+def _comparison_block(
+    scores: Sequence[CellScore], matrix: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Whether the per-arm quality means may be compared at all.
 
     Blocked when any arm dropped cells for `validator_errors`/`validator_unknown`:
@@ -1206,8 +1487,8 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
     a reader cannot quote `per_arm[*].recall` without seeing it.
     """
     per_arm: dict[str, dict[str, Any]] = {}
-    for arm in sorted({s.arm for s in scores}):
-        cells = [s for s in scores if s.arm == arm]
+    for arm in sorted({s.arm_key for s in scores}):
+        cells = [s for s in scores if s.arm_key == arm]
         dropped = len(
             [s for s in cells if s.exclusion in ("validator_errors", "validator_unknown")]
         )
@@ -1216,10 +1497,10 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
             "dropped_for_validator": dropped,
             "malformed_rate": round(dropped / len(cells), 4) if cells else None,
         }
-    coarse = sorted({s.arm for s in scores if s.validator_basis == "coarse_codes"})
+    coarse = sorted({s.arm_key for s in scores if s.validator_basis == "coarse_codes"})
     for arm, v in per_arm.items():
         v["coarsely_scored_cells"] = len(
-            [s for s in scores if s.arm == arm and s.validator_basis == "coarse_codes"]
+            [s for s in scores if s.arm_key == arm and s.validator_basis == "coarse_codes"]
         )
     # Every arm's INCLUDED support, as the set of (task, repeat) it actually
     # scored. Arms are excluded cell by cell - contamination, budget, missing,
@@ -1229,7 +1510,7 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
     # contamination reads better for having lost them (panel, 2026-08-30:
     # a worker can even provoke its own exclusion by emitting a scan marker).
     support = {
-        arm: {(s.task_id, s.repeat_index) for s in scores if s.arm == arm and s.included}
+        arm: {(s.task_id, s.repeat_index) for s in scores if s.arm_key == arm and s.included}
         for arm in per_arm
     }
     common = set.intersection(*support.values()) if support else set()
@@ -1242,6 +1523,13 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
 
     offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
     reasons: list[str] = []
+    missing = (matrix or {}).get("missing")
+    if missing:
+        reasons.append(
+            f"{len(missing)} declared cell(s) never produced a scored result "
+            f"({', '.join(missing[:8])}{', ...' if len(missing) > 8 else ''}), so the arms were "
+            "not measured on the matrix the campaign declared"
+        )
     if len(support) > 1 and unequal:
         reasons.append(
             "arms " + ", ".join(unequal) + " scored a different set of (task, repeat) cells "
@@ -1274,10 +1562,75 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
     }
 
 
+def declared_cells(campaign_dir: Path) -> list[dict[str, Any]] | None:
+    """The cell matrix the campaign said it would run, from `campaign.started`.
+
+    None when the campaign has no readable ledger of its own - an older campaign
+    dir, or one assembled by hand.
+    """
+    try:
+        view = LedgerView.from_path(Path(campaign_dir) / "events.jsonl")
+    except (LedgerCorrupt, OSError):
+        return None
+    payloads = view.payloads("campaign.started")
+    if not payloads:
+        return None
+    cells = payloads[-1].get("cells")
+    return cells if isinstance(cells, list) else None
+
+
+def _matrix_block(campaign_dir: Path, scores: Sequence[CellScore]) -> dict[str, Any]:
+    """What the campaign declared against what was actually scored.
+
+    Cells were discovered by listing finalized directories and never compared
+    with the matrix the campaign recorded. A cell that never finished simply
+    vanished, an extra directory was scored as if it belonged, and two
+    directories for the same `(task, repeat, arm)` were both aggregated - so an
+    arm could be missing entirely and the summary would read as complete (stop
+    review, 2026-08-30).
+
+    Missing cells are NOT an error: a budget-tripped cell is pre-registered as
+    MISSING, which is a legitimate outcome. They are reported, and they block
+    the comparison. Extra and duplicate coordinates ARE refused: neither is a
+    thing a campaign can legitimately produce.
+    """
+    declared = declared_cells(campaign_dir)
+    # Keyed on run_id, which is unique per declared cell. `(task, repeat, arm)`
+    # is NOT: the `single` arm expands to one cell per panel worker and all of
+    # them carry `arm: "single"`, so three lineages collapse into one coordinate
+    # and losing two of them would look like losing none.
+    counts: dict[str, int] = {}
+    for s in scores:
+        counts[s.run_id] = counts.get(s.run_id, 0) + 1
+    dupes = sorted(r for r, n in counts.items() if n > 1)
+    if dupes:
+        raise GateRefused(
+            f"the campaign has more than one scored cell for {', '.join(dupes)}. Duplicate "
+            "coordinates are all aggregated, so one of them silently double-weights an arm."
+        )
+    if declared is None:
+        return {"declared": None, "scored": len(scores), "missing": None, "unexpected": None}
+    want = {c["run_id"] for c in declared if isinstance(c, dict) and c.get("run_id")}
+    have = set(counts)
+    unexpected = sorted(have - want)
+    if unexpected:
+        raise GateRefused(
+            f"the campaign scored cells it never declared: {', '.join(unexpected)}. A cell "
+            "directory that is not in `campaign.started` did not come from this matrix."
+        )
+    return {
+        "declared": len(want),
+        "scored": len(have),
+        "missing": sorted(want - have),
+        "unexpected": [],
+    }
+
+
 def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str, Any]:
     scores: list[CellScore] = []
     invalid: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
+    unbound: list[dict[str, str]] = []
     for run_dir in cell_dirs(campaign_dir):
         try:
             cell = read_cell(run_dir)
@@ -1285,6 +1638,14 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             invalid.append({"run_id": run_dir.name, "error": str(exc)[:200]})
             continue
         task_id = cell.arm_run.task_id
+        # BEFORE the `scored` check, not after: flipping `"scored": false` after
+        # a run is one of the edits this guards against, and checking it second
+        # would let that particular edit skip the guard by removing the task
+        # from scoring altogether.
+        require_manifest_agrees(cell)
+        require_inputs_unchanged(cell, corpus)
+        if not inputs_are_bound(cell):
+            unbound.append({"run_id": run_dir.name, "task_id": task_id})
         if not task_is_scored(corpus, task_id):
             skipped.append(
                 {
@@ -1296,12 +1657,17 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             continue
         key = load_key(corpus, task_id)
         scores.append(score_cell(cell, key, home=home, corpus=corpus))
+    matrix = _matrix_block(campaign_dir, scores)
     return {
         "campaign_dir": str(campaign_dir),
         "cells": [asdict(s) for s in scores],
         "ledger_invalid": invalid,
         "skipped": skipped,
+        # cells from a ledger written before task/key hashes were recorded: their
+        # inputs cannot be shown to be the ones they ran against
+        "inputs_unbound": unbound,
         "per_arm": aggregate(scores),
+        "matrix": matrix,
         "paired": paired_deltas(scores),
         # M1 (panel): excluding malformed cells creates a NEW bias - only arm 4
         # passes critiques to the validator, so only it can emit
@@ -1310,7 +1676,7 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         # per-arm means are then computed over different populations and are not
         # comparable. Saying so in prose is advice; this says it in the output,
         # the way the E1 gate does.
-        "comparison": _comparison_block(scores),
+        "comparison": _comparison_block(scores, matrix),
         "validator": {
             "malformed_cells": len([s for s in scores if s.validator_errors]),
             "unknown_cells": len([s for s in scores if s.validator_errors is None]),

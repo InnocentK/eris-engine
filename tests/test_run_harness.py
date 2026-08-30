@@ -1784,3 +1784,33 @@ def test_a_leaked_key_stops_the_run_before_any_worker_spawns(tmp_path: Path) -> 
         load_task(w["task"])
     planted.unlink()
     assert load_task(w["task"])[0].task_id == "t_01"
+
+
+def test_key_content_anywhere_in_the_task_stops_the_run(tmp_path: Path) -> None:
+    """A filename check cannot see a key that arrived under another name.
+
+    `shutil.copytree` dereferences symlinks, so a link in `files/` pointing at
+    the key lands in `snapshot/` as plaintext under the link's name; and
+    `Path.rglob` does not walk symlinked directories, so a directory link to the
+    keys folder is invisible to a name walk entirely. The question is asked
+    directly instead: does the token that exists ONLY in the answer key appear
+    anywhere inside this task (stop review, 2026-08-30)?
+    """
+    w = world(tmp_path)
+    assert load_task(w["task"])[0].task_id == "t_01"
+
+    # the key's plaintext, in the worker's own cwd, under an innocuous name
+    planted = w["corpus"] / "t_01" / "snapshot" / "notes.txt"
+    planted.write_text(f"reference: {KEY_CANARY}\n")
+    with pytest.raises(LaunchRefused, match="canary appears inside the corpus task"):
+        load_task(w["task"])
+    planted.unlink()
+
+    # a directory symlink exposing the whole keys folder
+    peek = w["corpus"] / "t_01" / "peek"
+    peek.symlink_to(key_path_for(w["corpus"] / "t_01").parent, target_is_directory=True)
+    with pytest.raises(LaunchRefused, match="canary appears inside the corpus task"):
+        load_task(w["task"])
+    peek.unlink()
+
+    assert load_task(w["task"])[0].task_id == "t_01"

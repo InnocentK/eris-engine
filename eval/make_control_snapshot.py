@@ -16,6 +16,7 @@ copy and only ``git`` is spawned, with the identity supplied per-invocation
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -49,11 +50,36 @@ def git_commands(git: str, message: str) -> list[list[str]]:
     ]
 
 
+def find_symlinks(root: Path) -> list[Path]:
+    """Every symlink in a tree, at any depth."""
+    root = Path(root)
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        out.extend(
+            base / n for n in sorted(dirnames) + sorted(filenames) if (base / n).is_symlink()
+        )
+    return sorted(out)
+
+
 def copy_working_tree(task_dir: Path) -> Path:
     """Replace ``<task>/snapshot/`` with a fresh copy of ``<task>/files/``."""
     files = task_dir / "files"
     if not files.is_dir():
         raise FileNotFoundError(f"{files} does not exist")
+    # `shutil.copytree` DEREFERENCES symlinks by default, so a link in `files/`
+    # pointing at the answer key is materialised as the key's PLAINTEXT inside
+    # `snapshot/` - the worker's own cwd - under whatever name the link had. A
+    # check that looks for files called `key.json` sees nothing. A corpus task
+    # is a plain tree of source files and has no need of symlinks, so they are
+    # refused outright rather than resolved carefully (stop review, 2026-08-30).
+    links = find_symlinks(files)
+    if links:
+        raise ValueError(
+            f"{files} contains symlink(s): {', '.join(str(p) for p in links)}. They are copied "
+            f"by dereference, so a link pointing outside the tree would place that file's "
+            f"content into the snapshot the worker reads. Replace them with real files."
+        )
     snapshot = task_dir / "snapshot"
     if snapshot.exists():
         shutil.rmtree(snapshot)

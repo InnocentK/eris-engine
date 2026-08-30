@@ -132,7 +132,10 @@ def test_a_stale_snapshot_stops_a_run_before_any_worker_is_spawned(tmp_path: Pat
     assert load_task(task / "task.json")[1] == (task / "snapshot").resolve()
 
     (task / "files" / "calc.py").write_text("def add(a, b):\n    return a + b  # drifted\n")
-    with pytest.raises(LaunchRefused, match="stale"):
+    # not `match="stale"`: `tmp_path` is named after the test, so that pattern
+    # is satisfied by the temp directory in the message and would hold even
+    # with the refusal removed
+    with pytest.raises(LaunchRefused, match="does not match the committed"):
         load_task(task / "task.json")
 
 
@@ -184,3 +187,30 @@ def test_the_shipped_corpus_snapshots_are_current() -> None:
         )
     if all(res is None for res in results.values()):
         pytest.skip("no snapshots built in this checkout (gitignored); nothing was verified")
+
+
+def test_a_symlink_in_the_files_tree_is_refused(tmp_path: Path) -> None:
+    """`shutil.copytree` DEREFERENCES symlinks by default, so a link in `files/`
+    pointing at the answer key is materialised as the key's PLAINTEXT inside
+    `snapshot/` - the worker's own cwd - under whatever name the link had, where
+    nothing called `key.json` exists to find (stop review, 2026-08-30).
+
+    A corpus task is a plain tree of source files and has no need of symlinks,
+    so they are refused outright rather than resolved carefully.
+    """
+    task = _task_dir(tmp_path)
+    build_snapshot(task, runner=lambda argv, cwd: None)  # clean tree builds
+
+    secret = tmp_path / "keys" / "t_01.json"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text('{"canary": "ERIS-KEY-CANARY-t01-9f3ab27c"}')
+    (task / "files" / "notes.txt").symlink_to(secret)
+    with pytest.raises(ValueError, match="contains symlink"):
+        build_snapshot(task, runner=lambda argv, cwd: None)
+
+    # nested, not only at the top level
+    (task / "files" / "notes.txt").unlink()
+    (task / "files" / "pkg").mkdir()
+    (task / "files" / "pkg" / "x.py").symlink_to(secret)
+    with pytest.raises(ValueError, match="contains symlink"):
+        build_snapshot(task, runner=lambda argv, cwd: None)

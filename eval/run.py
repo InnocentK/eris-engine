@@ -118,7 +118,12 @@ from eris.writer import (
     WriterLocked,
 )
 from eval.make_control_snapshot import snapshot_matches_files
-from eval.score import CANARY_PREFIX, find_leaked_keys, key_path_for
+from eval.score import (
+    CANARY_PREFIX,
+    find_key_content_in_task,
+    find_leaked_keys,
+    key_path_for,
+)
 
 DEFAULT_POLICY = "policies/default.yaml"
 DEFAULT_PROMPTS = "eval/prompts"
@@ -712,6 +717,31 @@ def load_task(task_file: Path) -> tuple[TaskSpec, Path]:
             f"by task_id when scoring, so a mismatch scans against one key and grades "
             f"against another."
         )
+    key_file = key_path_for(task_dir)
+    if key_file.is_file():
+        # The key's own token, asked about directly: does the string that exists
+        # ONLY in the answer key appear anywhere inside this task? A name check
+        # cannot see a key that arrived under another name - which is exactly
+        # what `shutil.copytree` produces from a symlink in `files/`.
+        try:
+            body = json.loads(key_file.read_bytes())
+            canaries = [
+                s
+                for s in (body.get("scan", {}) or {}).get("extra_strings", [])
+                if isinstance(s, str) and s.startswith(CANARY_PREFIX)
+            ]
+        except (OSError, ValueError):
+            canaries = []
+        for canary in canaries:
+            inside = find_key_content_in_task(task_dir, canary)
+            if inside:
+                raise LaunchRefused(
+                    f"the answer key's canary appears inside the corpus task, in "
+                    f"{', '.join(str(p) for p in inside)} - readable by the worker being "
+                    f"graded, whose cwd is {task_dir.name}/snapshot. A symlink in files/ is "
+                    f"copied by DEREFERENCE, so it lands as the key's plaintext under the "
+                    f"link's name. Remove it; do not run with the key inside the task."
+                )
     leaked = find_leaked_keys(task_dir)
     if leaked:
         # BEFORE spawn, not at scoring time. The scorer's refusal fires after the
@@ -1024,6 +1054,20 @@ def run_cell(
                 "policy_sha256": h.loaded.sha256,
                 "pins_sha256": h.loaded.pins_sha256,
                 "task_file": str(task_file),
+                # What this cell was actually measured against. `run.started`
+                # already binds the policy, the pins and the snapshot tree; the
+                # question and the answer key were the two inputs it did not
+                # bind. Without them the key can be edited AFTER execution -
+                # delete a finding the run missed and recall rises, flip
+                # `scored` to false and the task vanishes into `skipped` - and
+                # the scorer, which rereads both files, cannot tell (stop
+                # review, 2026-08-30).
+                "task_sha256": sha256_hex(Path(task_file).read_bytes()),
+                "key_sha256": (
+                    sha256_hex(key_path_for(Path(task_file).resolve().parent).read_bytes())
+                    if key_path_for(Path(task_file).resolve().parent).is_file()
+                    else None
+                ),
                 "task_id": spec.task.task_id,
                 "category": spec.task.category.value,
                 "arm": spec.arm.value,
