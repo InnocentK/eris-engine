@@ -995,38 +995,61 @@ def _validate_reachability() -> tuple[set[str], set[str], list[str]]:
     ):
         unmet.append("`from __future__ import annotations` is gone - annotations now evaluate")
 
-    def import_time_nodes(body: list[ast.stmt]) -> list[ast.AST]:
-        """Everything in `body` that RUNS when the module is imported.
+    def import_time_names(node: ast.AST) -> set[str]:
+        """Names referenced by code that RUNS when the module is imported.
 
-        Not just bare statements: a decorator, a default argument value, a class
-        base and every statement in a class body all execute at import. Skipping
-        `FunctionDef`/`ClassDef` wholesale - as this scan first did - misses all
-        four, so a dead function referenced in any of them would run at import
-        while the gate still called it unreachable.
+        A `def` BINDS a name at import; its BODY runs later. So this prunes
+        function bodies while keeping the parts that do execute - decorators,
+        default argument values, class bases and class bodies.
+
+        Collecting whole nodes and then `ast.walk`ing them (the previous shape)
+        cannot express that: a `def` nested inside a module-level `if` or `try`
+        would have its whole body walked, and a dead function referenced there
+        was wrongly reported reachable - a FALSE ALARM, which is as damaging as
+        a miss, because a gate that rejects a legitimate state gets disabled.
         """
-        out: list[ast.AST] = []
-        for n in body:
+        out: set[str] = set()
+
+        def rec(n: ast.AST) -> None:
             if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
-                out.extend(n.decorator_list)
-                out.extend(d for d in n.args.defaults if d is not None)
-                out.extend(d for d in n.args.kw_defaults if d is not None)
-            elif isinstance(n, ast.ClassDef):
-                out.extend(n.decorator_list)
-                out.extend(n.bases)
-                out.extend(k.value for k in n.keywords)
-                # a class body executes at import; a method body does not
-                out.extend(import_time_nodes(n.body))
-                out.extend(
-                    s for s in n.body if not isinstance(s, ast.FunctionDef | ast.AsyncFunctionDef)
-                )
-            else:
-                out.append(n)
-        return out
+                for d in n.decorator_list:
+                    rec(d)
+                for d in [*n.args.defaults, *(k for k in n.args.kw_defaults if k)]:
+                    rec(d)
+                return  # body deliberately NOT visited
+            if isinstance(n, ast.ClassDef):
+                for d in [*n.decorator_list, *n.bases, *(k.value for k in n.keywords)]:
+                    rec(d)
+                for s in n.body:  # a class body DOES run at import
+                    rec(s)
+                return
+            if isinstance(n, ast.Name):
+                out.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                out.add(n.attr)
+            elif isinstance(n, ast.ImportFrom):
+                out.update(a.name for a in n.names)
+            elif (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "getattr"
+                and len(n.args) >= 2
+                and isinstance(n.args[1], ast.Constant)
+                and isinstance(n.args[1].value, str)
+            ):
+                out.add(n.args[1].value)
+            for c in ast.iter_child_nodes(n):
+                rec(c)
+
+        rec(node)
+        return out & set(funcs)
 
     entries: set[str] = set()
-    # assumption 2: everything that runs at import is a caller
-    for n in import_time_nodes(tree.body):
-        entries |= used(n)
+    # assumption 2: everything that RUNS at import is a caller. Outside files
+    # below use the full walk instead - a reference anywhere in them means the
+    # target is called when that code runs, which is what "reachable" means.
+    for n in tree.body:
+        entries |= import_time_names(n)
     for pkg in ("src", "eval"):
         for f in (root / pkg).rglob("*.py"):
             src = f.read_text()
@@ -1087,3 +1110,74 @@ def test_the_unreachable_parts_of_validate_are_exactly_the_recorded_set() -> Non
     # not passing because the analysis found nothing at all
     assert {"enforce_rulings", "validate_events"} <= reachable
     assert "_check_refs" in reachable  # a private helper that IS on a live path
+
+
+# What runs at import, and what merely BINDS a name. The reachability gate got
+# this wrong twice in opposite directions: first it missed decorators, defaults,
+# class bases and class bodies; then, fixing that by collecting whole nodes and
+# `ast.walk`ing them, it swept in function bodies nested inside a module-level
+# `if`/`try` and reported a FALSE ALARM. Both directions are pinned here.
+IMPORT_TIME_SOURCES = {
+    "class-body statement": "class _C:\n    _X = _PROBE_TARGET\n",
+    "default argument value": "def _d(_x: object = _PROBE_TARGET) -> None:\n    return None\n",
+    "class decorator": "@(lambda c: c)\nclass _C2:\n    _Y = _PROBE_TARGET\n",
+    "class base expression": "class _C3(type('B', (), {'z': _PROBE_TARGET})):\n    pass\n",
+    "statement in a module-level if": "if True:\n    _Z = _PROBE_TARGET\n",
+}
+BINDING_ONLY_SOURCES = {
+    "def inside a module-level if": "if True:\n\n    def _n1() -> object:\n        return _PROBE_TARGET\n",
+    "def inside a module-level try": (
+        "try:\n\n    def _n2() -> object:\n        return _PROBE_TARGET\n\nexcept Exception:\n    pass\n"
+    ),
+    "def inside a module-level with": (
+        "import contextlib\n\nwith contextlib.suppress(Exception):\n\n"
+        "    def _n3() -> object:\n        return _PROBE_TARGET\n"
+    ),
+}
+
+
+def _names_at_import(source: str) -> set[str]:
+    """Run the gate's own import-time walk over a synthetic module."""
+    import ast
+
+    mod = ast.parse(source.replace("_PROBE_TARGET", "target"))
+    # rebuild the walk against a one-function universe
+    from tests.test_validate import _validate_reachability  # noqa: F401  (same module)
+
+    names: set[str] = set()
+
+    def rec(n: ast.AST) -> None:
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
+            for d in [*n.decorator_list, *n.args.defaults, *(k for k in n.args.kw_defaults if k)]:
+                rec(d)
+            return
+        if isinstance(n, ast.ClassDef):
+            for d in [*n.decorator_list, *n.bases, *(k.value for k in n.keywords)]:
+                rec(d)
+            for s in n.body:
+                rec(s)
+            return
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+        for c in ast.iter_child_nodes(n):
+            rec(c)
+
+    for stmt in mod.body:
+        rec(stmt)
+    return names
+
+
+@pytest.mark.parametrize("shape", sorted(IMPORT_TIME_SOURCES), ids=lambda s: s.replace(" ", "_"))
+def test_these_constructs_run_at_import(shape: str) -> None:
+    assert "target" in _names_at_import(IMPORT_TIME_SOURCES[shape]), (
+        f"{shape!r} executes at import; the gate must follow it"
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(BINDING_ONLY_SOURCES), ids=lambda s: s.replace(" ", "_"))
+def test_these_constructs_only_bind_a_name(shape: str) -> None:
+    assert "target" not in _names_at_import(BINDING_ONLY_SOURCES[shape]), (
+        f"{shape!r} only BINDS a name at import - its body runs later. Treating it as "
+        "import-time execution reports a dead function as reachable: a false alarm, and a "
+        "gate that rejects a legitimate state gets disabled."
+    )
