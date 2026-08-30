@@ -70,8 +70,13 @@ ESCALATE_AT = 3
 # on a claim nobody made, one claim ruled twice, a contest with no dissent
 # recorded, an ACCEPT with no residual risks - and NOTHING happens. `eval/score.py`
 # treats a cell whose final adjudication carries one of these as not-evidence.
-# Giving them verdict powers instead is a protocol change and belongs to the
-# user (H3 was decided that way).
+# DECIDED 2026-08-30 (user): they keep NO verdict powers. Giving them any is a
+# protocol change of the same kind as H3, and `DISSENT_EMPTY_WITH_CONTEST` would
+# fire on nearly every arm-4 cell today because `_contest_exists` counts any
+# non-REFUTED challenge and nothing ever refutes one. Reasons and the concrete
+# triggers for revisiting are in
+# `docs/decisions/2026-08-30-deferred-validator-decisions.md` - read it before
+# proposing a change here.
 UNHANDLED_CODES: frozenset[str] = frozenset(
     {
         "CLAIM_MISSING",
@@ -410,7 +415,16 @@ def validate_adjudication(
 
 
 def validate_critique(critique: Critique) -> list[Finding]:
-    """Unevidenced challenges are retained and flagged; VERIFIED without refs is an error."""
+    """Unevidenced challenges are retained and flagged; VERIFIED without refs is an error.
+
+    DELIBERATELY NOT INVOKED (decided 2026-08-30). `ChallengeStatus` is written
+    in one place only and always as UNVERIFIED, so calling this today would emit
+    `UNVERIFIED_CHALLENGE` for every challenge ever created, permanently, and
+    the `VERIFIED`-without-refs branch below is unreachable. That is the M2 hole
+    (`VerificationResult` has no producer), not a wiring gap: invoke this in the
+    SAME change that builds challenge verification.
+    See `docs/decisions/2026-08-30-deferred-validator-decisions.md`.
+    """
     findings: list[Finding] = list(validate_origin(critique))
     for ch in critique.challenges:
         findings.extend(validate_origin(ch))
@@ -490,7 +504,14 @@ def _record_id(record: Record) -> str | None:
 
 
 def validate_origin(record: Record) -> list[Finding]:
-    """ORIGIN_MISMATCH when a record's origin contradicts what it is."""
+    """ORIGIN_MISMATCH when a record's origin contradicts what it is.
+
+    DELIBERATELY NOT INVOKED (decided 2026-08-30). Wire models use
+    `extra="forbid"` and have no `origin` field, so a model cannot set one -
+    Eris does, in its own constructors. This guards Eris against itself, which
+    is a unit-test concern. Invoke it if a wire model ever gains `origin`.
+    See `docs/decisions/2026-08-30-deferred-validator-decisions.md`.
+    """
     if isinstance(record, EvidenceItem):
         allowed = EVIDENCE_ORIGIN_RULES[record.kind]
         what = f"evidence kind {record.kind.value}"

@@ -150,6 +150,7 @@ or a real `git`.
 | E13 | Which file under `HOME` agy actually needs for auth (A8: relocated HOME → auth error, so HOME-rooted) | Bisect a relocated HOME containing only `~/.gemini/antigravity-cli/` vs only `~/.gemini/oauth_creds.json`. | UNKNOWN |
 | E14 | Per-worker read confinement on the host: codex restricted-read permission profile path set; claude `--settings` read-deny rules | Candidate per-worker mitigations, unverified; grok's documented strict sandbox already FAILED (E1b). | UNKNOWN |
 | E15 | agy `--sandbox` mechanism and the effect of `AGY_CLI_DISABLE_AUTO_UPDATE` | Seatbelt profile strings are embedded in the binary (shell commands only, per those strings); the env name comes from the binary's strings — effect ASSUMPTION. Verify with a pinned binary and a watch on the auto-updater process. | ASSUMPTION |
+| M1-1 | Is `DISSENT_EMPTY_WITH_CONTEST` gutting arm 4? | After the FIRST scored campaign read `summary.per_arm[*].validator.codes`. `_contest_exists` counts ANY non-`REFUTED` challenge and nothing ever refutes one, so every arm-4 cell with a challenge and empty dissent is excluded from quality metrics. If that share is large, the question is whether `_contest_exists` is too broad - NOT whether the finding should force ESCALATE (decided 2026-08-30: it should not). See `docs/decisions/2026-08-30-deferred-validator-decisions.md` | OPEN, checkable only from a scored run |
 
 ## Corpus (Milestone 2)
 `eval/corpus/plumbing-control/` is the first entry and is a **plumbing
