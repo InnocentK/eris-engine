@@ -21,8 +21,8 @@
     {
       "id": "r2",
       "path": "ROLLOUT.md",
-      "line_start": 32,
-      "line_end": 36,
+      "line_start": 56,
+      "line_end": 60,
       "severity": "medium",
       "must_mention": [
         "lint",
@@ -33,13 +33,13 @@
   "distractors": [
     {
       "path": "ROLLOUT.md",
-      "line_start": 40,
-      "line_end": 42
+      "line_start": 64,
+      "line_end": 66
     },
     {
       "path": "ROLLOUT.md",
-      "line_start": 43,
-      "line_end": 45
+      "line_start": 67,
+      "line_end": 69
     }
   ],
   "scan": {

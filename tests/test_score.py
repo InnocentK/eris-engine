@@ -2687,3 +2687,62 @@ def test_a_key_that_bounds_the_span_bounds_it_coherently() -> None:
                 f"{path} forbids nothing - a whole-document claim still covers every finding"
             )
     assert checked, "no key sets max_prediction_span - this test would check nothing"
+
+
+def test_no_shipped_key_can_be_swept_by_one_prediction() -> None:
+    """Every scored key must resist the sweep, however its author chose to do it.
+
+    Removing the "every plan key must set `max_prediction_span`" mandate was
+    right - it forbade a code key from bounding a sweep it had reason to bound -
+    but it left the direction that mattered unguarded: a key that NEEDS a bound
+    could ship without one and nothing would notice (stop review, 2026-08-30).
+
+    So this asserts the PROPERTY, not the mechanism. For each key it builds the
+    worst prediction available to a model that wants credit without doing the
+    work - the widest window the key permits, slid over the document, whose text
+    contains every `must_mention` token of every finding in that file - and
+    requires that it identify at most one. An author can satisfy that with a span bound, by
+    spacing findings, by choosing tokens a single sentence would not plausibly
+    carry, or any other way. What is forbidden is shipping a key where one vague
+    claim covers the corpus.
+    """
+    corpus = Path(__file__).resolve().parent.parent / "eval" / "corpus"
+    checked = 0
+    for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
+        spec = json.loads((task_dir / "task.json").read_text())
+        if spec.get("scored", True) is False:
+            continue
+        key = load_key(corpus, task_dir.name)
+        for path in sorted({f.path for f in key.findings}):
+            here = [f for f in key.findings if f.path == path]
+            if len(here) < 2:
+                continue  # one finding cannot be over-covered
+            checked += 1
+            doc_lines = len((task_dir / "files" / path).read_text().splitlines())
+            every_token = " ".join(tok for f in here for tok in f.must_mention)
+            # The widest window the KEY permits, slid over the whole document -
+            # not merely a full-document claim. A bound of 46 over a 47-line
+            # file rejects the full sweep and admits every near-sweep, so
+            # probing only the full span reported that key as safe.
+            width = min(key.max_prediction_span or doc_lines, doc_lines)
+            covered = max(
+                match_findings(
+                    [
+                        Predicted(
+                            path,
+                            start,
+                            min(start + width - 1, doc_lines),
+                            Severity.LOW,
+                            every_token,
+                        )
+                    ],
+                    key,
+                ).covered
+                for start in range(1, doc_lines + 1)
+            )
+            assert covered <= 1, (
+                f"{task_dir.name}: one claim {width} lines wide over {path}, naming every "
+                f"token, is credited with {covered} of {len(here)} findings. Bound the span, "
+                "space the findings, or choose tokens one sentence would not carry."
+            )
+    assert checked, "no key has two findings in one file - this test would check nothing"

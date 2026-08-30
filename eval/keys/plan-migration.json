@@ -10,8 +10,8 @@
     {
       "id": "m1",
       "path": "MIGRATION.md",
-      "line_start": 27,
-      "line_end": 34,
+      "line_start": 22,
+      "line_end": 29,
       "severity": "high",
       "must_mention": [
         "marker",
@@ -21,8 +21,8 @@
     {
       "id": "m2",
       "path": "MIGRATION.md",
-      "line_start": 36,
-      "line_end": 41,
+      "line_start": 49,
+      "line_end": 54,
       "severity": "medium",
       "must_mention": [
         "workspace",
@@ -32,8 +32,8 @@
     {
       "id": "m3",
       "path": "MIGRATION.md",
-      "line_start": 43,
-      "line_end": 47,
+      "line_start": 75,
+      "line_end": 79,
       "severity": "medium",
       "must_mention": [
         "graded",

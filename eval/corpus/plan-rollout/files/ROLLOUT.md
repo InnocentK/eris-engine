@@ -29,6 +29,30 @@ Roll back immediately if any of these fire:
 * cost per review above $0.40;
 * any data-loss incident, of any size.
 
+## Who decides
+
+The pipeline team owns the rollout. A stop condition is evaluated by whoever is
+on call, and either of the two pipeline leads can halt a phase without waiting
+for the other.
+
+## Cost accounting
+
+Cost per review is the sum of every model call the review made, including
+retries and the calls a review makes before being abandoned. We attribute
+abandoned work to the phase that started it, not the phase it finished in.
+
+## Communication
+
+Each phase is announced in the engineering channel the working day before, with
+the stop conditions restated. Teams entering a phase get a short note on what
+changes for them; teams already in one get nothing further.
+
+## Training and support
+
+No training is planned. The reviewer interface is unchanged, and the difference
+is in how many reviewers a change is shown to. Support questions go to the
+existing channel.
+
 ## Scope of the pre-flight lint
 
 Before each phase we lint the config files that the pipeline reads. The linter
