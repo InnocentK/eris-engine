@@ -7,6 +7,7 @@ runner, so it spawns nothing."""
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 from eval.make_control_snapshot import (
     COMMIT_IDENTITY,
+    IGNORED_NAMES,
     build_snapshot,
     corpus_task_dirs,
     git_commands,
@@ -405,8 +407,14 @@ def test_every_keyed_finding_survives_into_the_evidence_actually_emitted(tmp_pat
     called the private `_excerpt` helper and asserted a size proxy for `_cap`
     rather than running it: that tested a component, not the emission.
 
-    Skips when snapshots are not built. They are gitignored, so a clean clone
-    has none, and a test that fails there is telling the truth about nothing.
+    Builds its own snapshot from the committed `files/` tree rather than
+    depending on `<task>/snapshot`. Snapshots are gitignored, so on a clean
+    checkout - which is what CI is - a test that skips without one never runs at
+    all, and an invariant enforced nowhere is not enforced (stop review,
+    2026-08-30). `files/` is committed, so this runs everywhere; that the
+    generated snapshot still matches `files/` is a different invariant, checked
+    by `test_the_shipped_corpus_snapshots_are_current`, which genuinely cannot
+    run without one.
     """
     from eval.score import load_key
 
@@ -420,14 +428,16 @@ def test_every_keyed_finding_survives_into_the_evidence_actually_emitted(tmp_pat
 
     corpus = REPO / "eval" / "corpus"
     tasks = sorted(p.parent for p in corpus.glob("*/task.json"))
-    if not any((d / "snapshot").is_dir() for d in tasks):
-        pytest.skip("no snapshots built in this checkout (gitignored); nothing was verified")
 
     checked = 0
     for i, task_dir in enumerate(tasks):
         spec_raw = json.loads((task_dir / "task.json").read_text())
-        if spec_raw.get("scored", True) is False or not (task_dir / "snapshot").is_dir():
+        if spec_raw.get("scored", True) is False:
             continue
+        # the snapshot a worker would run in, built here from the committed
+        # tree, with the same exclusions the real builder applies
+        snapshot = tmp_path / f"snap{i}"
+        shutil.copytree(task_dir / "files", snapshot, ignore=shutil.ignore_patterns(*IGNORED_NAMES))
         spec = TaskSpec.model_validate(spec_raw)
         (tmp_path / f"env{i}").mkdir(parents=True, exist_ok=True)
         writer = RunWriter(tmp_path / f"run{i}", Redactor(), run_id=f"r{i}").open()
@@ -436,7 +446,7 @@ def test_every_keyed_finding_survives_into_the_evidence_actually_emitted(tmp_pat
                 spec,
                 env=make_env(
                     tmp_path / f"env{i}",
-                    task_dir / "snapshot",
+                    snapshot,
                     ScriptedPopen(),
                     make_policy(tmp_path / f"env{i}"),
                 ),
