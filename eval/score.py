@@ -880,7 +880,7 @@ M1_PRE_REGISTRATION = (
     "findings ARE classified by code, using the coarse `validate.UNHANDLED_CODES` fallback "
     "that treats every `REF_*` as handled and therefore UNDER-REPORTS malformation on such "
     "a ledger. Classification is per FINDING, so a cell counts as coarsely scored when ANY "
-    "of its findings lacks `acted`, not only when all do. `summary.comparison` reports which arms "
+    "of its findings lacks `acted`, not only when all do, and is reported as `validator_basis: coarse_codes`. `summary.comparison` reports which arms "
     "were scored that way and is BLOCKED "
     "while any were, because an arm scored by code and an arm scored by `acted` are measured "
     "against two different definitions of malformed."

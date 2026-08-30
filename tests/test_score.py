@@ -1377,15 +1377,20 @@ def test_the_binding_pre_registration_matches_the_scorer() -> None:
     )
 
 
-def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
-    """M1, stop-gate finding: the binding rule must not contradict the code.
+def test_coarsely_scored_cells_block_the_comparison() -> None:
+    """M1: a cell scored by the coarse code set blocks the comparison.
+
+    Two causes produce it - a ledger written before 0.4.2 that carries no
+    `acted` at all, and a cell MIXING findings that carry it with findings that
+    do not. Both are `validator_basis: "coarse_codes"`; naming the state after
+    only the first cause is what produced a false gate message once already.
 
     The rule says `acted` is used "NOT inferred from its code" - but a ledger
     written before 0.4.2 carries no `acted`, so the scorer DOES fall back to the
     coarse code set, which calls every `REF_*` handled and under-reports
     malformation. Six real ledgers in `runs/` are of that vintage. The exception
     is now stated in the rule AND surfaced: such cells are reported as
-    `validator_basis: "legacy_codes"` and block the comparison, because an arm
+    `validator_basis: "coarse_codes"` and block the comparison, because an arm
     scored by code and one scored by `acted` are measured against two different
     definitions of malformed.
     """
@@ -1484,7 +1489,7 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
     assert mixed["per_arm"]["indep_verify_iter"]["coarsely_scored_cells"] == 1
     assert mixed["per_arm"]["indep_verify"]["coarsely_scored_cells"] == 0
 
-    # a MIXED cell reports `legacy_codes`, so the gate fires on it too
+    # a MIXED cell reports `coarse_codes` too, so the gate fires on it as well
     assert (
         _comparison_block(
             [score("indep_verify", "acted"), score("indep_verify_iter", _validator_basis(mixed_f))]

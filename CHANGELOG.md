@@ -21,11 +21,11 @@ string is TRUE. Six ledgers in `runs/` are of that vintage, so this was live.
   the gate was wrong. The basis value is `coarse_codes` (not `legacy_codes`) and
   the per-arm key is `coarsely_scored_cells`, because both cover a mixed cell.
 * `_validator_basis` reports how each cell was classified: `"acted"` (exact) or
-  `"legacy_codes"` (coarse - it calls every `REF_*` handled and therefore
-  UNDER-REPORTS malformation).
-* `summary.comparison` is BLOCKED while any arm has legacy-basis cells: an arm
-  scored by code and an arm scored by `acted` are measured against two different
-  definitions of malformed, so their rates are not comparable.
+  `"coarse_codes"` (at least one finding lacked `acted`, so the code fallback
+  ran - it calls every `REF_*` handled and therefore UNDER-REPORTS malformation).
+* `summary.comparison` is BLOCKED while any arm has coarsely-scored cells: an
+  arm scored by code and an arm scored by `acted` are measured against two
+  different definitions of malformed, so their rates are not comparable.
 * `M1_PRE_REGISTRATION` now states the exception rather than asserting an
   absolute the code does not honour, and `docs/EVAL-PLAN.md` carries the
   corrected text.
