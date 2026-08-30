@@ -914,6 +914,55 @@ def test_a_finding_records_whether_the_engine_ACTED_on_it() -> None:
     assert findings == []
 
 
+def _import_time_names(node: object) -> set[str]:
+    """Names referenced by code that RUNS when a module is imported.
+
+    A `def` BINDS a name at import; its BODY runs later. So this visits the
+    parts that do execute - decorators, default argument values, class bases and
+    class bodies - and PRUNES function bodies.
+
+    The single implementation: `_validate_reachability` uses it, and the
+    import-time matrix below exercises it. An earlier version had the gate and
+    the matrix each carry their own copy, so mutating the gate left the matrix
+    green - it was testing a duplicate, not the thing.
+    """
+    import ast
+
+    out: set[str] = set()
+
+    def rec(n: object) -> None:
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
+            for d in [*n.decorator_list, *n.args.defaults, *(k for k in n.args.kw_defaults if k)]:
+                rec(d)
+            return  # body deliberately NOT visited
+        if isinstance(n, ast.ClassDef):
+            for d in [*n.decorator_list, *n.bases, *(k.value for k in n.keywords)]:
+                rec(d)
+            for s in n.body:  # a class body DOES run at import
+                rec(s)
+            return
+        if isinstance(n, ast.Name):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            out.add(n.attr)
+        elif isinstance(n, ast.ImportFrom):
+            out.update(a.name for a in n.names)
+        elif (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "getattr"
+            and len(n.args) >= 2
+            and isinstance(n.args[1], ast.Constant)
+            and isinstance(n.args[1].value, str)
+        ):
+            out.add(n.args[1].value)
+        for c in ast.iter_child_nodes(n):
+            rec(c)
+
+    rec(node)
+    return out
+
+
 UNREACHABLE_IN_VALIDATE = {
     # decided 2026-08-30, see docs/decisions/2026-08-30-deferred-validator-decisions.md
     "validate_adjudication",  # findings-only wrapper; the engine calls enforce_rulings
@@ -995,61 +1044,12 @@ def _validate_reachability() -> tuple[set[str], set[str], list[str]]:
     ):
         unmet.append("`from __future__ import annotations` is gone - annotations now evaluate")
 
-    def import_time_names(node: ast.AST) -> set[str]:
-        """Names referenced by code that RUNS when the module is imported.
-
-        A `def` BINDS a name at import; its BODY runs later. So this prunes
-        function bodies while keeping the parts that do execute - decorators,
-        default argument values, class bases and class bodies.
-
-        Collecting whole nodes and then `ast.walk`ing them (the previous shape)
-        cannot express that: a `def` nested inside a module-level `if` or `try`
-        would have its whole body walked, and a dead function referenced there
-        was wrongly reported reachable - a FALSE ALARM, which is as damaging as
-        a miss, because a gate that rejects a legitimate state gets disabled.
-        """
-        out: set[str] = set()
-
-        def rec(n: ast.AST) -> None:
-            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
-                for d in n.decorator_list:
-                    rec(d)
-                for d in [*n.args.defaults, *(k for k in n.args.kw_defaults if k)]:
-                    rec(d)
-                return  # body deliberately NOT visited
-            if isinstance(n, ast.ClassDef):
-                for d in [*n.decorator_list, *n.bases, *(k.value for k in n.keywords)]:
-                    rec(d)
-                for s in n.body:  # a class body DOES run at import
-                    rec(s)
-                return
-            if isinstance(n, ast.Name):
-                out.add(n.id)
-            elif isinstance(n, ast.Attribute):
-                out.add(n.attr)
-            elif isinstance(n, ast.ImportFrom):
-                out.update(a.name for a in n.names)
-            elif (
-                isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Name)
-                and n.func.id == "getattr"
-                and len(n.args) >= 2
-                and isinstance(n.args[1], ast.Constant)
-                and isinstance(n.args[1].value, str)
-            ):
-                out.add(n.args[1].value)
-            for c in ast.iter_child_nodes(n):
-                rec(c)
-
-        rec(node)
-        return out & set(funcs)
-
     entries: set[str] = set()
     # assumption 2: everything that RUNS at import is a caller. Outside files
     # below use the full walk instead - a reference anywhere in them means the
     # target is called when that code runs, which is what "reachable" means.
     for n in tree.body:
-        entries |= import_time_names(n)
+        entries |= _import_time_names(n) & set(funcs)
     for pkg in ("src", "eval"):
         for f in (root / pkg).rglob("*.py"):
             src = f.read_text()
@@ -1137,33 +1137,13 @@ BINDING_ONLY_SOURCES = {
 
 
 def _names_at_import(source: str) -> set[str]:
-    """Run the gate's own import-time walk over a synthetic module."""
+    """Run THE gate's own import-time walk over a synthetic module."""
     import ast
 
     mod = ast.parse(source.replace("_PROBE_TARGET", "target"))
-    # rebuild the walk against a one-function universe
-    from tests.test_validate import _validate_reachability  # noqa: F401  (same module)
-
     names: set[str] = set()
-
-    def rec(n: ast.AST) -> None:
-        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
-            for d in [*n.decorator_list, *n.args.defaults, *(k for k in n.args.kw_defaults if k)]:
-                rec(d)
-            return
-        if isinstance(n, ast.ClassDef):
-            for d in [*n.decorator_list, *n.bases, *(k.value for k in n.keywords)]:
-                rec(d)
-            for s in n.body:
-                rec(s)
-            return
-        if isinstance(n, ast.Name):
-            names.add(n.id)
-        for c in ast.iter_child_nodes(n):
-            rec(c)
-
     for stmt in mod.body:
-        rec(stmt)
+        names |= _import_time_names(stmt)
     return names
 
 
