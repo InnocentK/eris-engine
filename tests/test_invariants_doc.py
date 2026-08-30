@@ -420,3 +420,60 @@ def test_a_lost_pipe_row_is_a_known_unreported_gap() -> None:
     rows, malformed = _rule_rows(doc)
     assert not malformed, "this gap is documented as unreported; see the module docstring"
     assert len(rows) == 1, "the intact row is still validated"
+
+
+def test_the_changelog_records_the_current_version() -> None:
+    """`__version__` was bumped to 0.4.3 with no changelog entry at all, across
+    three commits of substantive change, and nothing failed. A version number is
+    a claim that a release exists; the record of what is in it is the thing that
+    makes the claim checkable.
+
+    Asserts the TOP entry, not merely that the version appears somewhere: a
+    changelog whose newest entry is older than the code describes a release that
+    was never written down.
+    """
+    from eris.version import __version__
+
+    lines = (REPO / "CHANGELOG.md").read_text().splitlines()
+    headings = [ln for ln in lines if ln.startswith("## ")]
+    assert headings, "CHANGELOG.md has no version headings"
+    top = headings[0]
+    assert top.startswith(f"## {__version__} "), (
+        f"CHANGELOG.md's newest entry is {top!r}, but eris.__version__ is {__version__!r}. "
+        "Bumping the version without recording what changed leaves the release undocumented."
+    )
+    body = lines[lines.index(top) + 1 :]
+    body = body[: next((i for i, ln in enumerate(body) if ln.startswith("## ")), len(body))]
+    assert any(ln.strip() for ln in body), f"{top!r} has no body"
+
+
+def test_live_docs_do_not_point_at_files_that_do_not_exist() -> None:
+    """`eval/README.md` was named in four live documents - including AGENTS.md's
+    gate condition and its own map of where the pre-registration lives - as the
+    home of the Phase 0 decision rule. It had never been written. A reader
+    following the repo's own signposts to find the authoritative rule found
+    nothing, while the rule sat in `docs/EVAL-PLAN.md`.
+
+    Checked over the LIVE docs only. `docs/history/` is frozen by convention and
+    carries a banner saying so; a decision record describes the world as it was
+    when the decision was taken; and CHANGELOG.md is the same kind of thing - a
+    past release entry names the paths that existed then, and rewriting it to
+    match today would destroy the record it exists to be.
+    """
+    historical = {"CHANGELOG.md"}
+    live = sorted(
+        [p for p in REPO.glob("*.md") if p.name not in historical]
+        + [p for p in REPO.glob("docs/*.md") if p.parent.name == "docs"]
+    )
+    assert live, "no live docs found - this test would check nothing"
+    dangling: list[str] = []
+    for doc in live:
+        for m in re.finditer(
+            r"`((?:docs|eval|src|tests|policies)/[A-Za-z0-9_./-]+)`", doc.read_text()
+        ):
+            ref = m.group(1)
+            if "*" in ref or "<" in ref or (REPO / ref).exists():
+                continue
+            # a doc may name a path in order to say it does NOT exist
+            dangling.append(f"{doc.relative_to(REPO)} -> {ref}")
+    assert not dangling, "live docs point at files that do not exist:\n  " + "\n  ".join(dangling)

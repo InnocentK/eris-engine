@@ -1,10 +1,17 @@
 # Phase 0 evaluation plan
 
 Status: the harness is RUNNABLE as of 0.3.0 (`eval/run.py run|campaign`,
-`eval/score.py`); the pre-registration text (`eval/README.md` with the
-per-category decision rule and a USD ceiling from a 3-task pilot) and the
-corpus keys are Milestone 2c. This file records what is settled, what the
-experiments showed, and what must still run before any scored corpus run.
+`eval/score.py`); the per-category decision rule and a USD ceiling from a
+3-task pilot are still to be finalised, and the corpus keys are Milestone 2c.
+This file records what is settled, what the experiments showed, and what must
+still run before any scored corpus run.
+
+**This file is the pre-registration.** Earlier drafts pointed at an
+an eval/README.md that was never written, so four live documents named a file
+that does not exist as the home of the decision rule. The rule is stated here,
+once — a second copy is a second thing to drift. `eval/score.py` echoes the M1
+clause verbatim (coupled by test) and prints the caveats with every summary;
+`docs/INVARIANTS.md` records what is enforced and by which test.
 
 ## Runnable now (Milestone 2b)
 * `python eval/run.py run --task-file eval/corpus/<t>/task.json --arm <arm>`
@@ -93,7 +100,7 @@ experiments showed, and what must still run before any scored corpus run.
 * A budget-tripped cell is MISSING, not ABSTAIN. Every retry is an event;
   failed attempts' cost counts.
 * Corpus tasks are history-truncated snapshots built by `eris.snapshot`.
-* Pre-registered rule (draft, to be finalised in `eval/README.md`): build
+* Pre-registered rule (draft, to be finalised HERE — see the status note above): build
   the orchestrator only if arm 4 beats arm 3 by >= 10 points catch rate or
   halves the **wrong-ACCEPT rate** at <= 2x cost, AND arm 3 beats the
   incumbents.

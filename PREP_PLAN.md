@@ -20,8 +20,8 @@ This decided the shape of the plan. From `Matching.precision/recall`:
 * a **control** task has `findings: []`, so `tp+fn == 0` and **recall is
   `None`** - it contributes NOTHING to catch rate. If an arm invents a finding,
   `precision` becomes 0.0. So a control measures FALSE-POSITIVE discipline,
-  `confident_wrong`, abstention, cost and wall-clock - and cannot measure catch
-  rate at all.
+  `wrong_accept`/`severe_false_positive`, abstention, cost and wall-clock -
+  and cannot measure catch rate at all.
 * a **plan** task has real key findings, so it measures BOTH precision and
   recall.
 

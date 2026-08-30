@@ -1,5 +1,107 @@
 # Changelog
 
+## 0.4.3 - the scorer is bound to what it scored (2026-08-30)
+
+Two multi-family review rounds against Phase A - a three-family panel (OpenAI /
+xAI / Google) and a stop-time Codex review - found that the answer key could
+still be read by the graded worker, and that several numbers the scorer printed
+could be wrong in ways no reader would notice. Every finding below was
+reproduced here before being acted on; two of them were in code written earlier
+in the same session, and one was in a test that passed for the wrong reason.
+
+### The answer key
+
+* Keys move OUT of the corpus to `eval/keys/<task_id>.json`. A worker runs with
+  cwd `<task>/snapshot` and E1 established that claude, codex and grok read the
+  snapshot's PARENT, so `key.json` beside `task.json` was readable by the thing
+  being graded - and `scan.build_patterns` deliberately does not match
+  `must_mention`, so a worker that read the key and paraphrased it scored
+  perfectly and was never flagged.
+* `find_leaked_keys` refuses a key ANYWHERE in the task subtree (`files/`,
+  `snapshot/` - the worker's own cwd - nested, or `KEY.json`), in `load_task`
+  BEFORE any spawn as well as at scoring time. Checking one exact path refused
+  the file that had been there and nothing else.
+* `shutil.copytree` DEREFERENCES symlinks, so a link in `files/` pointing at the
+  key was materialised as the key's plaintext inside `snapshot/` under the
+  link's name, where no filename check looks; `Path.rglob` does not walk
+  symlinked directories at all. Symlinks in `files/` are refused at build, and
+  `load_task` refuses any file inside the task whose CONTENTS carry the key's
+  canary - following symlinks, skipping already-visited real directories so a
+  cycle cannot hang it, and treating an unreadably large file as a hit.
+* The key file may not itself be a symlink: `eval/keys/t.json ->
+  ../corpus/t/ground-truth.json` loaded perfectly while the bytes stayed where
+  the worker reads. Moving the key means moving the bytes, not the path.
+* Every scored key carries a per-task `ERIS-KEY-CANARY-<suffix>`, and a scored
+  run is REFUSED unless that canary SURVIVES into the scan pattern set -
+  `build_patterns` silently drops candidates that are too short, already known,
+  or present in the pre-fix tree, and a dropped canary detects nothing.
+  `BUILTIN_MARKERS` gained `eval/keys/`: relocating the key had taken it out of
+  marker coverage, trading a leak for a blind spot.
+* The canary detects a VERBATIM emission and nothing else. Stated in the code,
+  in `docs/EVAL-PLAN.md` and in the scorer's own output: absence of a hit is NOT
+  evidence of a clean run.
+
+### What the scorer counts
+
+* Recall is a COVERAGE of key findings and precision counts DISTINCT true
+  claims. Credit was a maximum matching, one prediction to one key finding, so a
+  prediction naming BOTH planted bugs scored recall 0.5 while emitting that same
+  prediction TWICE scored 1.0 - a run was rewarded for repeating itself.
+  Repeating a true finding can no longer dilute a false positive either. The
+  augmenting-path search is gone, and with it a `RecursionError` on a key of
+  >1000 findings.
+* `run.started` records `task_sha256` and `key_sha256`, compared before anything
+  else - before the `scored` flag is read, because flipping that flag is one of
+  the edits this guards against. The scorer rereads both files, so the answer
+  could previously be edited after the answering.
+* Scored cells are checked against the matrix `campaign.started` declared, keyed
+  on `run_id`. Cells were discovered by listing directories: one that never
+  finished vanished, an extra was scored as if it belonged, duplicates were all
+  aggregated.
+* The `single` arm is aggregated per WORKER (`single:<worker>`): it expands to
+  one cell per panel worker, so pooling by arm merged separate model lineages
+  into one number and gave `single` several times the weight of other arms.
+* A cell that recorded a failure about itself (`run.error`,
+  `manifest.post_scan_errors`) is excluded as `run_error`, and the manifest must
+  describe the ledger that is there (`event_count`, `last_sha256`, no torn tail
+  on a finalized run) - all four were previously unread.
+* Rates are published pooled AND per-cell, each named, with their denominators:
+  precision, recall and `unsupported_claim_rate`. The bare number was a per-CELL
+  mean answering a per-FINDING question, and silently dropped cells whose rate
+  was None. Clean controls get a false-positive rate of their own, every rate is
+  stratified `by_category`, and `comparison` is BLOCKED when arms did not score
+  the same cells.
+* A prediction with no `line_start` matches nothing (it defaulted to line 1, so
+  a bare path hit anything near the top of a file); key finding ids must be
+  unique; a `control` key may plant nothing; `paired_deltas` emits an explicit
+  unpaired row rather than skipping a coordinate.
+
+### The decision rule
+
+* `confident_wrong` is SPLIT into `wrong_accept` (mechanical: the verdict
+  against the key's `expected_verdict`) and `severe_false_positive` (the model's
+  OWN severity label on its OWN claim). `docs/EVAL-PLAN.md`'s build/don't-build
+  rule now reads `wrong_accept_rate`; the severity rate is reported beside it
+  and is an input to no rule. Combined, one of the two branches authorising a
+  whole orchestrator could be satisfied by an arm relabelling `critical` as
+  `low` - a tone change, with no change in what it found, and there is no
+  confidence field anywhere in the wire schema. User decision, recorded in
+  `docs/decisions/2026-08-30-confident-wrong-split.md`.
+
+### Corpus and harness
+
+* Snapshots are generated, never committed, and drift silently from the
+  committed `files/` tree. `load_task` refuses a stale snapshot before any
+  worker is spawned - on every spawn path, including `invoke` - and
+  `make_control_snapshot.py <corpus> --all` builds a whole corpus, which a fresh
+  clone needs before anything will run. The plumbing control's snapshot WAS
+  stale, several edits behind its own README.
+* `TaskSpec.scored` is `strict=True`: `eval/run.py` and `eval/score.py` read the
+  flag through different code, and under lax coercion `"scored": "false"` made
+  discovery skip a task the scorer still expected.
+* A task whose directory name disagrees with its `task_id` is refused rather
+  than scanned against one key and graded against another.
+
 ## 0.4.2 - the legacy fallback is stated and gated, not hidden (2026-08-29)
 
 0.4.1's binding rule said whether a finding was acted on is "recorded per

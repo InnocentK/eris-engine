@@ -1,5 +1,12 @@
 # Eris Engine — DRAFT design synthesis (for adversarial review)
 
+> **HISTORICAL — not the live plan.** Frozen as written on 2026-08-21 and kept for
+> provenance; it is not edited when decisions change. Where it describes metrics or
+> the build/don't-build rule it is **out of date**: the live documents are
+> [`docs/EVAL-PLAN.md`](../EVAL-PLAN.md) for the plan and rule,
+> [`docs/INVARIANTS.md`](../INVARIANTS.md) for what is enforced, and
+> [`docs/decisions/`](../decisions/) for why. Read those before acting on anything here.
+
 Status: draft produced by the synthesizer after six independent role reports
 (Athena reuse analyst, scope critic, workflow architect, security reviewer,
 provenance architect, MVP reducer). Nothing has been built. The Eris directory

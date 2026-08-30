@@ -105,7 +105,7 @@ never push without being asked) → stop and report.
 
 - **No orchestrator before evidence.** Phase 0 is an evaluation harness. The
   engine (state machine, ledger package, adjudication loop) is built only if
-  the pre-registered Phase 0 experiment in `eval/README.md` clears its rule.
+  the pre-registered Phase 0 experiment in `docs/EVAL-PLAN.md` clears its rule.
 - **Hermetic tests.** No real worker CLI, subprocess, or network in the suite.
   `tests/conftest.py` blocks `shutil.which` for worker binaries, all subprocess
   entry points, and sockets. Tests that must spawn a real process use the
@@ -157,7 +157,7 @@ proposing a change to one of these.
 | `CLAIM_MISSING`, `DISSENT_EMPTY_WITH_CONTEST` have no verdict powers | Leave as-is (2026-08-30). They exclude the cell from metrics but do not change the verdict | The first scored campaign shows `DISSENT_EMPTY_WITH_CONTEST` on a large share of arm-4 cells, or challenge verification is built |
 | Five functions in `eris.validate` are unreachable at runtime (`validate_adjudication`, `validate_critique`, `validate_origin`, `_record_id`, `has_errors`) | Leave them so (2026-08-30). `validate_adjudication` is a findings-only wrapper the engine has no use for (it calls `enforce_rulings` directly); it is also the only path to `validate_origin`, which guards Eris against itself since a model cannot set `origin`; `validate_critique` would flag EVERY challenge because nothing ever verifies one | Challenge verification (M2) is built, a wire model gains an `origin` field, or something needs findings WITHOUT enforcement |
 | E1 containment: accept-and-scan | Plumbing/`control`/`plan` runs only; scored defect/ABSTAIN arms refused | A portable container mechanism exists (M2c) |
-| `confident_wrong` is split into `wrong_accept` and `severe_false_positive` | Split 2026-08-30 by user decision. `wrong_accept` is mechanical (the verdict against the key's `expected_verdict`); `severe_false_positive` reads the model's OWN severity label on its OWN claim. The EVAL-PLAN build/don't-build rule reads `wrong_accept_rate`; the severity rate is reported beside it and is an input to no rule. Combined, one of the two branches authorising an orchestrator could be satisfied by relabelling `critical` as `low` - a tone change with no change in what was found, and there is no confidence field anywhere in the wire schema | A confidence signal is added to the wire schema, or a scored campaign shows `wrong_accept` is too sparse to discriminate arms |
+| `confident_wrong` is split into `wrong_accept` and `severe_false_positive` | Split 2026-08-30 by user decision. `wrong_accept` is mechanical (the verdict against the key's `expected_verdict`); `severe_false_positive` reads the model's OWN severity label on its OWN claim. The EVAL-PLAN build/don't-build rule reads `wrong_accept_rate`; the severity rate is reported beside it and is an input to no rule. Combined, one of the two branches authorising an orchestrator could be satisfied by relabelling `critical` as `low` - a tone change with no change in what was found, and there is no confidence field anywhere in the wire schema. Record: `docs/decisions/2026-08-30-confident-wrong-split.md` | A confidence signal is added to the wire schema, or a scored campaign shows `wrong_accept` is too sparse to discriminate arms |
 
 Full reasoning: `docs/decisions/2026-08-30-deferred-validator-decisions.md`,
 `docs/SECURITY.md` (E1).
@@ -167,7 +167,7 @@ Full reasoning: `docs/decisions/2026-08-30-deferred-validator-decisions.md`,
 | File | Why |
 |---|---|
 | `docs/PROTOCOL.md` | The adversarial protocol, evidence rule, verdict vocabulary |
-| `docs/EVAL-PLAN.md` + `eval/README.md` | Phase 0 pre-registration: arms, metrics, decision rule |
+| `docs/EVAL-PLAN.md` | Phase 0 pre-registration: arms, metrics, decision rule (stated once, there) |
 | `src/eris/schemas.py` | Every record; `origin`; canonical bytes |
 | `src/eris/validate.py` | The engine-enforced adjudication rules |
 | `src/eris/launch.py` | How each worker CLI is invoked (flags are load-bearing) |
