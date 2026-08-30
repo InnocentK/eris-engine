@@ -138,6 +138,25 @@ class Key(_Strict):
     injection_canary: bool | None = None
     source_repo: str | None = None
 
+    @model_validator(mode="after")
+    def _control_has_nothing_to_find(self) -> Key:
+        """A `control` key must plant nothing.
+
+        `_control_block` reports a false-positive rate on the premise that a
+        control has no findings, and nothing enforced that premise. A control key
+        that carried findings turned matching predictions into true positives
+        while the same block still called the result a clean-control FPR - an
+        understated number with no warning attached (panel, 2026-08-30).
+        """
+        if self.category is TaskCategory.CONTROL and self.findings:
+            raise ValueError(
+                f"control task {self.task_id!r} has {len(self.findings)} key finding(s). "
+                "A control is clean by definition: its whole purpose is to measure how often "
+                "an arm invents a defect where there is none, and the control false-positive "
+                "rate is computed on that premise."
+            )
+        return self
+
 
 def task_is_scored(corpus: Path, task_id: str) -> bool:
     """``task.json``'s ``scored`` flag (default True). False marks a PLUMBING
@@ -170,6 +189,40 @@ def keys_dir_for(corpus: Path) -> Path:
     return Path(corpus).resolve().parent / "keys"
 
 
+def key_path_for(task_dir: Path) -> Path:
+    """The answer key for one corpus task DIRECTORY.
+
+    One resolver, used by the scorer and by `eval/run.py`. They built the path
+    separately before, from different inputs - the scorer from `task_id`, the
+    runner from the directory name - so a task whose directory did not match its
+    `task_id` was scanned against one key and graded against another. `load_task`
+    now refuses that mismatch outright; sharing the construction is what keeps
+    the two from drifting again.
+    """
+    task_dir = Path(task_dir)
+    return keys_dir_for(task_dir.parent) / f"{task_dir.name}.json"
+
+
+def find_leaked_keys(task_dir: Path) -> list[Path]:
+    """Every answer key sitting anywhere inside one corpus task directory.
+
+    The whole subtree, not one exact path. Checking only
+    `<task>/key.json` refused the file that had actually been there and nothing
+    else - `files/key.json`, `snapshot/key.json` (the worker's own cwd), a
+    nested copy, or `KEY.json` on a case-sensitive filesystem all passed
+    (panel, 2026-08-30). Matched case-insensitively so the refusal does not
+    depend on which filesystem the corpus is authored on.
+    """
+    task_dir = Path(task_dir)
+    if not task_dir.is_dir():
+        return []
+    return sorted(
+        p
+        for p in task_dir.rglob("*")
+        if p.is_file() and p.name.lower() in ("key.json", "answer.json")
+    )
+
+
 def load_key(corpus: Path, task_id: str) -> Key:
     """Load `<corpus>/../keys/<task_id>.json`, refusing a key inside the corpus.
 
@@ -177,13 +230,13 @@ def load_key(corpus: Path, task_id: str) -> Key:
     impossible to reintroduce by accident, instead of relying on everyone
     remembering why the file moved.
     """
-    leaked = Path(corpus) / task_id / "key.json"
-    if leaked.exists():
+    leaked = find_leaked_keys(Path(corpus) / task_id)
+    if leaked:
         raise GateRefused(
-            f"{leaked} is inside the corpus, where a worker running in "
-            f"{task_id}/snapshot can read it (E1: workers read the snapshot's parent). "
-            f"Answer keys belong in {keys_dir_for(corpus)}/. Move it; do not score with it "
-            "in place."
+            f"{', '.join(str(p) for p in leaked)} inside the corpus, where a worker running in "
+            f"{task_id}/snapshot can read it (E1: workers read the snapshot's parent, and "
+            f"`snapshot/` IS the worker's cwd). Answer keys belong in {keys_dir_for(corpus)}/. "
+            "Move it; do not score with it in place."
         )
     path = keys_dir_for(corpus) / f"{task_id}.json"
     try:
@@ -195,6 +248,8 @@ def load_key(corpus: Path, task_id: str) -> Key:
 
 
 CANARY_PREFIX = "ERIS-KEY-CANARY-"
+# The canary must identify WHICH key it came from, so a hit names the leak.
+CANARY_MIN_SUFFIX = 8
 
 
 def _require_canary(key: Key, task_id: str) -> None:
@@ -207,13 +262,24 @@ def _require_canary(key: Key, task_id: str) -> None:
     turns `extra_strings` into scan patterns over the ledger and blobs.
 
     It detects a VERBATIM read, not a paraphrase - stated plainly here so no
-    report can claim the canary proves the key was not used.
+    report can claim the canary proves the key was not used. A worker that reads
+    the key and restates its findings in its own words emits no canary and is
+    reported `contaminated: false`. Absence of a hit is NOT evidence of a clean
+    run, and `docs/EVAL-PLAN.md` says so where the numbers are published.
+
+    The token must carry a per-task suffix. A bare `ERIS-KEY-CANARY-` would
+    satisfy a prefix test while being shared by every key, so a hit would not say
+    WHICH key was read - and a shared token is far likelier to appear in the
+    repository by accident, where `build_patterns` drops it.
     """
-    if not any(s.startswith(CANARY_PREFIX) for s in key.scan.extra_strings):
+    if not any(
+        s.startswith(CANARY_PREFIX) and len(s) >= len(CANARY_PREFIX) + CANARY_MIN_SUFFIX
+        for s in key.scan.extra_strings
+    ):
         raise GateRefused(
-            f"key for {task_id!r} has no {CANARY_PREFIX}* token in scan.extra_strings. "
-            "Without it a key read cannot be detected at all, and the quality metrics "
-            "would be unfalsifiable."
+            f"key for {task_id!r} has no {CANARY_PREFIX}<suffix> token of at least "
+            f"{CANARY_MIN_SUFFIX} further characters in scan.extra_strings. Without it a key "
+            "read cannot be detected at all, and the quality metrics would be unfalsifiable."
         )
 
 
@@ -375,95 +441,88 @@ def _matches(pred: Predicted, kf: KeyFinding, tolerance: int) -> bool:
 
 @dataclass
 class Matching:
+    """Two questions with two different denominators, kept apart.
+
+    RECALL asks about key findings: how many planted defects did the run
+    identify. Its numerator is `covered` - key findings named by AT LEAST ONE
+    prediction. It is a COVERAGE, not an assignment, because a run that names
+    two defects in one sentence found two defects, and because coverage cannot
+    be inflated by saying the same thing twice.
+
+    PRECISION asks about predictions: of the distinct claims made, how many were
+    true. Its numerator is `tp`, the number of DISTINCT true claims - predictions
+    matching the same set of key findings are one claim repeated, so the first
+    counts and the rest are `redundant`.
+
+    An earlier version credited both from a single maximum matching, which made
+    both wrong in opposite directions: one prediction naming two key findings
+    scored recall 0.5, and REPEATING that prediction scored 1.0, because each
+    copy was assigned to a different key finding. A run was rewarded for
+    repeating itself. (Panel, 2026-08-30, mechanically reproduced.)
+    """
+
+    covered: int
     tp: int
     fp: int
     fn: int
     distractor_hits: int
     matched_ids: list[str]
     fp_severities: list[str]
-    # A prediction that matches a key finding some OTHER prediction is already
-    # credited with. It is not a false positive - what it says is true - but it
-    # names no new key finding, so it raises neither tp nor recall. It used to
-    # be dropped silently, which shrank precision's denominator and let a run
-    # that repeated one true finding ten times read as flawless. It is counted
-    # and REPORTED instead: `precision` still excludes it, and a reader who
-    # wants the per-utterance rate can compute `tp / (tp + fp + redundant)`.
+    # Predictions that matched exactly the key findings some earlier prediction
+    # already claimed: the same claim said again. Not false - what they say is
+    # true - so they are NOT charged as false positives and NOT entered in
+    # `fp_severities`; a run is not "confidently wrong" for repeating something
+    # correct. Counted and reported rather than dropped, because dropping them
+    # shrank precision's denominator silently: ten copies of one true finding
+    # beside one false one used to read 0.909 instead of 0.5.
     redundant: int = 0
 
     @property
     def precision(self) -> float | None:
-        """Of the DISTINCT claims made, the fraction that were true.
+        """Of the DISTINCT true claims and the false ones, the fraction true.
 
-        Redundant repeats are outside the denominator deliberately: repeating a
-        true finding is not asserting a false one. `redundant` is reported
-        alongside so the choice is visible and reversible by the reader, rather
-        than being made silently by a `continue`.
+        Asymmetric on purpose, and the asymmetry is stated because it is not
+        obvious: repeated TRUE claims collapse into one `tp`, while repeated
+        FALSE claims each count in `fp`. Collapsing true repeats is what stops a
+        run diluting its false positives by restating a correct finding; not
+        collapsing false ones costs the run nothing it did not say, and there is
+        no incentive to exploit. `micro_with_redundant` in the aggregate puts the
+        repeats back so a reader can overrule the choice.
         """
         return None if self.tp + self.fp == 0 else self.tp / (self.tp + self.fp)
 
     @property
     def recall(self) -> float | None:
-        return None if self.tp + self.fn == 0 else self.tp / (self.tp + self.fn)
-
-
-def _credit(predicted: Sequence[Predicted], key: Key) -> tuple[list[list[str]], dict[str, int]]:
-    """Assign predictions to key findings so that as many DISTINCT key findings
-    as possible are credited - a maximum bipartite matching, by augmenting paths.
-
-    First-come greedy assignment made the score depend on the ORDER a worker
-    happened to list its findings. A broad prediction that mentions two nearby
-    key findings would consume the one a later, more specific prediction needed,
-    and that later prediction would then be uncredited: recall fell for a run
-    that had in fact found everything. The SIZE of a maximum matching is unique,
-    so that order dependence is gone.
-
-    Maximality is also what makes "redundant" mean something. If a prediction is
-    left uncredited but still `_matches` a key finding, then by maximality it
-    cannot be credited without un-crediting another - it identifies no key
-    finding that is not already found. That is a fact about the assignment, not
-    a guess about intent.
-
-    Recursion depth is bounded by the number of KEY findings, not predictions:
-    every nested call adds at least one key-finding id to `seen` before
-    recursing, so a worker emitting thousands of findings cannot exhaust the
-    stack.
-    """
-    adj = [
-        [kf.id for kf in key.findings if _matches(pred, kf, key.line_tolerance)]
-        for pred in predicted
-    ]
-    owner: dict[str, int] = {}
-
-    def augment(i: int, seen: set[str]) -> bool:
-        for kid in adj[i]:
-            if kid in seen:
-                continue
-            seen.add(kid)
-            if kid not in owner or augment(owner[kid], seen):
-                owner[kid] = i
-                return True
-        return False
-
-    for i in range(len(predicted)):
-        augment(i, set())
-    return adj, owner
+        return None if self.covered + self.fn == 0 else self.covered / (self.covered + self.fn)
 
 
 def match_findings(predicted: Sequence[Predicted], key: Key) -> Matching:
-    adj, owner = _credit(predicted, key)
-    credited = set(owner.values())
+    # Which key findings each prediction names. No assignment is made: a
+    # prediction may legitimately name several, and several may name the same
+    # one. Iterative and flat - the previous augmenting-path search recursed
+    # once per key finding and raised RecursionError on a key of >1000 findings
+    # (panel, mechanically reproduced), a limit nothing validated.
+    adj = [
+        frozenset(kf.id for kf in key.findings if _matches(pred, kf, key.line_tolerance))
+        for pred in predicted
+    ]
+    covered: set[str] = set()
+    for ids in adj:
+        covered |= ids
+
+    claimed: set[frozenset[str]] = set()
+    tp = 0
     fp = 0
-    fp_sev: list[str] = []
     redundant = 0
+    fp_sev: list[str] = []
     distractor_hits = 0
-    for i, pred in enumerate(predicted):
-        if i in credited:
-            continue
-        if adj[i]:
-            # True, but names nothing new. NOT a false positive, and so
-            # deliberately NOT in `fp_severities`: a run is not "confidently
-            # wrong" for saying a correct thing twice.
-            redundant += 1
+    for pred, ids in zip(predicted, adj, strict=True):
+        if ids:
+            if ids in claimed:
+                redundant += 1
+            else:
+                claimed.add(ids)
+                tp += 1
             continue
         fp += 1
         fp_sev.append(pred.severity.value)
@@ -480,11 +539,12 @@ def match_findings(predicted: Sequence[Predicted], key: Key) -> Matching:
         ):
             distractor_hits += 1
     return Matching(
-        len(owner),
+        len(covered),
+        tp,
         fp,
-        len(key.findings) - len(owner),
+        len(key.findings) - len(covered),
         distractor_hits,
-        sorted(owner),
+        sorted(covered),
         fp_sev,
         redundant,
     )
@@ -506,11 +566,16 @@ class CellScore:
     verdict_basis: str | None
     precision: float | None
     recall: float | None
+    covered: int
     tp: int
     fp: int
     fn: int
     redundant: int
     distractor_hits: int
+    # the severities of the FALSE positives, so a report can ask about severe
+    # ones without going back through `confident_wrong`, which also fires on a
+    # wrong ACCEPT and is therefore a different question
+    fp_severities: list[str]
     unsupported_claim_rate: float | None
     downgrades: int
     confident_wrong: bool
@@ -771,10 +836,12 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         verdict_basis=basis,
         precision=matching.precision if exclusion is None else None,
         recall=matching.recall if exclusion is None else None,
+        covered=matching.covered,
         tp=matching.tp,
         fp=matching.fp,
         fn=matching.fn,
         redundant=matching.redundant,
+        fp_severities=list(matching.fp_severities),
         distractor_hits=matching.distractor_hits,
         unsupported_claim_rate=rate,
         downgrades=enforced.downgrades if enforced else 0,
@@ -826,7 +893,10 @@ def _rates(inc: Sequence[CellScore], which: Literal["precision", "recall"]) -> d
     computed only over the half where it spoke, and silence would be free. The
     count makes that visible instead; `silent_cells` names it outright.
     """
-    tp = sum(s.tp for s in inc)
+    # Different numerators on purpose: precision counts distinct true CLAIMS,
+    # recall counts key FINDINGS that were covered. They coincided only while a
+    # single matching produced both, which is exactly what made both wrong.
+    tp = sum(s.tp if which == "precision" else s.covered for s in inc)
     other = sum(s.fp for s in inc) if which == "precision" else sum(s.fn for s in inc)
     per_cell = [getattr(s, which) for s in inc]
     out: dict[str, Any] = {
@@ -864,15 +934,30 @@ def _control_block(inc: Sequence[CellScore]) -> dict[str, Any]:
     failures and sum(fp) alone cannot tell them apart.
     """
     ctl = [s for s in inc if s.category == TaskCategory.CONTROL.value]
+    # One shape whether or not there are controls, so a report can read every
+    # field without a KeyError on an arm that happened to score none. `None`
+    # says "not measured"; it is never rounded down to a reassuring 0.0.
     if not ctl:
-        return {"cells": 0, "flagged_cells": None, "fpr": None, "mean_false_positives": None}
+        return {
+            "cells": 0,
+            "flagged_cells": None,
+            "fpr": None,
+            "mean_false_positives": None,
+            "severe_cells": None,
+        }
     flagged = len([s for s in ctl if s.fp > 0])
     return {
         "cells": len(ctl),
         "flagged_cells": flagged,
         "fpr": round(flagged / len(ctl), 4),
         "mean_false_positives": round(sum(s.fp for s in ctl) / len(ctl), 4),
-        "high_or_critical_cells": len([s for s in ctl if s.confident_wrong]),
+        # Computed from the FALSE-POSITIVE severities directly, not from
+        # `confident_wrong` - which also fires on a wrong ACCEPT verdict and so
+        # answers a different question than "invented a severe defect in clean
+        # code".
+        "severe_cells": len(
+            [s for s in ctl if any(v in ("high", "critical") for v in s.fp_severities)]
+        ),
     }
 
 
@@ -1136,8 +1221,35 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
         v["coarsely_scored_cells"] = len(
             [s for s in scores if s.arm == arm and s.validator_basis == "coarse_codes"]
         )
+    # Every arm's INCLUDED support, as the set of (task, repeat) it actually
+    # scored. Arms are excluded cell by cell - contamination, budget, missing,
+    # incomplete, no_scan, validator - and those exclusions are NOT the same per
+    # arm, so two arms' pooled rates can be computed over different task
+    # populations while nothing says so. An arm that lost its hardest cells to
+    # contamination reads better for having lost them (panel, 2026-08-30:
+    # a worker can even provoke its own exclusion by emitting a scan marker).
+    support = {
+        arm: {(s.task_id, s.repeat_index) for s in scores if s.arm == arm and s.included}
+        for arm in per_arm
+    }
+    common = set.intersection(*support.values()) if support else set()
+    for arm, v in per_arm.items():
+        v["included_cells"] = len(support[arm])
+        v["outside_common_support"] = sorted(
+            f"{tid}#{rep}" for tid, rep in sorted(support[arm] - common)
+        )
+    unequal = sorted(a for a in per_arm if support[a] != common)
+
     offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
     reasons: list[str] = []
+    if len(support) > 1 and unequal:
+        reasons.append(
+            "arms " + ", ".join(unequal) + " scored a different set of (task, repeat) cells "
+            f"than the {len(common)} cell(s) every arm has in common, so their pooled rates "
+            "are over different task populations. `common_support` lists what they share; a "
+            "difference between arms here is confounded with the difference in what they were "
+            "measured on"
+        )
     if offenders:
         reasons.append(
             "arms " + ", ".join(offenders) + " dropped cells for validator findings; their "
@@ -1157,6 +1269,7 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
     return {
         "blocked": bool(reasons),
         "reason": "; ".join(reasons) + ". NOT comparable." if reasons else None,
+        "common_support": sorted(f"{tid}#{rep}" for tid, rep in sorted(common)),
         "per_arm": per_arm,
     }
 
@@ -1212,6 +1325,19 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             M1_PRE_REGISTRATION,
             "categories revert/planted/insufficient require ArmRun.containment == container (E1)",
             "containment basis: " + CONTAINMENT_BASIS,
+            "PANEL 2026-08-30, NOT fixed and load-bearing on any reading of these numbers: "
+            "`confident_wrong` is driven by the model's OWN self-reported severity - an "
+            "unmatched `critical` prediction sets it, the identical prediction labelled `low` "
+            "does not. There is no confidence field anywhere in the wire schema. An arm can "
+            "therefore satisfy the pre-registered `halves confident-wrong` branch by grading "
+            "its own claims more mildly, with no change in what it got right. Read it as "
+            "`severe-false-positive-or-wrong-accept rate`, and do not read a decision rule off "
+            "it without saying so.",
+            "PANEL 2026-08-30: the canary detects a VERBATIM emission of the key token and "
+            "nothing else. A worker that reads the key and paraphrases it emits no canary, is "
+            "reported `contaminated: false`, and scores as if it had reasoned. Absence of a "
+            "canary hit is NOT evidence of a clean run, and no quality number here may be "
+            "reported as if it were.",
             "plan tasks are scored without containment by user decision; plan keys are as "
             "readable as the others (testing critic) - recorded caveat",
         ],

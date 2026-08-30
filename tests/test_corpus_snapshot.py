@@ -166,9 +166,21 @@ def test_the_builder_can_make_every_snapshot_a_clone_is_missing(tmp_path: Path) 
 
 
 def test_the_shipped_corpus_snapshots_are_current() -> None:
-    """The real corpus on disk, not a fixture."""
-    for task_dir in corpus_task_dirs(REPO / "eval" / "corpus"):
-        assert snapshot_matches_files(task_dir) is not False, (
-            f"{task_dir.name}: snapshot is stale - rebuild with "
+    """The real corpus on disk, not a fixture.
+
+    `is not False` alone would pass on a fresh clone for the wrong reason:
+    snapshots are gitignored, so `snapshot_matches_files` returns None for every
+    task and the assertion holds while nothing has been checked. That is a
+    legitimate state - a clone has no snapshots until it builds them - so the
+    test SKIPS there and says so, rather than reporting a pass it did not earn.
+    """
+    tasks = corpus_task_dirs(REPO / "eval" / "corpus")
+    assert tasks, "no corpus task with a files/ tree - this test would check nothing"
+    results = {t.name: snapshot_matches_files(t) for t in tasks}
+    for name, res in results.items():
+        assert res is not False, (
+            f"{name}: snapshot is stale - rebuild with "
             f"`python eval/make_control_snapshot.py eval/corpus --all`"
         )
+    if all(res is None for res in results.values()):
+        pytest.skip("no snapshots built in this checkout (gitignored); nothing was verified")

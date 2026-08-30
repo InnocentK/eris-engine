@@ -14,12 +14,15 @@ import pytest
 from eval import score
 from eval.run import main as run_main
 from eval.score import (
+    CANARY_MIN_SUFFIX,
+    CANARY_PREFIX,
     EXIT_GATE,
     EXIT_OK,
     CellScore,
     GateRefused,
     Key,
     Predicted,
+    _comparison_block,
     aggregate,
     keys_dir_for,
     load_key,
@@ -50,7 +53,14 @@ def key_dict(**over: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "key_version": 1,
         "task_id": "t_01",
-        "category": "control",
+        # `plan`, not `control`: this fixture carries a key finding, and a
+        # control is clean BY DEFINITION - `Key` refuses one that plants
+        # anything, because the control false-positive rate is computed on that
+        # premise. The fixture used to describe a task that cannot exist. `plan`
+        # keeps the gating identical (it is not in `GATED_CATEGORIES`, so it is
+        # scored without containment) while being a category that may carry
+        # findings.
+        "category": "plan",
         "expected_verdict": ["REVISE"],
         "line_tolerance": 2,
         "findings": [
@@ -273,7 +283,8 @@ def test_e1_gate_refuses_defect_categories_without_containment(tmp_path: Path) -
         w2 = world(tmp_path / category)
         t2 = json.loads(w2["task"].read_text())
         w2["task"].write_text(json.dumps({**t2, "category": category}))
-        write_key(w2, category=category)
+        # a control plants nothing - `Key` refuses a control that carries findings
+        write_key(w2, category=category, **({"findings": []} if category == "control" else {}))
         cdir2 = campaign(w2, tmp_path / category, "single")
         summary = score_campaign(cdir2, w2["corpus"], home=tmp_path / category / "home")
         assert summary["cells"][0]["included"] is True
@@ -545,6 +556,8 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -812,6 +825,8 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -1014,6 +1029,8 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -1160,6 +1177,8 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -1270,6 +1289,8 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -1469,6 +1490,8 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -1545,6 +1568,8 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             tp=1,
             fp=1,
             fn=1,
+            covered=0,
+            fp_severities=[],
             redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
@@ -1623,8 +1648,16 @@ def test_a_key_without_a_canary_is_refused(tmp_path: Path) -> None:
     with pytest.raises(GateRefused, match="CANARY"):
         load_key(w["corpus"], "t_01")
 
-    write_key(w, scan={"fix_hunk_lines": [], "extra_strings": ["ERIS-KEY-CANARY-x-1"]})
-    assert load_key(w["corpus"], "t_01").scan.extra_strings == ["ERIS-KEY-CANARY-x-1"]
+    # a bare prefix is refused too: it would be shared by every key, so a hit
+    # would not say WHICH key was read, and a token that appears in more than one
+    # place is likelier to be dropped from the pattern set as non-distinctive
+    write_key(w, scan={"fix_hunk_lines": [], "extra_strings": [CANARY_PREFIX]})
+    with pytest.raises(GateRefused, match="CANARY"):
+        load_key(w["corpus"], "t_01")
+
+    token = f"{CANARY_PREFIX}t01-9f3ab27c"
+    write_key(w, scan={"fix_hunk_lines": [], "extra_strings": [token]})
+    assert load_key(w["corpus"], "t_01").scan.extra_strings == [token]
 
 
 def test_the_shipped_key_is_outside_the_corpus_and_has_a_canary() -> None:
@@ -1635,50 +1668,22 @@ def test_the_shipped_key_is_outside_the_corpus_and_has_a_canary() -> None:
         assert not (task_dir / "key.json").exists(), (
             f"{task_dir.name} has a key inside the corpus - readable by its own worker"
         )
-    for key_file in sorted((root / "eval" / "keys").glob("*.json")):
+    keys = sorted((root / "eval" / "keys").glob("*.json"))
+    # asserted, not assumed: an empty glob would walk the loop zero times and
+    # report a pass for a repository with no keys at all
+    assert keys, "eval/keys/ has no key files - this test would check nothing"
+    for key_file in keys:
         body = json.loads(key_file.read_text())
         assert any(
-            s.startswith("ERIS-KEY-CANARY-") for s in body.get("scan", {}).get("extra_strings", [])
-        ), f"{key_file.name} has no canary"
+            s.startswith(CANARY_PREFIX) and len(s) >= len(CANARY_PREFIX) + CANARY_MIN_SUFFIX
+            for s in body.get("scan", {}).get("extra_strings", [])
+        ), f"{key_file.name} has no per-task canary"
 
 
-def test_a_repeated_true_finding_is_counted_as_redundant_not_dropped() -> None:
-    """Precision's denominator must account for every distinct prediction.
-
-    The old matcher, when a prediction matched only an already-credited key
-    finding, fell back to that same finding and `continue`d - so the repeat was
-    neither a true positive nor a false one. It vanished. A run that named one
-    real bug three times and nothing else scored precision 1.0 out of a single
-    counted prediction, and nothing in the output said two others had been
-    swallowed. Precision could read better than the proposals actually were.
-
-    It is still NOT a false positive - what it says is true - so it stays out of
-    the denominator by an explicit, reported decision rather than a silent one.
-    """
-    key = Key.model_validate(key_dict())
-    once = Predicted("src/app.py", 10, 11, Severity.HIGH, "null deref here")
-    again = Predicted("src/app.py", 11, 12, Severity.HIGH, "null deref, again")
-    m = match_findings([once, again], key)
-    assert (m.tp, m.fp, m.fn, m.redundant) == (1, 0, 0, 1)
-    assert m.precision == 1.0
-
-    # and it is not treated as a wrong claim: `confident_wrong` keys off
-    # fp_severities, and repeating something true is not being confidently wrong
-    assert m.fp_severities == []
-
-
-def test_crediting_does_not_depend_on_the_order_findings_were_listed() -> None:
-    """Greedy first-come assignment let listing order change the score.
-
-    `broad` matches both key findings; `narrow` matches only k1. Assigned
-    greedily in the order given, `broad` takes k1 - the first key finding it
-    matches - `narrow` then finds nothing unclaimed, and a run that identified
-    BOTH bugs is credited with one. The same two predictions in the other order
-    score 2. Recall would have measured the sequence a worker happened to emit
-    rather than what it found. Augmenting re-seats `broad` onto k2 and credits
-    both, in either order.
-    """
-    key = Key.model_validate(
+@pytest.fixture
+def _key_two() -> Key:
+    """Two planted findings, close enough that one prediction can name both."""
+    return Key.model_validate(
         key_dict(
             findings=[
                 {
@@ -1700,14 +1705,88 @@ def test_crediting_does_not_depend_on_the_order_findings_were_listed() -> None:
             ]
         )
     )
-    broad = Predicted("src/app.py", 1, 4, Severity.HIGH, "alpha and beta are both wrong")
-    narrow = Predicted("src/app.py", 1, 2, Severity.HIGH, "alpha is wrong")
 
-    for order in ([broad, narrow], [narrow, broad]):
-        m = match_findings(order, key)
-        assert (m.tp, m.fp, m.fn, m.redundant) == (2, 0, 0, 0), [p.description for p in order]
-        assert m.matched_ids == ["k1", "k2"]
-        assert m.recall == 1.0
+
+def test_repeating_a_finding_cannot_change_recall(_key_two: Key) -> None:
+    """The panel's Critical finding, mechanically reproduced then closed.
+
+    Credit used to be a maximum matching, one prediction to one key finding. A
+    single prediction naming BOTH planted bugs was therefore assigned to one of
+    them and scored recall 0.5 - while emitting that same prediction TWICE
+    scored 1.0, because the second copy was assigned to the other key finding. A
+    run was rewarded for repeating itself, and recall read better than the run.
+
+    Recall is a COVERAGE now: a key finding counts when at least one prediction
+    names it. Saying it once and saying it twice are the same coverage, and one
+    sentence that names two defects has found two defects.
+    """
+    broad = Predicted("src/app.py", 1, 4, Severity.HIGH, "alpha and beta are both wrong")
+    once = match_findings([broad], _key_two)
+    twice = match_findings([broad, broad], _key_two)
+
+    assert once.recall == 1.0, "one prediction naming both defects must catch both"
+    assert twice.recall == once.recall, "repeating a prediction must not change recall"
+    assert (once.covered, twice.covered) == (2, 2)
+    assert (once.tp, once.redundant) == (1, 0)
+    assert (twice.tp, twice.redundant) == (1, 1), "the copy is one claim repeated"
+
+
+def test_a_repeated_true_finding_cannot_dilute_a_false_one(_key_two: Key) -> None:
+    """Precision counts DISTINCT true claims, so restating a correct finding
+    cannot wash out a wrong one. Ten copies of a true finding beside one false
+    finding is still one true claim and one false claim.
+
+    Redundant repeats stay out of `fp_severities`: a run is not "confidently
+    wrong" for saying a correct thing twice.
+    """
+    true = Predicted("src/app.py", 1, 2, Severity.HIGH, "alpha is wrong")
+    false = Predicted("other.py", 90, 90, Severity.CRITICAL, "invented")
+    once = match_findings([true, false], _key_two)
+    spammed = match_findings([true] * 10 + [false], _key_two)
+
+    assert once.precision == 0.5
+    assert spammed.precision == once.precision
+    assert (spammed.tp, spammed.fp, spammed.redundant) == (1, 1, 9)
+    assert spammed.fp_severities == ["critical"]
+
+
+def test_two_different_true_claims_are_not_confused_with_a_repeat(_key_two: Key) -> None:
+    """Redundancy is "the same claim again", not "true again". Two predictions
+    naming DIFFERENT key findings are two claims; a broad one and a narrow one
+    name different SETS and are two claims as well. Collapsing them would
+    understate precision for a run that reported precisely.
+    """
+    alpha = Predicted("src/app.py", 1, 2, Severity.HIGH, "alpha is wrong")
+    beta = Predicted("src/app.py", 3, 4, Severity.HIGH, "beta is wrong")
+    both = Predicted("src/app.py", 1, 4, Severity.HIGH, "alpha and beta are both wrong")
+
+    m = match_findings([alpha, beta], _key_two)
+    assert (m.tp, m.redundant, m.covered) == (2, 0, 2)
+
+    m2 = match_findings([both, alpha], _key_two)
+    assert (m2.tp, m2.redundant) == (2, 0), "a narrower claim is not a repeat of a broader one"
+
+
+def test_crediting_does_not_depend_on_the_order_findings_were_listed(_key_two: Key) -> None:
+    """Coverage and set-equality are both order-free, so no reordering of a
+    worker's output can move any number. Greedy assignment used to make recall
+    depend on the sequence a model happened to emit.
+    """
+    preds = [
+        Predicted("src/app.py", 1, 4, Severity.HIGH, "alpha and beta are both wrong"),
+        Predicted("src/app.py", 1, 2, Severity.HIGH, "alpha is wrong"),
+        Predicted("nope.py", 7, 7, Severity.LOW, "invented"),
+    ]
+    first = match_findings(preds, _key_two)
+    for perm in ([preds[1], preds[0], preds[2]], [preds[2], preds[1], preds[0]]):
+        m = match_findings(perm, _key_two)
+        assert (m.covered, m.tp, m.fp, m.fn, m.redundant) == (
+            first.covered,
+            first.tp,
+            first.fp,
+            first.fn,
+            first.redundant,
+        ), [p.description for p in perm]
 
 
 def test_a_prediction_matching_nothing_is_still_a_false_positive() -> None:
@@ -1715,22 +1794,35 @@ def test_a_prediction_matching_nothing_is_still_a_false_positive() -> None:
     key = Key.model_validate(key_dict())
     wrong = Predicted("src/app.py", 10, 11, Severity.CRITICAL, "unrelated - no keyword")
     m = match_findings([wrong], key)
-    assert (m.tp, m.fp, m.redundant) == (0, 1, 0)
+    assert (m.covered, m.tp, m.fp, m.redundant) == (0, 0, 1, 0)
     assert m.fp_severities == ["critical"]
 
 
-def test_credit_recursion_is_bounded_by_key_findings_not_predictions() -> None:
-    """A worker's output size is not under our control; the stack must not be.
-
-    Augmenting recursion descends once per key finding it has not yet tried, so
-    depth is bounded by len(key.findings) however many predictions arrive. Ten
-    thousand mutually-matching predictions would overflow a per-prediction
-    recursion at CPython's default limit of 1000.
+def test_matching_is_flat_and_survives_a_key_larger_than_the_recursion_limit() -> None:
+    """The previous augmenting-path search recursed once per key finding, and
+    the panel raised `RecursionError` on a key of ~1100 - a limit nothing
+    validated, since `Key.findings` has no maximum length. Coverage needs no
+    search at all; this pins that it stays that way.
     """
-    key = Key.model_validate(key_dict())
-    preds = [Predicted("src/app.py", 10, 11, Severity.LOW, "null") for _ in range(10_000)]
-    m = match_findings(preds, key)
-    assert (m.tp, m.fp, m.redundant) == (1, 0, 9_999)
+    n = 2000
+    key = Key.model_validate(
+        key_dict(
+            line_tolerance=0,
+            findings=[
+                {
+                    "id": f"k{i}",
+                    "path": "src/app.py",
+                    "line_start": i + 1,
+                    "line_end": i + 1,
+                    "severity": "low",
+                    "must_mention": ["null"],
+                }
+                for i in range(n)
+            ],
+        )
+    )
+    m = match_findings([Predicted("src/app.py", 1, n, Severity.LOW, "null")] * 3, key)
+    assert (m.covered, m.tp, m.redundant, m.recall) == (n, 1, 2, 1.0)
 
 
 def _cs(**over: Any) -> CellScore:
@@ -1747,6 +1839,8 @@ def _cs(**over: Any) -> CellScore:
         verdict_basis="enforced",
         precision=None,
         recall=None,
+        covered=0,
+        fp_severities=[],
         tp=0,
         fp=0,
         fn=0,
@@ -1789,7 +1883,9 @@ def test_pooled_and_per_cell_rates_are_both_reported_and_named() -> None:
     under its own name, so `per_arm[*]["recall"]` cannot be quoted as a number
     without choosing which question it answers.
     """
-    agg = aggregate([_cs(tp=1, fn=0, recall=1.0), _cs(tp=1, fn=8, recall=round(1 / 9, 4))])
+    agg = aggregate(
+        [_cs(covered=1, fn=0, recall=1.0), _cs(covered=1, fn=8, recall=round(1 / 9, 4))]
+    )
     assert agg["single"]["recall"]["micro"] == 0.2
     assert agg["single"]["recall"]["macro"] == 0.5555
     assert agg["single"]["recall"]["cells_counted"] == 2
@@ -1846,10 +1942,27 @@ def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
     other = aggregate(spread)["single"]["control"]
     assert other["fpr"] == 1.0 and other["mean_false_positives"] == 1.0
 
-    # and an arm with no controls at all says so rather than reporting 0.0
-    assert (
-        aggregate([_cs(category="planted", tp=1, recall=1.0)])["single"]["control"]["fpr"] is None
-    )
+    # `severe_cells` comes from the FALSE-POSITIVE severities, not from
+    # `confident_wrong`, which also fires on a wrong ACCEPT verdict and so
+    # answers a different question than "invented a severe defect in clean code"
+    sev = aggregate(
+        [
+            _cs(category="control", fp=1, fp_severities=["critical"], precision=0.0),
+            _cs(category="control", fp=1, fp_severities=["high"], precision=0.0),
+            _cs(category="control", fp=1, fp_severities=["low"], precision=0.0),
+            # confidently wrong for a VERDICT reason, with no false positive at all:
+            # counted by `confident_wrong` and NOT by `severe_cells`, which is the
+            # whole difference between the two
+            _cs(category="control", fp=0, confident_wrong=True),
+        ]
+    )["single"]["control"]
+    assert sev["severe_cells"] == 2
+
+    # an arm with no controls says so rather than reporting a reassuring 0.0,
+    # and keeps the same SHAPE so a report cannot KeyError on it
+    empty = aggregate([_cs(category="planted", covered=1, recall=1.0)])["single"]["control"]
+    assert empty["fpr"] is None and empty["severe_cells"] is None
+    assert set(empty) == set(sev)
 
 
 def test_rates_are_stratified_by_category() -> None:
@@ -1861,8 +1974,8 @@ def test_rates_are_stratified_by_category() -> None:
     """
     agg = aggregate(
         [
-            _cs(category="planted", tp=2, fn=0, recall=1.0),
-            _cs(category="revert", tp=0, fn=2, recall=0.0),
+            _cs(category="planted", covered=2, fn=0, recall=1.0),
+            _cs(category="revert", covered=0, fn=2, recall=0.0),
         ]
     )["single"]
     assert agg["recall"]["micro"] == 0.5
@@ -1918,23 +2031,95 @@ def test_only_a_literal_false_opts_a_task_out_of_scoring(tmp_path: Path) -> None
     def write(name: str, flag: object) -> Path:
         # named, not derived from `flag`: `str(False)` and `str("false")` differ
         # only in case, and this repo is developed on a case-insensitive
-        # filesystem where the two would collide into one directory
+        # filesystem where the two would collide into one directory.
+        # `flag is ...` omits the key entirely - the default-True case.
         d = tmp_path / name / "t_01"
         d.mkdir(parents=True)
-        (d / "task.json").write_text(
-            json.dumps(
-                {
-                    "task_id": "t_01",
-                    "question": "q",
-                    "category": "control",
-                    "snapshot": "s",
-                    "scored": flag,
-                }
-            )
-        )
+        body: dict[str, Any] = {
+            "task_id": "t_01",
+            "question": "q",
+            "category": "control",
+            "snapshot": "s",
+        }
+        if flag is not ...:
+            body["scored"] = flag
+        (d / "task.json").write_text(json.dumps(body))
         return d / "task.json"
 
     assert runner_reads(write("bool_false", False)) is False
     assert task_is_scored(tmp_path / "bool_false", "t_01") is False
     assert runner_reads(write("str_false", "false")) is True
     assert task_is_scored(tmp_path / "str_false", "t_01") is True
+    # and the positive direction, so "both readers say False to everything"
+    # cannot satisfy the agreement test above either
+    assert runner_reads(write("bool_true", True)) is True
+    assert task_is_scored(tmp_path / "bool_true", "t_01") is True
+    assert runner_reads(write("omitted", ...)) is True
+    assert task_is_scored(tmp_path / "omitted", "t_01") is True
+
+
+def test_a_key_anywhere_under_the_task_is_refused(tmp_path: Path) -> None:
+    """The refusal checked one exact path - `<task>/key.json` - which is the file
+    that had actually been there and nothing else. `files/key.json`,
+    `snapshot/key.json` (the worker's own cwd), a nested copy and `KEY.json` on a
+    case-sensitive filesystem all passed a check whose docstring claimed the leak
+    was structurally impossible to reintroduce (panel, 2026-08-30).
+    """
+    w = world(tmp_path)
+    write_key(w)
+    assert load_key(w["corpus"], "t_01").task_id == "t_01"
+
+    task_dir = w["corpus"] / "t_01"
+    for rel in ("key.json", "files/key.json", "snapshot/key.json", "a/b/key.json", "KEY.JSON"):
+        planted = task_dir / rel
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("{}")
+        with pytest.raises(GateRefused, match="inside the corpus"):
+            load_key(w["corpus"], "t_01")
+        planted.unlink()
+
+    assert load_key(w["corpus"], "t_01").task_id == "t_01"
+
+
+def test_a_control_key_may_not_plant_findings() -> None:
+    """`_control_block` reports a false-positive rate on the premise that a
+    control is clean, and nothing enforced it. A control key carrying findings
+    turned matching predictions into true positives while the same block still
+    called the result a clean-control FPR - understated, with no warning.
+    """
+    with pytest.raises(ValidationError, match="control"):
+        Key.model_validate(key_dict(category="control"))
+    assert Key.model_validate(key_dict(category="control", findings=[])).findings == []
+    # every other category may plant
+    assert Key.model_validate(key_dict(category="planted")).findings
+
+
+def test_comparison_is_blocked_when_arms_scored_different_cells() -> None:
+    """Cells are excluded PER ARM - contamination, budget, missing, incomplete,
+    no_scan, validator - so two arms' pooled rates can be computed over different
+    task populations with nothing saying so. An arm that lost its hardest cells
+    reads better for having lost them, and a worker can even provoke its own
+    exclusion by emitting a scan marker (panel, 2026-08-30).
+    """
+    equal = [
+        _cs(arm=a, task_id=t, repeat_index=0, included=True)
+        for a in ("indep_verify", "indep_verify_critique")
+        for t in ("t1", "t2")
+    ]
+    assert _comparison_block(equal)["blocked"] is False
+
+    unequal = [s for s in equal if not (s.arm == "indep_verify_critique" and s.task_id == "t2")]
+    unequal.append(
+        _cs(
+            arm="indep_verify_critique",
+            task_id="t2",
+            repeat_index=0,
+            included=False,
+            exclusion="contaminated",
+        )
+    )
+    block = _comparison_block(unequal)
+    assert block["blocked"] is True
+    assert "different set of (task, repeat)" in block["reason"]
+    assert block["common_support"] == ["t1#0"]
+    assert block["per_arm"]["indep_verify"]["outside_common_support"] == ["t2#0"]

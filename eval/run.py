@@ -90,7 +90,7 @@ from eris.sanitize import (
     sanitized_copy,
     tree_sha256,
 )
-from eris.scan import PatternSet, build_patterns, scan_and_record
+from eris.scan import PatternSet, build_patterns, fold, scan_and_record
 from eris.schemas import (
     Arm,
     ArmStatus,
@@ -118,6 +118,7 @@ from eris.writer import (
     WriterLocked,
 )
 from eval.make_control_snapshot import snapshot_matches_files
+from eval.score import CANARY_PREFIX, find_leaked_keys, key_path_for
 
 DEFAULT_POLICY = "policies/default.yaml"
 DEFAULT_PROMPTS = "eval/prompts"
@@ -217,6 +218,18 @@ def _build_call(
     snapshot = Path(args.snapshot).resolve()
     if not snapshot.is_dir():
         raise LaunchRefused(f"snapshot {snapshot} is not a directory")
+    # `invoke` spawns a worker without going through `load_task`, so the
+    # stale-snapshot refusal has to be repeated on this path or it is not a
+    # refusal at all - it is a refusal on the paths that happened to be checked
+    # (panel, 2026-08-30). `snapshot_matches_files` returns None for any
+    # directory that is not a `files/`-backed corpus task, so an ad-hoc snapshot
+    # passed to `invoke` is unaffected.
+    if snapshot_matches_files(snapshot.parent) is False:
+        raise LaunchRefused(
+            f"snapshot {snapshot} does not match the committed {snapshot.parent / 'files'} it "
+            f"was built from - it is stale. Rebuild: "
+            f"`python eval/make_control_snapshot.py {snapshot.parent}`"
+        )
     return WorkerCall(
         worker_id=args.worker,
         policy=worker,
@@ -687,6 +700,29 @@ def load_task(task_file: Path) -> tuple[TaskSpec, Path]:
     campaign and every single-cell run passes, and BEFORE any worker is spawned.
     """
     task = TaskSpec.model_validate_json(Path(task_file).read_bytes())
+    task_dir = Path(task_file).resolve().parent
+    if task.task_id != task_dir.name:
+        # The key is addressed by DIRECTORY here and by `task_id` in the scorer.
+        # When they disagree, a run is scanned against one key and graded against
+        # another - silently, since both files exist. Refusing the mismatch is
+        # cheaper than teaching two components to disagree carefully.
+        raise LaunchRefused(
+            f"{task_file} declares task_id {task.task_id!r} but lives in directory "
+            f"{task_dir.name!r}. The answer key is addressed by directory when scanning and "
+            f"by task_id when scoring, so a mismatch scans against one key and grades "
+            f"against another."
+        )
+    leaked = find_leaked_keys(task_dir)
+    if leaked:
+        # BEFORE spawn, not at scoring time. The scorer's refusal fires after the
+        # cells have run and the money is spent, and deleting the stray file then
+        # produces metrics with no record that it was present while workers ran
+        # (panel, 2026-08-30).
+        raise LaunchRefused(
+            f"{', '.join(str(p) for p in leaked)} is inside the corpus task, readable by the "
+            f"worker being graded (its cwd is {task_dir.name}/snapshot). Answer keys belong "
+            f"outside the corpus; move it before running."
+        )
     snapshot = Path(task.snapshot)
     if not snapshot.is_absolute():
         snapshot = Path(task_file).resolve().parent / snapshot
@@ -696,11 +732,16 @@ def load_task(task_file: Path) -> tuple[TaskSpec, Path]:
             f"snapshot {snapshot} is not a directory. Snapshots are generated, not committed: "
             f"build them with `python eval/make_control_snapshot.py <corpus> --all`"
         )
-    if snapshot_matches_files(snapshot.parent) is False:
+    # The TASK directory, not `snapshot.parent`: `task.snapshot` may name a path
+    # outside the task dir, and `snapshot.resolve()` follows a symlink, so
+    # `snapshot.parent` could be some other tree with no `files/` at all - where
+    # the check returns None and refuses nothing. That was the exact silent
+    # old-tree case A7 claimed to close (panel, 2026-08-30).
+    if snapshot_matches_files(Path(task_file).resolve().parent) is False:
         raise LaunchRefused(
             f"snapshot {snapshot} does not match the committed {snapshot.parent / 'files'} it was "
             f"built from - it is stale, and a run would measure a tree that is not in the "
-            f"repository. Rebuild: `python eval/make_control_snapshot.py {snapshot.parent} `"
+            f"repository. Rebuild: `python eval/make_control_snapshot.py {snapshot.parent}`"
         )
     return task, snapshot
 
@@ -719,7 +760,8 @@ def scan_patterns_for(
     worker's environment.
     """
     task_dir = Path(task_file).resolve().parent
-    key_path = task_dir.parent.parent / "keys" / f"{task_dir.name}.json"
+    scored = task_is_scored(task_file)
+    key_path = key_path_for(task_dir)
     fix_hunks: list[str] = []
     extra: list[str] = []
     source_repo: str | None = None
@@ -730,7 +772,17 @@ def scan_patterns_for(
         extra = [str(x) for x in scan.get("extra_strings", [])]
         src = key.get("source_repo") if isinstance(key, dict) else None
         source_repo = str(src) if src else None
-    return build_patterns(
+    elif scored:
+        # Silence here used to mean: run the scored cell with NO key-derived
+        # patterns and no canary, spend the money, and produce quality numbers
+        # whose contamination check could not fire. A plumbing task has no key
+        # and that is correct; a scored one without a key is a broken corpus.
+        raise LaunchRefused(
+            f"{task_file} is a scored task but its answer key {key_path} does not exist. "
+            f"Without it the contamination scan has no key-derived patterns and no canary, "
+            f"so a key read could not be detected and the metrics would be unfalsifiable."
+        )
+    patterns = build_patterns(
         snapshot_root=snapshot,
         home=home,
         source_repo=source_repo,
@@ -739,6 +791,23 @@ def scan_patterns_for(
         policy_patterns=list(policy.scan.patterns_from_policy),
         known_texts=[str(snapshot), str(run_dir), str(run_dir.parent)],
     )
+    if scored:
+        # `build_patterns` DROPS candidates that are too short, already in
+        # `known_texts`, or present in the pre-fix tree - and it drops them
+        # quietly, as counts. A canary that also appears in the snapshot (copied
+        # into `files/`, say) is therefore removed from the pattern set, and the
+        # detector the key promises simply does not exist for that run. Checked
+        # against the surviving patterns, not against the key file, because the
+        # file is not what does the detecting.
+        wanted = {fold(s) for s in extra if s.startswith(CANARY_PREFIX)}
+        if not wanted or not any(p.folded in wanted for p in patterns.patterns):
+            raise LaunchRefused(
+                f"no {CANARY_PREFIX}* canary from {key_path} survived into the scan patterns "
+                f"(dropped: {dict(patterns.dropped_reasons)}). A canary that is dropped as "
+                f"too short, already known, or present in the snapshot detects nothing, so a "
+                f"key read would go unrecorded while the run reported `contaminated: false`."
+            )
+    return patterns
 
 
 def _stream(err: IO[str], run_id: str) -> Callable[[Event], None]:

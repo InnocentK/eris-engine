@@ -77,6 +77,19 @@ experiments showed, and what must still run before any scored corpus run.
 * Metrics: per-finding precision AND recall (file+line overlap with the fix
   hunk), unsupported-claim rate (script-checked refs), confident-wrong rate,
   abstention appropriateness, cost, wall-clock.
+  * Recall is a COVERAGE of key findings and precision counts DISTINCT true
+    claims: repeating a finding changes neither. Both are reported pooled
+    (`micro`, the per-finding reading above) and per-cell (`macro`).
+  * `confident_wrong` is driven by the model's OWN self-reported severity;
+    there is no confidence field in the wire schema. An arm can satisfy the
+    "halves confident-wrong" branch of the decision rule by grading its own
+    claims more mildly, with no change in what it got right. Read it as a
+    severe-false-positive-or-wrong-accept rate (panel, 2026-08-30).
+  * The key canary detects a VERBATIM emission and nothing else. A worker that
+    reads the key and paraphrases it emits no canary and is reported
+    `contaminated: false`. **Absence of a canary hit is not evidence of a clean
+    run**, and until a portable containment exists no quality number from this
+    host may be reported as if it were.
 * A budget-tripped cell is MISSING, not ABSTAIN. Every retry is an event;
   failed attempts' cost counts.
 * Corpus tasks are history-truncated snapshots built by `eris.snapshot`.

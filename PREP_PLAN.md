@@ -41,9 +41,15 @@ Four tasks, enough for a real multi-cell campaign without pretending to be the
 | `plan-migration` | plan | a migration plan with 3 known pitfalls in `key.findings` |
 | `plan-rollout` | plan | a rollout plan with 2 known pitfalls and 2 `distractors` |
 
-Each is `task.json` + `key.json` + `files/` + a GENERATED `snapshot/`
-(`eval/make_control_snapshot.py`). **No code changes** - `discover_tasks`
-already picks up any `scored: true` task, so this is a pure data addition.
+Each is `task.json` + `files/` + a GENERATED `snapshot/`
+(`eval/make_control_snapshot.py --all`). The answer key is **NOT** in the task
+directory: it goes in `eval/keys/<task_id>.json`, outside the corpus, because a
+worker's cwd is `<task>/snapshot` and E1 proved claude/codex/grok read the
+snapshot's parent. `load_task` refuses to run a task with any `key.json` under
+it and `load_key` refuses to score one, so authoring it in place fails closed
+rather than silently leaking. Each key needs a per-task `ERIS-KEY-CANARY-*`
+token in `scan.extra_strings`, and a scored run is refused unless that token
+survives into the scan pattern set.
 
 ## What this can and cannot conclude
 

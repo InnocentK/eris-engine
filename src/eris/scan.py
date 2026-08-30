@@ -39,7 +39,18 @@ from eris.writer import RunWriter
 MIN_PATTERN_CHARS = 12
 # Fixed markers: exempt from the length floor (short by construction), still
 # subject to the pre-fix-tree and known-texts rules.
-BUILTIN_MARKERS: tuple[str, ...] = ("athena-assistant", "eval/corpus/", "key.json")
+# `eval/keys/` is here because the answer key MOVED there (a key beside
+# `task.json` is readable by the worker being graded - E1). Moving it silently
+# took the key path out of marker coverage: a worker citing
+# `eval/keys/<task>.json` matched neither `eval/corpus/` nor `key.json` and was
+# not flagged, so the relocation traded a leak for a blind spot until this row
+# was added (panel, 2026-08-30).
+BUILTIN_MARKERS: tuple[str, ...] = (
+    "athena-assistant",
+    "eval/corpus/",
+    "eval/keys/",
+    "key.json",
+)
 VENDOR_MEMORY_RELPATHS: tuple[str, ...] = (
     ".claude/projects",
     ".codex/sessions",

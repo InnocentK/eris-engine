@@ -18,8 +18,10 @@ its in-process permission check, policy, not the kernel. (A10b's earlier
 A14.)
 
 **Consequence.** On this host a worker can read the Athena working tree
-(which contains every fix the corpus hides), the answer keys under
-`eval/corpus/`, and the vendors' memory/session stores. Any defect-detection
+(which contains every fix the corpus hides), the answer keys - which now live
+under `eval/keys/`, outside the corpus, which REDUCES exposure but does not
+remove it on a host where a worker can read the working tree at all - and the
+vendors' memory/session stores. Any defect-detection
 or ABSTAIN result obtained before containment is not evidence.
 
 **Options** (security critic, 2026-08-22; none is built in M2a):
@@ -321,7 +323,9 @@ cache entry. Patterns are derived at RUN TIME - the source repository's
 path (`key.json.source_repo`) and `Path.home()`-rooted vendor memory stores
 (`~/.claude/projects`, `~/.codex/sessions`,
 `~/.gemini/antigravity-cli/brain`), the fixed markers `athena-assistant`,
-`eval/corpus/`, `key.json`, the key's fix-hunk lines and extra strings, and
+`eval/corpus/`, `eval/keys/`, `key.json`, the key's fix-hunk lines and its
+extra strings (which must include a per-task `ERIS-KEY-CANARY-*` token; a
+scored run is REFUSED unless one survives into the pattern set), and
 policy strings - whitespace-folded and sha256-named. The ledger carries
 pattern hashes and counts ONLY (`ScanResult`); no fix-hunk text exists in
 this repository or in any run. A hit marks the run `contaminated` (exit 6;

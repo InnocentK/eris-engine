@@ -79,7 +79,10 @@ runs/<run_id>/                       one cell (task x repeat x arm) or one `invo
 runs/<campaign_id>/                  campaign ledger + one cell dir per cell
 runs/STOP, runs/<campaign_id>/STOP   stop files
 cache/entries|keys|blobs             write-once call cache (never under runs/)
-eval/corpus/<task>/{task.json,key.json,snapshot/}
+eval/corpus/<task>/{task.json,files/,snapshot/}   snapshot/ is GENERATED, gitignored
+eval/keys/<task_id>.json             answer keys: OUTSIDE the corpus (E1: a worker
+                                     reads its snapshot's parent, so a key beside
+                                     task.json is readable by the graded model)
 policies/default.yaml   committed
 policies/pins.yaml      machine-specific, gitignored
 ```

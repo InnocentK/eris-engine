@@ -26,18 +26,26 @@ from eval.run import (
     EXIT_SIGINT,
     EXIT_STOP,
     discover_tasks,
+    load_task,
     main,
+    scan_patterns_for,
     sweep_scratch,
 )
+from eval.score import key_path_for
 
-from eris.launch import resolve_user
+from eris.launch import LaunchRefused, resolve_user
 from eris.ledger import LedgerView
+from eris.policy import load_policy
+from eris.scan import fold
 from eris.schemas import Stage
 from tests.conftest import FakeProcess
 from tests.test_stages import GOOD_PROPOSAL
 
 PROMPTS = Path(__file__).resolve().parents[1] / "eval" / "prompts"
 FIX_HUNK = "    if response.text is None:  # planted null guard"
+# Per-task, and long enough to survive `build_patterns`: a scored run is
+# refused unless a canary actually reaches the pattern set.
+KEY_CANARY = "ERIS-KEY-CANARY-t01-4b9e6d1a"
 ADJ = {
     "verdict": "REVISE",
     "rulings": [],
@@ -157,7 +165,7 @@ def world(
             {
                 "task_id": "t_01",
                 "question": "Is the null guard defensible?",
-                "category": "control",
+                "category": "plan",
                 "snapshot": "snapshot",
                 "battery": [],
                 "excerpts": [{"path": "src/app.py", "line_start": 1, "line_end": 3}],
@@ -176,12 +184,18 @@ def world(
             {
                 "key_version": 1,
                 "task_id": "t_01",
-                "category": "control",
+                "category": "plan",
                 "expected_verdict": ["ACCEPT"],
                 "line_tolerance": 2,
                 "findings": [],
                 "distractors": [],
-                "scan": {"fix_hunk_lines": [FIX_HUNK], "extra_strings": []},
+                "scan": {
+                    "fix_hunk_lines": [FIX_HUNK],
+                    # a scored task without a surviving canary is refused
+                    # before spawn: the contamination scan would have no
+                    # way to detect a key read
+                    "extra_strings": [KEY_CANARY],
+                },
             }
         )
     )
@@ -1718,3 +1732,55 @@ def test_the_whole_report_is_guarded_not_just_its_last_step(tmp_path: Path) -> N
     run_module._print_scratch_cleanup_failure(
         io.StringIO(), "r6", _UnprintablePath(tmp_path / "s"), "EBUSY"
     )
+
+
+def test_a_scored_run_is_refused_unless_a_canary_survives_into_the_patterns(
+    tmp_path: Path,
+) -> None:
+    """The canary is a detector only if it reaches the pattern set.
+
+    `build_patterns` drops candidates that are too short, already in
+    `known_texts`, or present in the pre-fix tree - quietly, as counts. A canary
+    that also appears in the snapshot (copied into `files/`, say) is therefore
+    removed, and the detection the key promises does not exist for that run,
+    while the run still reports `contaminated: false` (panel, 2026-08-30).
+    Checked against the SURVIVING patterns, because the key file is not what
+    does the detecting.
+    """
+    w = world(tmp_path)
+    loaded = load_policy(w["policy"])
+    args = (w["task"], w["snapshot"], tmp_path / "home", tmp_path / "run", loaded.policy)
+    assert any(p.folded == fold(KEY_CANARY) for p in scan_patterns_for(*args).patterns)
+
+    # the same canary, now also sitting in the snapshot the worker starts from
+    (w["snapshot"] / "leaked.txt").write_text(f"{KEY_CANARY}\n")
+    with pytest.raises(LaunchRefused, match="survived into the scan patterns"):
+        scan_patterns_for(*args)
+    (w["snapshot"] / "leaked.txt").unlink()
+
+    # a scored task with no key at all is refused too: patterns would be empty
+    # and the money would be spent on a cell whose scan could not fire
+    key_file = key_path_for(w["corpus"] / "t_01")
+    body = key_file.read_text()
+    key_file.unlink()
+    with pytest.raises(LaunchRefused, match="answer key"):
+        scan_patterns_for(*args)
+    key_file.write_text(body)
+    assert scan_patterns_for(*args).count > 0
+
+
+def test_a_leaked_key_stops_the_run_before_any_worker_spawns(tmp_path: Path) -> None:
+    """The scorer's refusal fires after the cells have run and the money is
+    spent, and deleting the stray file then produces metrics with no record that
+    it was present while workers ran. `load_task` is on every campaign and
+    single-run path, before spawn.
+    """
+    w = world(tmp_path)
+    assert load_task(w["task"])[0].task_id == "t_01"
+
+    planted = w["corpus"] / "t_01" / "snapshot" / "key.json"
+    planted.write_text("{}")
+    with pytest.raises(LaunchRefused, match="readable by the worker"):
+        load_task(w["task"])
+    planted.unlink()
+    assert load_task(w["task"])[0].task_id == "t_01"
