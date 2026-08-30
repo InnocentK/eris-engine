@@ -1,0 +1,17 @@
+{
+  "key_version": 1,
+  "task_id": "control-guarded",
+  "category": "control",
+  "expected_verdict": [
+    "ACCEPT"
+  ],
+  "line_tolerance": 3,
+  "findings": [],
+  "distractors": [],
+  "scan": {
+    "fix_hunk_lines": [],
+    "extra_strings": [
+      "ERIS-KEY-CANARY-control-guarded-461172e396ebda64"
+    ]
+  }
+}

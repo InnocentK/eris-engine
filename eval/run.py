@@ -117,8 +117,18 @@ from eris.writer import (
     WriterError,
     WriterLocked,
 )
-from eval.make_control_snapshot import snapshot_matches_files
-from eval.score import (
+
+# `eval/run.py` is BOTH a module (the tests import it) and a script - the
+# documented form is `python eval/run.py run|campaign ...`. Run as a script,
+# sys.path[0] is `eval/`, not the repository root, so the `eval.*` imports below
+# cannot resolve and the CLI dies at import time with ModuleNotFoundError. The
+# tests import it as a module, so nothing caught that until a campaign was run
+# by hand.
+if __package__ in (None, ""):  # pragma: no cover - only on the script path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from eval.make_control_snapshot import snapshot_matches_files  # noqa: E402
+from eval.score import (  # noqa: E402
     CANARY_PREFIX,
     find_key_content_in_task,
     find_leaked_keys,

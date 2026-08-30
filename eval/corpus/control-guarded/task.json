@@ -1,0 +1,15 @@
+{
+  "task_id": "control-guarded",
+  "question": "Is the `Window` ring buffer in `window.py` defensible as it stands? State whether you find a defect, and support every claim with evidence from the repository. If there is no defect, say so.",
+  "category": "control",
+  "snapshot": "snapshot",
+  "scored": true,
+  "battery": [],
+  "excerpts": [
+    {
+      "path": "window.py",
+      "line_start": 1,
+      "line_end": 52
+    }
+  ]
+}

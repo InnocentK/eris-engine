@@ -7,6 +7,8 @@ runner, so it spawns nothing."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -214,3 +216,31 @@ def test_a_symlink_in_the_files_tree_is_refused(tmp_path: Path) -> None:
     (task / "files" / "pkg" / "x.py").symlink_to(secret)
     with pytest.raises(ValueError, match="contains symlink"):
         build_snapshot(task, runner=lambda argv, cwd: None)
+
+
+@pytest.mark.real_subprocess
+def test_the_documented_cli_entry_points_run_as_scripts() -> None:
+    """`eval/run.py` and `eval/score.py` are BOTH modules and scripts.
+
+    `docs/EVAL-PLAN.md` documents `python eval/run.py run|campaign ...`, and the
+    test suite imports them as modules - so when `eval/run.py` gained an
+    `eval.*` import, the module path kept working and the SCRIPT path died at
+    import time with ModuleNotFoundError. Nothing caught it until a campaign was
+    run by hand. Run as a script, `sys.path[0]` is `eval/`, not the repository
+    root.
+
+    `--help` is enough: the failure was at import, before any argument was read.
+    Marked `real_subprocess`, which permits only this interpreter - the point of
+    the test is that the SCRIPT path resolves its imports, and nothing but a
+    real interpreter can show that.
+    """
+    for script in ("eval/run.py", "eval/score.py"):
+        proc = subprocess.run(
+            [sys.executable, script, "--help"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"{script} --help failed:\n{proc.stderr[-800:]}"
+        assert "usage:" in proc.stdout.lower(), f"{script} printed no usage"

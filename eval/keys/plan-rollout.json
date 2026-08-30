@@ -1,0 +1,49 @@
+{
+  "key_version": 1,
+  "task_id": "plan-rollout",
+  "category": "plan",
+  "expected_verdict": [
+    "REVISE"
+  ],
+  "line_tolerance": 3,
+  "findings": [
+    {
+      "id": "r1",
+      "path": "ROLLOUT.md",
+      "line_start": 14,
+      "line_end": 22,
+      "severity": "high",
+      "must_mention": [
+        "self-report"
+      ]
+    },
+    {
+      "id": "r2",
+      "path": "ROLLOUT.md",
+      "line_start": 32,
+      "line_end": 36,
+      "severity": "medium",
+      "must_mention": [
+        "allowlist"
+      ]
+    }
+  ],
+  "distractors": [
+    {
+      "path": "ROLLOUT.md",
+      "line_start": 40,
+      "line_end": 42
+    },
+    {
+      "path": "ROLLOUT.md",
+      "line_start": 43,
+      "line_end": 45
+    }
+  ],
+  "scan": {
+    "fix_hunk_lines": [],
+    "extra_strings": [
+      "ERIS-KEY-CANARY-plan-rollout-1941886620333fad"
+    ]
+  }
+}

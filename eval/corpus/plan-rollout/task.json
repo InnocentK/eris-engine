@@ -1,0 +1,15 @@
+{
+  "task_id": "plan-rollout",
+  "question": "Review the rollout plan in `ROLLOUT.md`. Identify anything that would go wrong if the plan were carried out exactly as written. Support every claim with evidence from the repository.",
+  "category": "plan",
+  "snapshot": "snapshot",
+  "scored": true,
+  "battery": [],
+  "excerpts": [
+    {
+      "path": "ROLLOUT.md",
+      "line_start": 1,
+      "line_end": 45
+    }
+  ]
+}
