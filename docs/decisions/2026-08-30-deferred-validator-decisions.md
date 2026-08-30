@@ -77,6 +77,24 @@ computed rather than asserted:
 | reachable | those two plus `_adjudication_shape_findings`, `_check_refs`, `_contest_exists`, `_err` |
 | **unreachable** | `validate_adjudication`, `validate_critique`, `validate_origin`, `_record_id`, `has_errors` |
 
+### What the check actually proves
+
+A static reachability claim is only as good as its assumptions, so the gate
+CHECKS them and fails if any stops holding, rather than relying on them
+silently:
+
+1. every definition is a module-level `def` - an `async def` or a class method
+   would be invisible to the scan and its reachability never examined;
+2. module-level code in `validate.py` is a caller too, because it runs at
+   import - anything it references is an entry point;
+3. the module is never bound as an object (`import eris.validate`,
+   `from eris import validate`, `importlib`) - that binding is what would make
+   `getattr(mod, <computed>)` possible and defeat the analysis. A `getattr`
+   with a matching string literal is counted as a use.
+
+Each is mutation-verified. Tests are excluded from the entry points
+deliberately: they are not a runtime path.
+
 `has_errors(findings) -> bool` is the error-severity predicate; `eval/score.py`
 reimplements it inline as `f.get("severity") == "error"` because it reads
 findings from a ledger payload, not from `Finding` objects. `_record_id` is a
