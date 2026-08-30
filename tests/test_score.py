@@ -2649,18 +2649,41 @@ def test_a_wide_prediction_is_bounded_only_where_the_key_asks_for_it() -> None:
     assert section.covered == 1, "quoting a whole section is still a located claim"
 
 
-def test_the_shipped_plan_keys_bound_the_span_and_the_others_do_not() -> None:
-    """The corpus on disk, not a fixture: the bound is set exactly where a sweep
-    would otherwise be free, and nowhere else."""
+def test_a_key_that_bounds_the_span_bounds_it_coherently() -> None:
+    """Where a key sets `max_prediction_span`, the value has to be usable.
+
+    Deliberately NOT "every plan key must set it and no other key may". That
+    rule was the category-wide cutoff over again, moved out of the matcher and
+    into a test: it would forbid a code key from bounding a sweep it has good
+    reason to bound, and force one on a plan key whose findings are far enough
+    apart not to need it. The field belongs to the key's author; what can be
+    checked mechanically is whether the number they chose does the job.
+
+    Too small and a legitimate whole-section citation is scored as a false
+    positive AND a miss. Too large - as wide as the document - and it forbids
+    nothing. Both bounds are computed from the key and the file it points at,
+    so this cannot drift away from the corpus.
+    """
     corpus = Path(__file__).resolve().parent.parent / "eval" / "corpus"
+    checked = 0
     for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
         spec = json.loads((task_dir / "task.json").read_text())
         if spec.get("scored", True) is False:
             continue
         key = load_key(corpus, task_dir.name)
-        if key.category.value == "plan":
-            assert key.max_prediction_span, f"{task_dir.name}: a plan key must bound the span"
-        else:
-            assert key.max_prediction_span is None, (
-                f"{task_dir.name}: only a key that needs the bound should carry it"
+        if key.max_prediction_span is None:
+            continue
+        checked += 1
+        widest = max((f.line_end - f.line_start + 1) for f in key.findings)
+        assert key.max_prediction_span >= widest + 2 * key.line_tolerance, (
+            f"{task_dir.name}: a bound of {key.max_prediction_span} rejects a citation of its "
+            f"own widest finding ({widest} lines) plus tolerance - a correct finding would be "
+            "scored as both a false positive and a miss"
+        )
+        for path in {f.path for f in key.findings}:
+            doc_lines = len((task_dir / "files" / path).read_text().splitlines())
+            assert key.max_prediction_span < doc_lines, (
+                f"{task_dir.name}: a bound of {key.max_prediction_span} over a {doc_lines}-line "
+                f"{path} forbids nothing - a whole-document claim still covers every finding"
             )
+    assert checked, "no key sets max_prediction_span - this test would check nothing"
