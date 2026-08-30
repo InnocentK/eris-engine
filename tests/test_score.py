@@ -2608,37 +2608,59 @@ def test_a_severe_false_positive_alone_is_not_a_wrong_accept(tmp_path: Path) -> 
     assert cell["wrong_accept"] is False
 
 
-def test_a_prediction_spanning_the_file_does_not_match_everything_in_it() -> None:
-    """A finding is a LOCATED claim, so a prediction must point AT one rather
-    than merely contain it. Overlap alone is symmetric: one sentence spanning a
-    47-line plan document overlapped all three planted findings and scored
-    recall 1.0 without identifying anything (stop review, 2026-08-30).
+def test_a_wide_prediction_is_bounded_only_where_the_key_asks_for_it() -> None:
+    """Overlap is symmetric, so a prediction spanning a whole document overlaps
+    every finding in it: one sentence across a 47-line plan covered all three
+    planted findings and scored recall 1.0 for identifying nothing.
 
-    A reviewer may legitimately cite a whole section, so the bound is the
-    finding's own span plus twice the tolerance - wider than the finding,
-    nowhere near the file.
+    `max_prediction_span` bounds that, and it belongs to the KEY rather than
+    being a global rule, because the right answer differs by task. On a short
+    prose document a sweep is meaningless. On CODE it is not - a model that
+    reports the whole function containing a four-line fix hunk has located the
+    defect - and a global bound counted that as a false positive AND a miss,
+    the same double penalty a brittle `must_mention` inflicts. Unset means
+    unbounded, which is what every key did before the field existed (stop
+    review, 2026-08-30).
     """
-    key = Key.model_validate(
-        key_dict(
-            line_tolerance=3,
-            findings=[
-                {
-                    "id": f"k{i}",
-                    "path": "PLAN.md",
-                    "line_start": s,
-                    "line_end": s + 4,
-                    "severity": "high",
-                    "must_mention": ["null"],
-                }
-                for i, s in enumerate((5, 20, 40))
-            ],
-        )
+    findings = [
+        {
+            "id": f"k{i}",
+            "path": "PLAN.md",
+            "line_start": s,
+            "line_end": s + 4,
+            "severity": "high",
+            "must_mention": ["null"],
+        }
+        for i, s in enumerate((5, 20, 40))
+    ]
+    sweep = Predicted("PLAN.md", 1, 47, Severity.LOW, "null everywhere")
+
+    unbounded = Key.model_validate(key_dict(line_tolerance=3, findings=findings))
+    assert unbounded.max_prediction_span is None
+    assert match_findings([sweep], unbounded).covered == 3, "unset must not change old behaviour"
+
+    bounded = Key.model_validate(
+        key_dict(line_tolerance=3, findings=findings, max_prediction_span=12)
     )
-    sweep = match_findings([Predicted("PLAN.md", 1, 47, Severity.LOW, "null everywhere")], key)
-    assert (sweep.covered, sweep.recall) == (0, 0.0), "a whole-file claim identifies nothing"
-
-    located = match_findings([Predicted("PLAN.md", 20, 24, Severity.HIGH, "null here")], key)
+    assert match_findings([sweep], bounded).covered == 0, "a whole-file claim identifies nothing"
+    located = match_findings([Predicted("PLAN.md", 20, 24, Severity.HIGH, "null")], bounded)
     assert located.covered == 1
-
-    section = match_findings([Predicted("PLAN.md", 18, 27, Severity.HIGH, "null here")], key)
+    section = match_findings([Predicted("PLAN.md", 18, 27, Severity.HIGH, "null")], bounded)
     assert section.covered == 1, "quoting a whole section is still a located claim"
+
+
+def test_the_shipped_plan_keys_bound_the_span_and_the_others_do_not() -> None:
+    """The corpus on disk, not a fixture: the bound is set exactly where a sweep
+    would otherwise be free, and nowhere else."""
+    corpus = Path(__file__).resolve().parent.parent / "eval" / "corpus"
+    for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
+        spec = json.loads((task_dir / "task.json").read_text())
+        if spec.get("scored", True) is False:
+            continue
+        key = load_key(corpus, task_dir.name)
+        if key.category.value == "plan":
+            assert key.max_prediction_span, f"{task_dir.name}: a plan key must bound the span"
+        else:
+            assert key.max_prediction_span is None, (
+                f"{task_dir.name}: only a key that needs the bound should carry it"
+            )

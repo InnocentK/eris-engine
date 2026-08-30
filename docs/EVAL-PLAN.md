@@ -96,8 +96,11 @@ M1 clause verbatim (coupled by test) and prints the caveats with every summary;
   * Mechanical scoring of a `plan` task is APPROXIMATE and is an upper bound
     on precision. A match is a location overlap plus every `must_mention`
     token; the tokens are a subject-and-object conjunction chosen to survive
-    paraphrase, and a prediction's span may not exceed the finding's by more
-    than twice the tolerance, so a whole-file claim identifies nothing. None of
+    paraphrase, and the key's `max_prediction_span` bounds how wide a
+    prediction may be and still count as pointing at a finding, so a whole-file
+    claim identifies nothing. That bound is per-KEY and unset by default: on a
+    plan document a sweep is meaningless, but on code a model naming the whole
+    function that contains a fix hunk has located the defect. None of
     that establishes that a matched finding is CORRECT - only that it is about
     the right place and names the right things. Blind human adjudication,
     already pre-registered above, is the arbiter; the mechanical number is not

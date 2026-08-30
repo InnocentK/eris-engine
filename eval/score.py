@@ -133,6 +133,12 @@ class Key(_Strict):
     category: TaskCategory
     expected_verdict: list[Verdict]
     line_tolerance: int = Field(ge=0)
+    # The widest a prediction may be and still count as POINTING AT a finding,
+    # in lines. None = unbounded, which is the behaviour every key had before
+    # this existed. Set it where overlap alone is too easy to satisfy - a short
+    # prose document whose findings sit a few lines apart - and leave it unset
+    # where a wide prediction is a legitimate way to name a defect, as on code.
+    max_prediction_span: int | None = Field(default=None, ge=1)
     findings: list[KeyFinding] = Field(default_factory=list)
     distractors: list[Distractor] = Field(default_factory=list)
     scan: KeyScan = Field(default_factory=KeyScan)
@@ -623,7 +629,7 @@ def _overlap(a_start: int, a_end: int, b_start: int, b_end: int, tolerance: int)
     return a_start <= b_end + tolerance and b_start <= a_end + tolerance
 
 
-def _matches(pred: Predicted, kf: KeyFinding, tolerance: int) -> bool:
+def _matches(pred: Predicted, kf: KeyFinding, tolerance: int, max_span: int | None = None) -> bool:
     if pred.path is None or pred.path != kf.path:
         return False
     if pred.line_start is None:
@@ -635,13 +641,17 @@ def _matches(pred: Predicted, kf: KeyFinding, tolerance: int) -> bool:
         return False
     ps = pred.line_start
     pe = pred.line_end or ps
-    # A finding is a LOCATED claim, so a prediction has to point AT the planted
-    # finding rather than merely contain it. Overlap alone is symmetric: one
-    # sentence spanning a 47-line plan document overlapped all three planted
-    # findings and scored recall 1.0 without identifying anything. A prediction
-    # may be somewhat wider than the finding - a reviewer may quote a whole
-    # section - but not unboundedly wider.
-    if (pe - ps) > (kf.line_end - kf.line_start) + 2 * tolerance:
+    # Overlap alone is symmetric, so a prediction spanning a whole document
+    # overlaps every finding in it: one sentence across a 47-line plan covered
+    # all three planted findings and scored recall 1.0 for identifying nothing.
+    # `max_prediction_span` bounds that, and it is a property of the KEY rather
+    # than a global rule, because the right answer differs by task. On a plan
+    # document a sweep is meaningless. On a CODE defect it is not: a model that
+    # reports the whole function containing a four-line fix hunk has located
+    # the defect, and a global bound would count that as a false positive AND a
+    # miss - the same double penalty a brittle `must_mention` inflicts.
+    # Unset means unbounded, so no key that does not ask for this is affected.
+    if max_span is not None and (pe - ps + 1) > max_span:
         return False
     if not _overlap(ps, pe, kf.line_start, kf.line_end, tolerance):
         return False
@@ -713,7 +723,11 @@ def match_findings(predicted: Sequence[Predicted], key: Key) -> Matching:
     # once per key finding and raised RecursionError on a key of >1000 findings
     # (panel, mechanically reproduced), a limit nothing validated.
     adj = [
-        frozenset(kf.id for kf in key.findings if _matches(pred, kf, key.line_tolerance))
+        frozenset(
+            kf.id
+            for kf in key.findings
+            if _matches(pred, kf, key.line_tolerance, key.max_prediction_span)
+        )
         for pred in predicted
     ]
     covered: set[str] = set()
