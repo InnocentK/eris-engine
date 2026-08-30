@@ -41,6 +41,15 @@ which is the only place that knows, and written per finding into
 `validate.findings`. `UNHANDLED_CODES` remains only as the coarse fallback for
 ledgers <= 0.4.1 that carry no `acted` (it under-reports there, and says so).
 
+**The binding pre-registration is now the scorer's own text.** A stop-gate found
+`docs/EVAL-PLAN.md` still stating the code-keyed rule under its BINDING heading -
+that cells are excluded by `UNHANDLED_CODES`, and that `REF_*` never excludes -
+both false once the rule moved to `Finding.acted`. A stale rule in the document
+the decision rule is read from is worse than no rule. `eval/score.py` now holds
+the canonical `M1_PRE_REGISTRATION`, the plan carries it verbatim, and
+`test_the_binding_pre_registration_matches_the_scorer` fails if either drifts or
+if the rule is pushed outside the binding bullet.
+
 Post-change panel (OpenAI + xAI, both BLOCK) added, all verified and fixed:
 
 * `None` had a value but no CONSEQUENCE - a cell with an adjudication and no
