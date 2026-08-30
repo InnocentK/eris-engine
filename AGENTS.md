@@ -146,6 +146,21 @@ never push without being asked) → stop and report.
   documented refusal.
 - Read `docs/INVARIANTS.md` before editing a subsystem; each rule names its test.
 
+## Standing decisions (do not re-litigate; revisit only on the stated trigger)
+
+Some things are the way they are on purpose. Each has a reason and a concrete
+condition for reopening it, in a decision record. Read the record before
+proposing a change to one of these.
+
+| Thing | Decision | Revisit when |
+|---|---|---|
+| `CLAIM_MISSING`, `DISSENT_EMPTY_WITH_CONTEST` have no verdict powers | Leave as-is (2026-08-30). They exclude the cell from metrics but do not change the verdict | The first scored campaign shows `DISSENT_EMPTY_WITH_CONTEST` on a large share of arm-4 cells, or challenge verification is built |
+| `validate_critique` / `validate_origin` are never invoked | Leave uninvoked (2026-08-30). `validate_origin` guards Eris against itself; `validate_critique` would flag EVERY challenge because nothing ever verifies one | Challenge verification (M2) is built, or a wire model gains an `origin` field |
+| E1 containment: accept-and-scan | Plumbing/`control`/`plan` runs only; scored defect/ABSTAIN arms refused | A portable container mechanism exists (M2c) |
+
+Full reasoning: `docs/decisions/2026-08-30-deferred-validator-decisions.md`,
+`docs/SECURITY.md` (E1).
+
 ## Files to read first
 
 | File | Why |
@@ -158,6 +173,7 @@ never push without being asked) → stop and report.
 | `src/eris/redact.py`, `writer.py` | The only path to disk |
 | `policies/default.yaml` | Declared workers, allowlists, budgets, vendors |
 | `docs/INVARIANTS.md` | Do-not-break rules with enforcing tests |
+| `docs/decisions/` | Why things are the way they are; the standing decisions above |
 | `eval/run.py`, `eval/score.py`, `eval/prompts/` | `run` / `campaign` / `campaign status` / scorer; the frozen stage prompts (M2b) |
 | `tests/conftest.py` | Hermeticity guards — read before writing a test |
 
