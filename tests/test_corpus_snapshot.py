@@ -388,3 +388,54 @@ def test_every_keyed_finding_is_inside_the_evidence_the_task_declares() -> None:
                 "is outside every excerpt the task shows the worker - it cannot be found"
             )
     assert checked, "no scored task plants a finding - this test would check nothing"
+
+
+def test_every_keyed_finding_survives_into_the_evidence_actually_emitted() -> None:
+    """The declaration is not the artifact. `task.json` says which lines to
+    show; `eris.evidence` decides what a worker actually receives, and it caps
+    an excerpt at `EXCERPT_MAX_LINES` and elides an oversized item in `_cap`.
+    Asserting that a finding lies inside a DECLARED range proves nothing about
+    whether its lines reach the prompt (stop review, 2026-08-30).
+
+    So this runs the real emission over the real snapshot and looks for each
+    finding's line numbers in the bytes that come out. The excerpt is emitted
+    line-numbered (`"12: ..."`), which is what makes the check exact rather than
+    a substring guess.
+    """
+    from eval.score import load_key
+
+    from eris.evidence import EXCERPT_MAX_LINES, ITEM_HEAD_BYTES, Excerpt, _excerpt
+
+    corpus = REPO / "eval" / "corpus"
+    checked = 0
+    for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
+        spec = json.loads((task_dir / "task.json").read_text())
+        if spec.get("scored", True) is False:
+            continue
+        emitted: dict[str, bytes] = {}
+        for e in spec.get("excerpts", []):
+            got = _excerpt(task_dir / "snapshot", Excerpt(**e))
+            assert not isinstance(got, str), f"{task_dir.name}: excerpt refused: {got}"
+            content, truncated = got
+            assert not truncated, (
+                f"{task_dir.name}: excerpt {e['path']} is truncated at {EXCERPT_MAX_LINES} "
+                "lines; the tail never reaches the worker"
+            )
+            assert len(content) < ITEM_HEAD_BYTES, (
+                f"{task_dir.name}: excerpt {e['path']} is large enough for `_cap` to elide its "
+                "middle before a worker sees it"
+            )
+            emitted[e["path"]] = emitted.get(e["path"], b"") + content
+        for f in load_key(corpus, task_dir.name).findings:
+            checked += 1
+            body = emitted.get(f.path, b"")
+            missing = [
+                n
+                for n in range(f.line_start, f.line_end + 1)
+                if f"\n{n}: ".encode() not in b"\n" + body
+            ]
+            assert not missing, (
+                f"{task_dir.name}: finding {f.id} claims {f.path} L{f.line_start}-{f.line_end}, "
+                f"but lines {missing[:5]} are not in the evidence the worker receives"
+            )
+    assert checked, "no scored task plants a finding - this test would check nothing"
