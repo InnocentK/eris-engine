@@ -546,6 +546,7 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             # really did share a world (C1)
             validator_errors=0,
             validator_codes={},
+            validator_basis="acted",
             propose_blobs={k: ["sha-" + k] for k in keys} if blobs is None else blobs,
             contaminated=False,
             scan_incomplete=False,
@@ -811,6 +812,7 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             propose_keys=[ka, kb],
             validator_errors=0,
             validator_codes={},
+            validator_basis="acted",
             propose_blobs=blobs,
             contaminated=False,
             scan_incomplete=False,
@@ -1012,6 +1014,7 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             propose_keys=keys,
             validator_errors=0,
             validator_codes={},
+            validator_basis="acted",
             propose_blobs=blobs,
             contaminated=False,
             scan_incomplete=False,
@@ -1156,6 +1159,7 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             propose_keys=["a" * 64],
             validator_errors=errors,
             validator_codes={},
+            validator_basis="acted",
             propose_blobs={"a" * 64: ["sha"]},
             contaminated=False,
             scan_incomplete=False,
@@ -1264,6 +1268,7 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             propose_keys=[],
             validator_errors=0,
             validator_codes={},
+            validator_basis="acted",
             propose_blobs={},
             contaminated=False,
             scan_incomplete=False,
@@ -1370,3 +1375,92 @@ def test_the_binding_pre_registration_matches_the_scorer() -> None:
         "the M1 rule is in the document but OUTSIDE the binding bullet - a rule the "
         "decision maker is not obliged to read is advice again"
     )
+
+
+def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
+    """M1, stop-gate finding: the binding rule must not contradict the code.
+
+    The rule says `acted` is used "NOT inferred from its code" - but a ledger
+    written before 0.4.2 carries no `acted`, so the scorer DOES fall back to the
+    coarse code set, which calls every `REF_*` handled and under-reports
+    malformation. Six real ledgers in `runs/` are of that vintage. The exception
+    is now stated in the rule AND surfaced: such cells are reported as
+    `validator_basis: "legacy_codes"` and block the comparison, because an arm
+    scored by code and one scored by `acted` are measured against two different
+    definitions of malformed.
+    """
+    from types import SimpleNamespace
+
+    from eval.score import CellScore, _comparison_block, _validator_basis, _validator_errors
+
+    class _View:
+        def __init__(self, payloads: list[dict[str, Any]]) -> None:
+            self._p = payloads
+
+        def payloads(self, kind: str) -> list[dict[str, Any]]:
+            return self._p if kind == "validate.findings" else []
+
+    def cellview(findings: list[dict[str, Any]]) -> Any:
+        return SimpleNamespace(
+            view=_View([{"adjudication_id": "adj-1", "findings": findings}]),
+            arm_run=SimpleNamespace(final_adjudication_id="adj-1"),
+        )
+
+    modern = cellview([{"code": "REF_MISSING", "severity": "error", "acted": False}])
+    legacy = cellview([{"code": "REF_MISSING", "severity": "error"}])
+    assert _validator_basis(modern) == "acted"
+    assert _validator_basis(legacy) == "legacy_codes"
+    # the same inert finding: exact on a modern ledger, invisible on a legacy one
+    assert _validator_errors(modern) == (1, {"REF_MISSING": 1})
+    assert _validator_errors(legacy) == (0, {})
+
+    def score(arm: str, basis: str | None) -> Any:
+        return CellScore(
+            run_id=f"r-{arm}-{basis}",
+            task_id="t",
+            arm=arm,
+            repeat_index=0,
+            category="control",
+            included=True,
+            exclusion=None,
+            verdict="REVISE",
+            verdict_basis="enforced",
+            precision=0.5,
+            recall=0.5,
+            tp=1,
+            fp=1,
+            fn=1,
+            distractor_hits=0,
+            unsupported_claim_rate=0.0,
+            downgrades=0,
+            confident_wrong=False,
+            abstained=False,
+            expected_abstain=False,
+            cost_spent_usd=1.0,
+            cost_attributed_usd=1.0,
+            cost_by_stage_spent={},
+            cost_by_stage_attributed={},
+            unknown_cost_records=0,
+            wall_ms=1,
+            attempts=1,
+            propose_keys=[],
+            validator_errors=0,
+            validator_codes={},
+            validator_basis=basis,
+            propose_blobs={},
+            contaminated=False,
+            scan_incomplete=False,
+            rescan_contaminated=False,
+            containment=None,
+        )
+
+    clean = _comparison_block([score("indep_verify", "acted"), score("indep_verify_iter", "acted")])
+    assert clean["blocked"] is False
+
+    mixed = _comparison_block(
+        [score("indep_verify", "acted"), score("indep_verify_iter", "legacy_codes")]
+    )
+    assert mixed["blocked"] is True
+    assert "under-reports" in mixed["reason"] and "indep_verify_iter" in mixed["reason"]
+    assert mixed["per_arm"]["indep_verify_iter"]["legacy_basis_cells"] == 1
+    assert mixed["per_arm"]["indep_verify"]["legacy_basis_cells"] == 0

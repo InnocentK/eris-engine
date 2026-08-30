@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.2 - the legacy fallback is stated and gated, not hidden (2026-08-29)
+
+0.4.1's binding rule said whether a finding was acted on is "recorded per
+finding as `Finding.acted`, NOT inferred from its code" - while the scorer still
+inferred from the code for ledgers that carry no `acted`. The coupling test
+added in 0.4.1 asserts the plan ECHOES the scorer's string; it cannot assert the
+string is TRUE. Six ledgers in `runs/` are of that vintage, so this was live.
+
+* `_validator_basis` reports how each cell was classified: `"acted"` (exact) or
+  `"legacy_codes"` (coarse - it calls every `REF_*` handled and therefore
+  UNDER-REPORTS malformation).
+* `summary.comparison` is BLOCKED while any arm has legacy-basis cells: an arm
+  scored by code and an arm scored by `acted` are measured against two different
+  definitions of malformed, so their rates are not comparable.
+* `M1_PRE_REGISTRATION` now states the exception rather than asserting an
+  absolute the code does not honour, and `docs/EVAL-PLAN.md` carries the
+  corrected text.
+
 ## 0.4.1 - engine validator findings are consequential (M1) (2026-08-29)
 
 `enforce_rulings` emitted findings about malformed adjudications and **nothing

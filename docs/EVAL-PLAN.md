@@ -38,7 +38,13 @@ experiments showed, and what must still run before any scored corpus run.
   `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore
   set MECHANICALLY whenever any arm dropped cells for validator findings,
   and while it is set the decision rule may NOT be applied to the per-arm
-  means.
+  means. One exception is stated rather than hidden: a ledger written before
+  0.4.2 carries no `Finding.acted`, so its findings ARE classified by code,
+  using the coarse `validate.UNHANDLED_CODES` fallback that treats every
+  `REF_*` as handled and therefore UNDER-REPORTS malformation on such a
+  ledger. `summary.comparison` reports which arms were scored that way and
+  is blocked while any were, because an arm scored by code and an arm scored
+  by `acted` are measured against two different definitions of malformed.
   Findings the engine DID act on do not exclude - the `REF_*` family downgrades
   its ruling and is measured by `unsupported_claim_rate`; `VERDICT_*` forces
   ACCEPT to ESCALATE. That is the engine working, and excluding it would delete

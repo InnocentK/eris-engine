@@ -419,6 +419,8 @@ class CellScore:
     # cell has no adjudication to judge - never conflate that with "clean".
     validator_errors: int | None
     validator_codes: dict[str, int]
+    # "acted" (exact) | "legacy_codes" (coarse, under-reports) | None
+    validator_basis: str | None
     contaminated: bool
     scan_incomplete: bool
     rescan_contaminated: bool
@@ -452,6 +454,29 @@ def _propose_blobs(cell: CellData) -> dict[str, list[str]]:
             blobs = p.get("blobs")
             out[k] = sorted(str(b) for b in blobs) if isinstance(blobs, list) else []
     return out
+
+
+def _validator_basis(cell: CellData) -> str | None:
+    """How `_validator_errors` classified this cell's findings.
+
+    `"acted"` - the ledger records `Finding.acted` per finding, which is exact.
+    `"legacy_codes"` - a ledger written before 0.4.2 carries no `acted`, so the
+    coarse `UNHANDLED_CODES` fallback was used. That fallback calls EVERY `REF_*`
+    handled, so it UNDER-REPORTS malformation: an inert `REF_MISSING` on a
+    CONTESTED ruling is invisible on such a ledger. `None` - nothing to classify.
+    """
+    final_id = cell.arm_run.final_adjudication_id
+    if final_id is None:
+        return None
+    matched = [
+        p for p in cell.view.payloads("validate.findings") if p.get("adjudication_id") == final_id
+    ]
+    if not matched:
+        return None
+    findings = [f for f in (matched[-1].get("findings") or []) if isinstance(f, dict)]
+    if not findings:
+        return None
+    return "acted" if any("acted" in f for f in findings) else "legacy_codes"
 
 
 def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
@@ -641,6 +666,7 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         propose_blobs=_propose_blobs(cell),
         validator_errors=validator_errors,
         validator_codes=validator_codes,
+        validator_basis=_validator_basis(cell),
         contaminated=contaminated,
         scan_incomplete=scan_incomplete,
         rescan_contaminated=rescanned.contaminated,
@@ -839,7 +865,13 @@ M1_PRE_REGISTRATION = (
     "creates a new bias, because only arm 4 passes critiques to the validator and so only it "
     "can emit `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore set "
     "MECHANICALLY whenever any arm dropped cells for validator findings, and while it is set "
-    "the decision rule may NOT be applied to the per-arm means."
+    "the decision rule may NOT be applied to the per-arm means. One exception is stated "
+    "rather than hidden: a ledger written before 0.4.2 carries no `Finding.acted`, so its "
+    "findings ARE classified by code, using the coarse `validate.UNHANDLED_CODES` fallback "
+    "that treats every `REF_*` as handled and therefore UNDER-REPORTS malformation on such "
+    "a ledger. `summary.comparison` reports which arms were scored that way and is blocked "
+    "while any were, because an arm scored by code and an arm scored by `acted` are measured "
+    "against two different definitions of malformed."
 )
 
 
@@ -862,18 +894,30 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
             "dropped_for_validator": dropped,
             "malformed_rate": round(dropped / len(cells), 4) if cells else None,
         }
-    offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
-    return {
-        "blocked": bool(offenders),
-        "reason": (
-            "arms "
-            + ", ".join(offenders)
-            + " dropped cells for validator findings; their quality means are over a "
-            "cleaner subsample than the other arms and are NOT comparable. Resolve the "
-            "malformations or compare only pairs where both cells are well formed."
+    legacy = sorted({s.arm for s in scores if s.validator_basis == "legacy_codes"})
+    for arm, v in per_arm.items():
+        v["legacy_basis_cells"] = len(
+            [s for s in scores if s.arm == arm and s.validator_basis == "legacy_codes"]
         )
-        if offenders
-        else None,
+    offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
+    reasons: list[str] = []
+    if offenders:
+        reasons.append(
+            "arms " + ", ".join(offenders) + " dropped cells for validator findings; their "
+            "quality means are over a cleaner subsample than the other arms"
+        )
+    if legacy:
+        # Honesty about the fallback: on a pre-0.4.2 ledger the coarse code set
+        # calls every REF_* handled, so malformation is UNDER-reported there.
+        # Comparing such an arm with one scored on `acted` compares two different
+        # definitions of malformed.
+        reasons.append(
+            "arms " + ", ".join(legacy) + " have cells from ledgers with no `Finding.acted`, "
+            "scored by the coarse legacy code set, which under-reports malformation"
+        )
+    return {
+        "blocked": bool(reasons),
+        "reason": "; ".join(reasons) + ". NOT comparable." if reasons else None,
         "per_arm": per_arm,
     }
 
