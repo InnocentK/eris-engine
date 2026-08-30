@@ -56,20 +56,31 @@ Reasons, in the order that decided it:
 
 ---
 
-## 2. Three validators are unreachable at runtime
+## 2. Five functions in `eris.validate` are unreachable at runtime
 
-Corrected 2026-08-30 after the first version of this record got it wrong: the
-claim was "`validate_critique` and `validate_origin` are never invoked", which
-is false for one of them and omits a third validator entirely. The verification
-grep excluded `validate.py` itself - the one file where a caller was.
+This section was wrong TWICE before it was right, which is why it is now
+computed rather than asserted:
 
-| validator | runtime callers | callers inside `validate.py` | status |
-|---|---|---|---|
-| `validate_origin` | 0 | **3** | **IS invoked** - by the two below, which are themselves dead. Transitively unreachable |
-| `validate_critique` | 0 | 0 | dead |
-| `validate_adjudication` | 0 | 0 | dead |
+* v1: "`validate_critique` and `validate_origin` are never invoked" - false;
+  `validate_origin` has three callers. The verification grep excluded
+  `validate.py` itself, the one file where a caller was.
+* v2: "three validators are unreachable" with a caller table - still incomplete;
+  it counted only direct callers, so it missed `_record_id` and `has_errors`,
+  and its test would have passed if a LIVE function started calling a dead one.
 
-`validate_events` and `enforce_rulings` ARE live and are not part of this.
+**Reachability is TRANSITIVE from the real entry points** - what `src/` and
+`eval/` actually use. Computed:
+
+| | functions |
+|---|---|
+| entry points | `enforce_rulings`, `validate_events` |
+| reachable | those two plus `_adjudication_shape_findings`, `_check_refs`, `_contest_exists`, `_err` |
+| **unreachable** | `validate_adjudication`, `validate_critique`, `validate_origin`, `_record_id`, `has_errors` |
+
+`has_errors(findings) -> bool` is the error-severity predicate; `eval/score.py`
+reimplements it inline as `f.get("severity") == "error"` because it reads
+findings from a ledger payload, not from `Finding` objects. `_record_id` is a
+private helper used only by `validate_origin`.
 
 ### Decision: leave all three unreachable. Do NOT "wire them up".
 

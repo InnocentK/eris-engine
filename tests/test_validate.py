@@ -914,56 +914,89 @@ def test_a_finding_records_whether_the_engine_ACTED_on_it() -> None:
     assert findings == []
 
 
-def test_the_unreachable_validators_are_still_unreachable() -> None:
-    """The standing decision claims three validators are unreachable at runtime.
+UNREACHABLE_IN_VALIDATE = {
+    # decided 2026-08-30, see docs/decisions/2026-08-30-deferred-validator-decisions.md
+    "validate_adjudication",  # findings-only wrapper; the engine calls enforce_rulings
+    "validate_critique",  # would flag EVERY challenge; nothing verifies one (M2)
+    "validate_origin",  # only reachable via the two above; models cannot set `origin`
+    "_record_id",  # private helper, used only by validate_origin
+    "has_errors",  # the error predicate; eval/score.py reimplements it inline
+}
 
-    That claim was WRONG when first written - `validate_origin` has three
-    callers, and `validate_adjudication` was omitted entirely - because the
-    verification grep excluded `validate.py`, the one file where a caller was.
-    A factual claim in a decision record should be executable, so it is here.
 
-    "Unreachable" means: no caller outside `eris.validate`, and every caller
-    inside it is itself unreachable. If that stops being true, the decision in
-    `docs/decisions/2026-08-30-deferred-validator-decisions.md` is stale and
-    must be revisited, not silently outgrown.
+def _validate_reachability() -> tuple[set[str], set[str]]:
+    """(reachable, unreachable) module-level functions of `eris.validate`.
+
+    Reachability is TRANSITIVE from the real entry points - the functions
+    something outside `eris.validate` actually uses. Checking only "has no
+    caller outside the module" is not the same thing and was the first version
+    of this test: a call from `enforce_rulings` (live, and in the same file)
+    would have satisfied it while making the target reachable.
     """
     import ast
-    from pathlib import Path as _P
+    from pathlib import Path
 
-    roots = [_P(__file__).resolve().parent.parent / d for d in ("src", "eval")]
-    validate_py = roots[0] / "eris" / "validate.py"
+    root = Path(__file__).resolve().parent.parent
+    vp = root / "src" / "eris" / "validate.py"
+    tree = ast.parse(vp.read_text())
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
 
-    def calls_in(path: _P) -> set[str]:
-        tree = ast.parse(path.read_text())
-        return {
-            n.func.id
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        } | {
-            n.func.attr
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        }
+    def used(node: object) -> set[str]:
+        names: set[str] = set()
+        for x in ast.walk(node):  # type: ignore[arg-type]
+            if isinstance(x, ast.Name):
+                names.add(x.id)
+            elif isinstance(x, ast.Attribute):
+                names.add(x.attr)
+            elif isinstance(x, ast.ImportFrom):
+                names.update(a.name for a in x.names)
+        return names & set(funcs)
 
-    unreachable = {"validate_origin", "validate_critique", "validate_adjudication"}
-    live = {"enforce_rulings", "validate_events"}
-
-    outside: dict[str, set[str]] = {name: set() for name in unreachable | live}
-    for root in roots:
-        for f in root.rglob("*.py"):
-            if f == validate_py:
+    graph = {name: used(node) - {name} for name, node in funcs.items()}
+    entries: set[str] = set()
+    for pkg in ("src", "eval"):
+        for f in (root / pkg).rglob("*.py"):
+            if f.resolve() == vp.resolve():
                 continue
-            for name in outside:
-                if name in calls_in(f):
-                    outside[name].add(str(f.relative_to(root.parent)))
+            entries |= used(ast.parse(f.read_text()))
 
-    for name in sorted(unreachable):
-        assert not outside[name], (
-            f"{name} now has a caller outside eris.validate ({sorted(outside[name])}). "
-            "The standing decision says it is unreachable at runtime - update the decision "
-            "record, do not just delete this assertion."
-        )
-    # the control: the live validators DO have outside callers, so the check above
-    # is not passing merely because the AST walk finds nothing
-    for name in sorted(live):
-        assert outside[name], f"{name} should have runtime callers; the AST scan found none"
+    reachable: set[str] = set()
+    stack = list(entries)
+    while stack:
+        fn = stack.pop()
+        if fn in reachable:
+            continue
+        reachable.add(fn)
+        stack.extend(graph.get(fn, ()))
+    return reachable, set(funcs) - reachable
+
+
+def test_the_unreachable_parts_of_validate_are_exactly_the_recorded_set() -> None:
+    """The standing decision names functions that runtime never reaches.
+
+    Asserted as an EXACT set, computed transitively, so all three ways the claim
+    can go stale fail here rather than rotting in prose:
+      * one of them becomes reachable -> the set shrinks;
+      * a new function is added and nothing uses it -> the set grows, forcing a
+        decision instead of silent dead code;
+      * a LIVE function starts calling one -> the set shrinks. The first version
+        of this test only asserted "no caller outside eris.validate", which a
+        call from `enforce_rulings` would have satisfied while making the target
+        reachable.
+
+    Two earlier versions of this claim were wrong in prose - it said
+    `validate_origin` had no callers (it has three) and omitted
+    `validate_adjudication`, `_record_id` and `has_errors` entirely.
+    """
+    reachable, unreachable = _validate_reachability()
+    assert unreachable == UNREACHABLE_IN_VALIDATE, (
+        "the unreachable set changed.\n"
+        f"  newly reachable: {sorted(UNREACHABLE_IN_VALIDATE - unreachable)}\n"
+        f"  newly dead:      {sorted(unreachable - UNREACHABLE_IN_VALIDATE)}\n"
+        "Update docs/decisions/2026-08-30-deferred-validator-decisions.md and this set "
+        "together - do not just edit the set."
+    )
+    # control: the entry points really are reachable, so the assertion above is
+    # not passing because the analysis found nothing at all
+    assert {"enforce_rulings", "validate_events"} <= reachable
+    assert "_check_refs" in reachable  # a private helper that IS on a live path
