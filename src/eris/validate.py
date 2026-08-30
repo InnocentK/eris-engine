@@ -60,6 +60,29 @@ from eris.schemas import (
 
 ESCALATE_AT = 3
 
+# M1: the codes the engine DETECTS but does not ACT on. Every other error code
+# already changes an outcome - the REF_*/`*_WITHOUT_REFS` family downgrades its
+# ruling (and is measured by `unsupported_claim_rate`), and VERDICT_* forces
+# ACCEPT to ESCALATE. Those are the engine working, not a broken record, and a
+# cell carrying them is still evidence.
+#
+# These are different: the adjudication asserts something incoherent - a ruling
+# on a claim nobody made, one claim ruled twice, a contest with no dissent
+# recorded, an ACCEPT with no residual risks - and NOTHING happens. `eval/score.py`
+# treats a cell whose final adjudication carries one of these as not-evidence.
+# Giving them verdict powers instead is a protocol change and belongs to the
+# user (H3 was decided that way).
+UNHANDLED_CODES: frozenset[str] = frozenset(
+    {
+        "CLAIM_MISSING",
+        "DUPLICATE_RULING",
+        "DISSENT_EMPTY_WITH_CONTEST",
+        "RESIDUAL_RISKS_EMPTY_ON_ACCEPT",
+        "ORIGIN_MISMATCH",
+        "UNVERIFIED_CHALLENGE",
+    }
+)
+
 Severity = Literal["error", "warning", "info"]
 
 
