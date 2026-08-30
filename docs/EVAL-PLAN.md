@@ -43,10 +43,11 @@ experiments showed, and what must still run before any scored corpus run.
   code, using the coarse `validate.UNHANDLED_CODES` fallback that treats
   every `REF_*` as handled and therefore UNDER-REPORTS malformation on such
   a ledger. Classification is per FINDING, so a cell counts as coarsely
-  scored when ANY of its findings lacks `acted`, not only when all do.
-  `summary.comparison` reports which arms were scored that way and is
-  BLOCKED while any were, because an arm scored by code and an arm scored by
-  `acted` are measured against two different definitions of malformed.
+  scored when ANY of its findings lacks `acted`, not only when all do, and
+  is reported as `validator_basis: coarse_codes`. `summary.comparison`
+  reports which arms were scored that way and is BLOCKED while any were,
+  because an arm scored by code and an arm scored by `acted` are measured
+  against two different definitions of malformed.
   Findings the engine DID act on do not exclude - the `REF_*` family downgrades
   its ruling and is measured by `unsupported_claim_rate`; `VERDICT_*` forces
   ACCEPT to ESCALATE. That is the engine working, and excluding it would delete
