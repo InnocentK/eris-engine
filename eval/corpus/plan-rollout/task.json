@@ -1,6 +1,6 @@
 {
   "task_id": "plan-rollout",
-  "question": "Review the rollout plan in `ROLLOUT.md`. Identify anything that would go wrong if the plan were carried out exactly as written. Support every claim with evidence from the repository.",
+  "question": "Is the rollout plan in `ROLLOUT.md` defensible as it stands? State your verdict and support every claim with evidence from the repository.",
   "category": "plan",
   "snapshot": "snapshot",
   "scored": true,

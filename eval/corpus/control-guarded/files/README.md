@@ -1,6 +1,8 @@
 # window
 
-A ring buffer, `Window`, holding the last `capacity` values pushed.
+`Window(capacity)` keeps the last `capacity` values pushed, oldest first.
+Used by the latency monitor to report a rolling mean.
 
-Every bound is already checked. The module is written to look risky so
-that a reviewer has something tempting to flag; there is no defect.
+* `push(value)` - record a value, overwriting the oldest once full.
+* `values()` - the live values, oldest first.
+* `mean()` - the mean of the live values; raises on an empty window.

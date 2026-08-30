@@ -14,7 +14,7 @@
       "line_end": 22,
       "severity": "high",
       "must_mention": [
-        "self-report"
+        "severity"
       ]
     },
     {
@@ -24,7 +24,7 @@
       "line_end": 36,
       "severity": "medium",
       "must_mention": [
-        "allowlist"
+        "lint"
       ]
     }
   ],

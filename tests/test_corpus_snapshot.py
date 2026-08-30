@@ -244,3 +244,78 @@ def test_the_documented_cli_entry_points_run_as_scripts() -> None:
         )
         assert proc.returncode == 0, f"{script} --help failed:\n{proc.stderr[-800:]}"
         assert "usage:" in proc.stdout.lower(), f"{script} printed no usage"
+
+
+# Phrases that state a task's ANSWER rather than describing its subject. A
+# worker's cwd is `<task>/snapshot` and E1 established it reads the parent, so
+# everything under a task directory is material the graded model can read.
+ANSWER_TELLS: tuple[str, ...] = (
+    "no defect",
+    "no defects",
+    "no bug",
+    "nothing to find",
+    "nothing wrong",
+    "clean control",
+    "distractor",
+    "planted",
+    "look risky",
+    "looks risky",
+    "the answer is",
+    "correct answer",
+)
+
+
+def test_no_scored_task_tells_the_worker_its_answer() -> None:
+    """The first draft of this corpus shipped controls whose own files said
+    "There is no defect here" and "written to LOOK risky ... so a reviewer under
+    pressure has something to reach for". Both were in `files/`, so both were
+    copied into `snapshot/` - the worker's cwd. The controls measured nothing.
+
+    The canary machinery could not catch this: it looks for the KEY's content,
+    and this is not the key, it is the answer written in prose.
+
+    Unscored plumbing tasks are exempt: they enter no metric, so their payload
+    cannot corrupt one, and describing itself is the whole point of a fixture.
+    """
+    from eval.run import task_is_scored
+
+    offenders: list[str] = []
+    for task_dir in sorted(p.parent for p in (REPO / "eval" / "corpus").glob("*/task.json")):
+        if not task_is_scored(task_dir / "task.json"):
+            continue
+        for f in sorted(task_dir.rglob("*")):
+            if not f.is_file() or ".git" in f.parts:
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            for tell in ANSWER_TELLS:
+                if tell in text:
+                    offenders.append(f"{f.relative_to(REPO)}: {tell!r}")
+    assert not offenders, "a scored task tells the worker its answer:\n  " + "\n  ".join(offenders)
+
+
+def test_a_control_key_and_its_task_agree_that_nothing_is_planted() -> None:
+    """A control's whole job is to measure invented findings, which only works
+    if there is genuinely nothing to find. `Key` refuses a control that plants
+    findings; this asserts the shipped corpus actually has none, and that every
+    plan task DOES plant something - a plan key with no findings would measure
+    no catch rate at all while looking like a scored task.
+    """
+    from eval.score import load_key
+
+    corpus = REPO / "eval" / "corpus"
+    seen = {"control": 0, "plan": 0}
+    for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
+        spec = json.loads((task_dir / "task.json").read_text())
+        if spec.get("scored", True) is False:
+            continue
+        key = load_key(corpus, task_dir.name)
+        cat = key.category.value
+        seen[cat] = seen.get(cat, 0) + 1
+        if cat == "control":
+            assert not key.findings, f"{task_dir.name}: a control must plant nothing"
+        elif cat == "plan":
+            assert key.findings, f"{task_dir.name}: a plan task with no findings measures nothing"
+    assert seen["control"] >= 1 and seen["plan"] >= 1, f"corpus is one-sided: {seen}"

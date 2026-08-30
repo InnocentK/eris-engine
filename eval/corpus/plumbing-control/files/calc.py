@@ -1,9 +1,4 @@
-"""A deliberately boring two-function module: the plumbing control's payload.
-
-There is no defect here and nothing to find. The point of this task is to
-exercise the harness end to end (pack -> propose -> critique -> verify ->
-adjudicate -> summarize -> scan), not to score a model.
-"""
+"""Two small arithmetic helpers."""
 
 from __future__ import annotations
 

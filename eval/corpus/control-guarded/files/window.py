@@ -1,10 +1,4 @@
-"""A ring buffer over a fixed-size backing list.
-
-Every index arithmetic here is already bounds-checked. It is written to
-LOOK risky - raw modular indexing, a subtraction, a slice built from two
-computed offsets - so a reviewer under pressure to find something has
-something to reach for.
-"""
+"""A ring buffer over a fixed-size backing list, used by the latency monitor."""
 
 from __future__ import annotations
 

@@ -1,8 +1,4 @@
-"""Fixed-width text blocks.
-
-Deliberately small and complete: every branch is reachable, every input
-that can occur is handled, and nothing is left for a caller to get wrong.
-"""
+"""Fixed-width text layout helpers used by the report writer."""
 
 from __future__ import annotations
 

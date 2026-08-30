@@ -1,6 +1,6 @@
 {
   "task_id": "control-clean-io",
-  "question": "Is `textblock.py` defensible as it stands? It provides wrap(text, width) and indent(lines, spaces). State whether you find a defect, and support every claim with evidence from the repository. If there is no defect, say so.",
+  "question": "Is `textblock.py` defensible as it stands? It provides wrap(text, width) and indent(lines, spaces). State your verdict and support every claim with evidence from the repository.",
   "category": "control",
   "snapshot": "snapshot",
   "scored": true,
