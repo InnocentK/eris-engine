@@ -56,12 +56,30 @@ Reasons, in the order that decided it:
 
 ---
 
-## 2. `validate_critique` and `validate_origin` are never invoked
+## 2. Three validators are unreachable at runtime
 
-`grep -rn "validate_critique\|validate_origin" src/ eval/` returns only their
-definitions in `validate.py`. Nothing calls them at runtime.
+Corrected 2026-08-30 after the first version of this record got it wrong: the
+claim was "`validate_critique` and `validate_origin` are never invoked", which
+is false for one of them and omits a third validator entirely. The verification
+grep excluded `validate.py` itself - the one file where a caller was.
 
-### Decision: leave them uninvoked. Do NOT "wire them up".
+| validator | runtime callers | callers inside `validate.py` | status |
+|---|---|---|---|
+| `validate_origin` | 0 | **3** | **IS invoked** - by the two below, which are themselves dead. Transitively unreachable |
+| `validate_critique` | 0 | 0 | dead |
+| `validate_adjudication` | 0 | 0 | dead |
+
+`validate_events` and `enforce_rulings` ARE live and are not part of this.
+
+### Decision: leave all three unreachable. Do NOT "wire them up".
+
+**`validate_adjudication`** is a findings-only wrapper: it calls
+`enforce_rulings` and discards the enforced record. The engine already calls
+`enforce_rulings` directly, which both enforces AND returns the findings, so the
+wrapper has no caller because it has no purpose. It is also the only path that
+would reach `validate_origin`, which is why "invoke `validate_origin`" is not
+even the right framing - the question is whether a findings-only variant should
+exist at all.
 
 **`validate_origin`** checks that a record's `origin` matches what the record is
 (an `EvidenceItem` from a git command must be `mechanically_observed`, and so
@@ -90,7 +108,9 @@ verification is not built.
   information.
 * If a wire model ever gains an `origin` field - i.e. if a model becomes able
   to assert its own origin - `validate_origin` stops being redundant and MUST
-  be invoked on model-derived records.
+  be reachable from a live path on model-derived records.
+* If anything ever needs findings WITHOUT enforcement, `validate_adjudication`
+  is the function to reach for; today nothing does.
 
 ---
 

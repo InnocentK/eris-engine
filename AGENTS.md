@@ -155,7 +155,7 @@ proposing a change to one of these.
 | Thing | Decision | Revisit when |
 |---|---|---|
 | `CLAIM_MISSING`, `DISSENT_EMPTY_WITH_CONTEST` have no verdict powers | Leave as-is (2026-08-30). They exclude the cell from metrics but do not change the verdict | The first scored campaign shows `DISSENT_EMPTY_WITH_CONTEST` on a large share of arm-4 cells, or challenge verification is built |
-| `validate_critique` / `validate_origin` are never invoked | Leave uninvoked (2026-08-30). `validate_origin` guards Eris against itself; `validate_critique` would flag EVERY challenge because nothing ever verifies one | Challenge verification (M2) is built, or a wire model gains an `origin` field |
+| `validate_critique`, `validate_adjudication`, `validate_origin` are unreachable at runtime | Leave them so (2026-08-30). `validate_adjudication` is a findings-only wrapper the engine has no use for (it calls `enforce_rulings` directly); it is also the only path to `validate_origin`, which guards Eris against itself since a model cannot set `origin`; `validate_critique` would flag EVERY challenge because nothing ever verifies one | Challenge verification (M2) is built, a wire model gains an `origin` field, or something needs findings WITHOUT enforcement |
 | E1 containment: accept-and-scan | Plumbing/`control`/`plan` runs only; scored defect/ABSTAIN arms refused | A portable container mechanism exists (M2c) |
 
 Full reasoning: `docs/decisions/2026-08-30-deferred-validator-decisions.md`,

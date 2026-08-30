@@ -912,3 +912,58 @@ def test_a_finding_records_whether_the_engine_ACTED_on_it() -> None:
     good = Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
     _, findings = enforce_rulings(adjudication([good]), CLAIMS, EVIDENCE)
     assert findings == []
+
+
+def test_the_unreachable_validators_are_still_unreachable() -> None:
+    """The standing decision claims three validators are unreachable at runtime.
+
+    That claim was WRONG when first written - `validate_origin` has three
+    callers, and `validate_adjudication` was omitted entirely - because the
+    verification grep excluded `validate.py`, the one file where a caller was.
+    A factual claim in a decision record should be executable, so it is here.
+
+    "Unreachable" means: no caller outside `eris.validate`, and every caller
+    inside it is itself unreachable. If that stops being true, the decision in
+    `docs/decisions/2026-08-30-deferred-validator-decisions.md` is stale and
+    must be revisited, not silently outgrown.
+    """
+    import ast
+    from pathlib import Path as _P
+
+    roots = [_P(__file__).resolve().parent.parent / d for d in ("src", "eval")]
+    validate_py = roots[0] / "eris" / "validate.py"
+
+    def calls_in(path: _P) -> set[str]:
+        tree = ast.parse(path.read_text())
+        return {
+            n.func.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        } | {
+            n.func.attr
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+
+    unreachable = {"validate_origin", "validate_critique", "validate_adjudication"}
+    live = {"enforce_rulings", "validate_events"}
+
+    outside: dict[str, set[str]] = {name: set() for name in unreachable | live}
+    for root in roots:
+        for f in root.rglob("*.py"):
+            if f == validate_py:
+                continue
+            for name in outside:
+                if name in calls_in(f):
+                    outside[name].add(str(f.relative_to(root.parent)))
+
+    for name in sorted(unreachable):
+        assert not outside[name], (
+            f"{name} now has a caller outside eris.validate ({sorted(outside[name])}). "
+            "The standing decision says it is unreachable at runtime - update the decision "
+            "record, do not just delete this assertion."
+        )
+    # the control: the live validators DO have outside callers, so the check above
+    # is not passing merely because the AST walk finds nothing
+    for name in sorted(live):
+        assert outside[name], f"{name} should have runtime callers; the AST scan found none"

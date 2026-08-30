@@ -405,7 +405,15 @@ def validate_adjudication(
     evidence: Mapping[str, EvidenceItem],
     challenges: Iterable[Challenge] = (),
 ) -> list[Finding]:
-    """Findings only (no enforcement). Never raises."""
+    """Findings only (no enforcement). Never raises.
+
+    UNCALLED, DELIBERATELY (decided 2026-08-30). The engine calls
+    `enforce_rulings` directly, which both enforces AND returns the findings, so
+    a findings-only wrapper has no caller because it has no purpose. It is also
+    the only path that would reach `validate_origin`. Reach for it if something
+    ever needs findings WITHOUT enforcement.
+    See `docs/decisions/2026-08-30-deferred-validator-decisions.md`.
+    """
     _, findings = enforce_rulings(adj, claims, evidence, challenges)
     findings.extend(validate_origin(adj))
     return findings
@@ -506,10 +514,13 @@ def _record_id(record: Record) -> str | None:
 def validate_origin(record: Record) -> list[Finding]:
     """ORIGIN_MISMATCH when a record's origin contradicts what it is.
 
-    DELIBERATELY NOT INVOKED (decided 2026-08-30). Wire models use
+    UNREACHABLE AT RUNTIME (decided 2026-08-30). It HAS callers -
+    `validate_adjudication` and `validate_critique` - but both of those are
+    themselves uncalled, so nothing reaches it. Wire models use
     `extra="forbid"` and have no `origin` field, so a model cannot set one -
     Eris does, in its own constructors. This guards Eris against itself, which
-    is a unit-test concern. Invoke it if a wire model ever gains `origin`.
+    is a unit-test concern. Make it reachable if a wire model ever gains
+    `origin`.
     See `docs/decisions/2026-08-30-deferred-validator-decisions.md`.
     """
     if isinstance(record, EvidenceItem):
