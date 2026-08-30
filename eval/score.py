@@ -456,15 +456,10 @@ def _propose_blobs(cell: CellData) -> dict[str, list[str]]:
     return out
 
 
-def _validator_basis(cell: CellData) -> str | None:
-    """How `_validator_errors` classified this cell's findings.
-
-    `"acted"` - the ledger records `Finding.acted` per finding, which is exact.
-    `"legacy_codes"` - a ledger written before 0.4.2 carries no `acted`, so the
-    coarse `UNHANDLED_CODES` fallback was used. That fallback calls EVERY `REF_*`
-    handled, so it UNDER-REPORTS malformation: an inert `REF_MISSING` on a
-    CONTESTED ruling is invisible on such a ledger. `None` - nothing to classify.
-    """
+def _matched_findings(cell: CellData) -> list[dict[str, Any]] | None:
+    """The findings of the cell's FINAL adjudication, or None if there are none
+    to judge. One extractor, so `_validator_errors` and `_validator_basis` can
+    never disagree about WHICH findings they are describing."""
     final_id = cell.arm_run.final_adjudication_id
     if final_id is None:
         return None
@@ -473,10 +468,31 @@ def _validator_basis(cell: CellData) -> str | None:
     ]
     if not matched:
         return None
-    findings = [f for f in (matched[-1].get("findings") or []) if isinstance(f, dict)]
+    # The LAST event per id wins. Adjudication ids are deterministic
+    # (`stages.py`: `adj-{prefix}`), so a crash after `validate.findings` but
+    # before `stage.finished` leaves a stale event that a clean re-run reproduces
+    # under the SAME id. Taking every match would let the abandoned attempt
+    # exclude the outcome that replaced it.
+    return [f for f in (matched[-1].get("findings") or []) if isinstance(f, dict)]
+
+
+def _validator_basis(cell: CellData) -> str | None:
+    """How `_validator_errors` classified this cell's findings.
+
+    `"acted"` - EVERY finding records `Finding.acted`, so the classification is
+    exact. `"legacy_codes"` - at least one does not, so at least one finding was
+    classified by the coarse `UNHANDLED_CODES` fallback, which calls every
+    `REF_*` handled and therefore UNDER-REPORTS malformation.
+
+    Conservative by ALL, not ANY: classification is per FINDING, so a single
+    event mixing findings with and without `acted` has some classified exactly
+    and some coarsely. Asking "does any finding have `acted`" reported such a
+    cell as exact and hid the coarse ones, bypassing the comparison gate.
+    """
+    findings = _matched_findings(cell)
     if not findings:
         return None
-    return "acted" if any("acted" in f for f in findings) else "legacy_codes"
+    return "acted" if all("acted" in f for f in findings) else "legacy_codes"
 
 
 def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
@@ -502,13 +518,8 @@ def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
     findings events match it. A cell with no adjudication has not been shown to
     be clean, and must never be reported as if it were.
     """
-    final_id = cell.arm_run.final_adjudication_id
-    if final_id is None:
-        return None, {}
-    matched = [
-        p for p in cell.view.payloads("validate.findings") if p.get("adjudication_id") == final_id
-    ]
-    if not matched:
+    findings = _matched_findings(cell)
+    if findings is None:
         return None, {}
     # The LAST matching event wins. Adjudication ids are deterministic
     # (`stages.py`: `adj-{prefix}`), so a crash after `validate.findings` but
@@ -516,24 +527,23 @@ def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
     # under the SAME id. Summing every match would let the abandoned attempt
     # exclude the outcome that replaced it - the attempt-vs-outcome error again.
     counts: dict[str, int] = {}
-    for payload in matched[-1:]:
-        for f in payload.get("findings") or []:
-            if isinstance(f, dict) and f.get("severity") == "error":
-                code = str(f.get("code", "?"))
-                if "acted" in f:
-                    # The producer told us. Classifying by CODE is wrong:
-                    # `REF_MISSING` downgrades a SUPPORTED/REFUTED ruling but is
-                    # INERT on a CONTESTED or UNSUPPORTED one, since only those
-                    # two statuses are downgraded - so the same code is handled
-                    # in one ruling and ignored in the next.
-                    if f.get("acted"):
-                        continue
-                elif code not in UNHANDLED_CODES:
-                    # Legacy ledgers (<= 0.4.1) carry no `acted`. Fall back to
-                    # the code set, which is coarser: it calls every `REF_*`
-                    # handled and so under-reports on those ledgers.
+    for f in findings:
+        if f.get("severity") == "error":
+            code = str(f.get("code", "?"))
+            if "acted" in f:
+                # The producer told us. Classifying by CODE is wrong:
+                # `REF_MISSING` downgrades a SUPPORTED/REFUTED ruling but is
+                # INERT on a CONTESTED or UNSUPPORTED one, since only those
+                # two statuses are downgraded - so the same code is handled
+                # in one ruling and ignored in the next.
+                if f.get("acted"):
                     continue
-                counts[code] = counts.get(code, 0) + 1
+            elif code not in UNHANDLED_CODES:
+                # Legacy ledgers (<= 0.4.1) carry no `acted`. Fall back to
+                # the code set, which is coarser: it calls every `REF_*`
+                # handled and so under-reports on those ledgers.
+                continue
+            counts[code] = counts.get(code, 0) + 1
     return sum(counts.values()), dict(sorted(counts.items()))
 
 
@@ -866,10 +876,12 @@ M1_PRE_REGISTRATION = (
     "can emit `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore set "
     "MECHANICALLY whenever any arm dropped cells for validator findings, and while it is set "
     "the decision rule may NOT be applied to the per-arm means. One exception is stated "
-    "rather than hidden: a ledger written before 0.4.2 carries no `Finding.acted`, so its "
+    "rather than hidden: a ledger written before 0.4.2 carries no `Finding.acted`, so those "
     "findings ARE classified by code, using the coarse `validate.UNHANDLED_CODES` fallback "
     "that treats every `REF_*` as handled and therefore UNDER-REPORTS malformation on such "
-    "a ledger. `summary.comparison` reports which arms were scored that way and is blocked "
+    "a ledger. Classification is per FINDING, so a cell counts as coarsely scored when ANY "
+    "of its findings lacks `acted`, not only when all do. `summary.comparison` reports which arms "
+    "were scored that way and is BLOCKED "
     "while any were, because an arm scored by code and an arm scored by `acted` are measured "
     "against two different definitions of malformed."
 )

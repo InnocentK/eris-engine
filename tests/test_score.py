@@ -1410,6 +1410,21 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
     legacy = cellview([{"code": "REF_MISSING", "severity": "error"}])
     assert _validator_basis(modern) == "acted"
     assert _validator_basis(legacy) == "legacy_codes"
+
+    # MIXED: classification is per FINDING, so one event can have some findings
+    # classified exactly and some coarsely. Asking "does ANY finding carry
+    # `acted`" reported such a cell as exact and hid the coarse ones, bypassing
+    # the gate entirely. The basis is conservative: ALL, not ANY.
+    mixed_f = cellview(
+        [
+            {"code": "VERDICT_UNSUPPORTED", "severity": "error", "acted": True},
+            {"code": "REF_MISSING", "severity": "error"},  # no `acted` -> coarse
+        ]
+    )
+    assert _validator_basis(mixed_f) == "legacy_codes", (
+        "a cell with ANY finding lacking `acted` was classified coarsely at least once "
+        "and must not report itself as exact"
+    )
     # the same inert finding: exact on a modern ledger, invisible on a legacy one
     assert _validator_errors(modern) == (1, {"REF_MISSING": 1})
     assert _validator_errors(legacy) == (0, {})
@@ -1464,3 +1479,11 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
     assert "under-reports" in mixed["reason"] and "indep_verify_iter" in mixed["reason"]
     assert mixed["per_arm"]["indep_verify_iter"]["legacy_basis_cells"] == 1
     assert mixed["per_arm"]["indep_verify"]["legacy_basis_cells"] == 0
+
+    # a MIXED cell reports `legacy_codes`, so the gate fires on it too
+    assert (
+        _comparison_block(
+            [score("indep_verify", "acted"), score("indep_verify_iter", _validator_basis(mixed_f))]
+        )["blocked"]
+        is True
+    )
