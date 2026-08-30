@@ -88,6 +88,27 @@ in the same session, and one was in a test that passed for the wrong reason.
   confidence field anywhere in the wire schema. User decision, recorded in
   `docs/decisions/2026-08-30-confident-wrong-split.md`.
 
+### Documentation, and two rules that make its failures fail closed
+
+* `CHANGELOG.md`'s newest entry must name `eris.__version__` and have a body.
+  This entry exists because the version had been bumped across three commits
+  with no record at all and nothing failed.
+* Live documents may not name a repo path that does not exist. An
+  `eval/README.md` was cited in four places - including AGENTS.md's gate
+  condition and its map of where the pre-registration lives - as the home of the
+  Phase 0 decision rule, and had never been written. `docs/EVAL-PLAN.md` says
+  plainly that it carries the pre-registration, and states the rule once.
+* Backticked, bare and markdown-link forms are all checked, and links are
+  checked in EVERY document including `docs/history/`. The first version of the
+  rule looked only inside backticks, and the two references that survived it
+  survived because their backticks had been removed to make it pass: an
+  invariant a formatting change defeats is not one. Paths named because they do
+  NOT exist are listed in `DELIBERATELY_ABSENT` with a reason, and a second test
+  fails if one later starts existing.
+* `docs/history/*.md` carry a banner naming the live documents. The body of each
+  is untouched; the banner says so, and says when it was added, rather than
+  claiming the file is never edited while being an edit.
+
 ### Corpus and harness
 
 * Snapshots are generated, never committed, and drift silently from the

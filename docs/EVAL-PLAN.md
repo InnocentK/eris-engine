@@ -6,11 +6,12 @@ Status: the harness is RUNNABLE as of 0.3.0 (`eval/run.py run|campaign`,
 This file records what is settled, what the experiments showed, and what must
 still run before any scored corpus run.
 
-**This file is the pre-registration.** Earlier drafts pointed at an
-an eval/README.md that was never written, so four live documents named a file
-that does not exist as the home of the decision rule. The rule is stated here,
-once — a second copy is a second thing to drift. `eval/score.py` echoes the M1
-clause verbatim (coupled by test) and prints the caveats with every summary;
+**This file is where the pre-registration lives** — the rule in it is still
+marked draft, but this is the document that carries it. Earlier drafts pointed
+at an `eval/README.md` that was never written, so four live documents named a
+file that does not exist as the home of the decision rule. The rule is stated
+here, once: a second copy is a second thing to drift. `eval/score.py` echoes the
+M1 clause verbatim (coupled by test) and prints the caveats with every summary;
 `docs/INVARIANTS.md` records what is enforced and by which test.
 
 ## Runnable now (Milestone 2b)

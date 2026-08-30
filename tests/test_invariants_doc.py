@@ -447,12 +447,73 @@ def test_the_changelog_records_the_current_version() -> None:
     assert any(ln.strip() for ln in body), f"{top!r} has no body"
 
 
+# Paths named in live documents that deliberately DO NOT exist. Each is named in
+# order to RECORD that it was never written, so the check must still see it -
+# listed here, with a reason, rather than reworded until the check stops
+# matching. Rewording to silence this test is the exact failure mode it exists
+# to prevent, and the first version of it was silenced that way: the paths below
+# had their backticks removed, and the check only looked at backticked text.
+DELIBERATELY_ABSENT: dict[str, str] = {
+    "eval/README.md": (
+        "never written. Four live documents named it as the home of the Phase 0 "
+        "decision rule; the rule is in docs/EVAL-PLAN.md, which says so."
+    ),
+}
+
+# Filenames belonging to OTHER tools' conventions, not to this repository. The
+# security and eval docs name them when describing what each vendor CLI injects
+# from a worker's tree, so they are references to a convention rather than
+# pointers into this checkout.
+EXTERNAL_CONVENTIONS: frozenset[str] = frozenset(
+    {
+        "GEMINI.md",
+        "GROK.md",
+        "CLAUDE.local.md",
+        ".github/copilot-instructions.md",
+        ".agents/rules/r.md",
+    }
+)
+
+# Where a repo path can be written: inside backticks, as a markdown link target,
+# or bare in prose. All three are checked, because which one an author reaches
+# for is a formatting choice and an invariant that turns on formatting is not an
+# invariant. Any backticked `*.md` counts, not a hardcoded list of known
+# documents - a reference to a doc that does not exist is the fault whatever the
+# doc is called.
+_PATH = r"(?:docs|eval|src|tests|policies)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,5}"
+_MENTION = re.compile(rf"`([A-Za-z0-9_./-]+\.md|{_PATH})`|(?<![`/\w])({_PATH})")
+_LINK = re.compile(r"\]\(([^)\s]+)\)")
+
+
+def _mentioned_paths(text: str) -> set[str]:
+    out: set[str] = set()
+    for m in _MENTION.finditer(text):
+        out.add(m.group(1) or m.group(2))
+    return out
+
+
+def test_the_deliberately_absent_list_is_still_true() -> None:
+    """An allowlist that outlives its reason is a lie in a config file."""
+    for ref, why in DELIBERATELY_ABSENT.items():
+        assert not (REPO / ref).exists(), (
+            f"{ref} now exists, but is listed as deliberately absent ({why}). "
+            "Remove the entry so the reference is checked like any other."
+        )
+
+
 def test_live_docs_do_not_point_at_files_that_do_not_exist() -> None:
-    """`eval/README.md` was named in four live documents - including AGENTS.md's
-    gate condition and its own map of where the pre-registration lives - as the
-    home of the Phase 0 decision rule. It had never been written. A reader
-    following the repo's own signposts to find the authoritative rule found
-    nothing, while the rule sat in `docs/EVAL-PLAN.md`.
+    """A file named eval/README.md was cited in four live documents - including
+    AGENTS.md's gate condition and its own map of where the pre-registration
+    lives - as the home of the Phase 0 decision rule. It had never been written.
+    A reader following the repo's own signposts to find the authoritative rule
+    found nothing, while the rule sat in docs/EVAL-PLAN.md.
+
+    Backticked, bare and markdown-link forms are all checked. The first version
+    of this test looked only inside backticks, and the two references that
+    survived it survived because their backticks had been REMOVED to make it
+    pass - an invariant that a formatting change defeats is not one. Paths that
+    are named precisely because they do not exist go in `DELIBERATELY_ABSENT`,
+    where a reader can see them.
 
     Checked over the LIVE docs only. `docs/history/` is frozen by convention and
     carries a banner saying so; a decision record describes the world as it was
@@ -460,20 +521,40 @@ def test_live_docs_do_not_point_at_files_that_do_not_exist() -> None:
     past release entry names the paths that existed then, and rewriting it to
     match today would destroy the record it exists to be.
     """
-    historical = {"CHANGELOG.md"}
     live = sorted(
-        [p for p in REPO.glob("*.md") if p.name not in historical]
-        + [p for p in REPO.glob("docs/*.md") if p.parent.name == "docs"]
+        [p for p in REPO.glob("*.md") if p.name != "CHANGELOG.md"] + list(REPO.glob("docs/*.md"))
     )
     assert live, "no live docs found - this test would check nothing"
     dangling: list[str] = []
     for doc in live:
-        for m in re.finditer(
-            r"`((?:docs|eval|src|tests|policies)/[A-Za-z0-9_./-]+)`", doc.read_text()
-        ):
-            ref = m.group(1)
-            if "*" in ref or "<" in ref or (REPO / ref).exists():
+        for ref in sorted(_mentioned_paths(doc.read_text())):
+            if ref in DELIBERATELY_ABSENT or ref in EXTERNAL_CONVENTIONS:
                 continue
-            # a doc may name a path in order to say it does NOT exist
+            if (REPO / ref).exists() or (doc.parent / ref).exists():
+                continue
             dangling.append(f"{doc.relative_to(REPO)} -> {ref}")
-    assert not dangling, "live docs point at files that do not exist:\n  " + "\n  ".join(dangling)
+    assert not dangling, (
+        "live docs name repo paths that do not exist:\n  "
+        + "\n  ".join(dangling)
+        + "\nFix the path, or add it to DELIBERATELY_ABSENT with the reason. Do NOT reword the "
+        "reference until this test stops matching it."
+    )
+
+
+def test_no_document_contains_a_broken_link() -> None:
+    """Links are navigation, and a broken one is broken whatever the age of the
+    document. Checked EVERYWHERE, `docs/history/` included: the banners marking
+    those files superseded were added by pointing at the live documents, and a
+    banner whose links do not resolve is worse than no banner.
+    """
+    broken: list[str] = []
+    for doc in sorted(REPO.glob("**/*.md")):
+        if any(part in (".venv", "node_modules", ".git") for part in doc.parts):
+            continue
+        for m in _LINK.finditer(doc.read_text()):
+            ref = m.group(1)
+            if ref.startswith(("http://", "https://", "#", "mailto:")):
+                continue
+            if not (doc.parent / ref.split("#")[0]).exists():
+                broken.append(f"{doc.relative_to(REPO)} -> {ref}")
+    assert not broken, "broken links:\n  " + "\n  ".join(broken)
