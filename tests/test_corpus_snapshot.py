@@ -22,6 +22,8 @@ from eval.make_control_snapshot import (
     snapshot_matches_files,
 )
 
+from eris.evidence import TaskSpec
+
 REPO = Path(__file__).resolve().parents[1]
 PLUMBING = REPO / "eval" / "corpus" / "plumbing-control"
 
@@ -390,50 +392,80 @@ def test_every_keyed_finding_is_inside_the_evidence_the_task_declares() -> None:
     assert checked, "no scored task plants a finding - this test would check nothing"
 
 
-def test_every_keyed_finding_survives_into_the_evidence_actually_emitted() -> None:
+def test_every_keyed_finding_survives_into_the_evidence_actually_emitted(tmp_path: Path) -> None:
     """The declaration is not the artifact. `task.json` says which lines to
-    show; `eris.evidence` decides what a worker actually receives, and it caps
-    an excerpt at `EXCERPT_MAX_LINES` and elides an oversized item in `_cap`.
+    show; `eris.evidence` decides what a worker actually receives, capping an
+    excerpt at `EXCERPT_MAX_LINES` and eliding an oversized item in `_cap`.
     Asserting that a finding lies inside a DECLARED range proves nothing about
     whether its lines reach the prompt (stop review, 2026-08-30).
 
-    So this runs the real emission over the real snapshot and looks for each
-    finding's line numbers in the bytes that come out. The excerpt is emitted
-    line-numbered (`"12: ..."`), which is what makes the check exact rather than
-    a substring guess.
+    So this builds the REAL pack - `build_evidence_pack`, the function the
+    harness calls - over the real snapshot, and looks for each finding's line
+    numbers in the item content a worker would be given. The first version
+    called the private `_excerpt` helper and asserted a size proxy for `_cap`
+    rather than running it: that tested a component, not the emission.
+
+    Skips when snapshots are not built. They are gitignored, so a clean clone
+    has none, and a test that fails there is telling the truth about nothing.
     """
     from eval.score import load_key
 
-    from eris.evidence import EXCERPT_MAX_LINES, ITEM_HEAD_BYTES, Excerpt, _excerpt
+    from eris.evidence import build_evidence_pack
+    from eris.redact import Redactor
+    from eris.writer import RunWriter
+
+    # the established pack-building helpers, rather than a second construction
+    # of policy/env that could drift from the one the harness exercises
+    from tests.test_evidence import ScriptedPopen, make_env, make_policy
 
     corpus = REPO / "eval" / "corpus"
+    tasks = sorted(p.parent for p in corpus.glob("*/task.json"))
+    if not any((d / "snapshot").is_dir() for d in tasks):
+        pytest.skip("no snapshots built in this checkout (gitignored); nothing was verified")
+
     checked = 0
-    for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
-        spec = json.loads((task_dir / "task.json").read_text())
-        if spec.get("scored", True) is False:
+    for i, task_dir in enumerate(tasks):
+        spec_raw = json.loads((task_dir / "task.json").read_text())
+        if spec_raw.get("scored", True) is False or not (task_dir / "snapshot").is_dir():
             continue
-        emitted: dict[str, bytes] = {}
-        for e in spec.get("excerpts", []):
-            got = _excerpt(task_dir / "snapshot", Excerpt(**e))
-            assert not isinstance(got, str), f"{task_dir.name}: excerpt refused: {got}"
-            content, truncated = got
-            assert not truncated, (
-                f"{task_dir.name}: excerpt {e['path']} is truncated at {EXCERPT_MAX_LINES} "
-                "lines; the tail never reaches the worker"
+        spec = TaskSpec.model_validate(spec_raw)
+        (tmp_path / f"env{i}").mkdir(parents=True, exist_ok=True)
+        writer = RunWriter(tmp_path / f"run{i}", Redactor(), run_id=f"r{i}").open()
+        try:
+            build = build_evidence_pack(
+                spec,
+                env=make_env(
+                    tmp_path / f"env{i}",
+                    task_dir / "snapshot",
+                    ScriptedPopen(),
+                    make_policy(tmp_path / f"env{i}"),
+                ),
+                writer=writer,
+                repeat_index=0,
+                policy_sha256="0" * 64,
+                snapshot_sha=None,
             )
-            assert len(content) < ITEM_HEAD_BYTES, (
-                f"{task_dir.name}: excerpt {e['path']} is large enough for `_cap` to elide its "
-                "middle before a worker sees it"
+        finally:
+            writer.close()
+        # Parsed out of `build.rendered` - the bytes that become the prompt -
+        # not out of the intermediate item objects. Canonical JSON, so the
+        # content is escaped in the raw bytes and has to be decoded rather than
+        # substring-searched: the first version looked for a literal newline and
+        # failed against the escaped one.
+        emitted: dict[str, str] = {}
+        for item in json.loads(build.rendered)["items"]:
+            label = str(item["label"])
+            if not label.startswith("excerpt:"):
+                continue
+            path = label.split(":", 2)[1]
+            assert not item["truncated"], (
+                f"{task_dir.name}: the excerpt for {path} is truncated before a worker sees it"
             )
-            emitted[e["path"]] = emitted.get(e["path"], b"") + content
+            emitted[path] = emitted.get(path, "") + str(item["content"])
         for f in load_key(corpus, task_dir.name).findings:
             checked += 1
-            body = emitted.get(f.path, b"")
-            missing = [
-                n
-                for n in range(f.line_start, f.line_end + 1)
-                if f"\n{n}: ".encode() not in b"\n" + body
-            ]
+            body = "\n" + emitted.get(f.path, "")
+            missing = [n for n in range(f.line_start, f.line_end + 1) if f"\n{n}: " not in body]
             assert not missing, (
                 f"{task_dir.name}: finding {f.id} claims {f.path} L{f.line_start}-{f.line_end}, "
                 f"but lines {missing[:5]} are not in the evidence the worker receives"
