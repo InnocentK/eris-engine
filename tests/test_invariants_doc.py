@@ -455,6 +455,15 @@ def test_the_changelog_records_the_current_version() -> None:
 # to prevent, and the first version of it was silenced that way: the paths below
 # had their backticks removed, and the check only looked at backticked text.
 DELIBERATELY_ABSENT: dict[str, str] = {
+    # The rule that catches truncated references has to SHOW one, and a
+    # demonstration of a name that does not exist must not be reworded until the
+    # check stops seeing it - that is the evasion this whole rule exists to
+    # prevent. Listed instead, which is what the list is for.
+    # keyed on what the scan actually produces - the prefix plus the ONE
+    # truncating character, since the run stops there
+    "docs/EVAL-PLAN.md~": "an example of a truncated reference, in the rule that catches them",
+    "docs/EVAL-PLAN.md+": "an example of a truncated reference, in the rule that catches them",
+    "docs/EVAL-PLAN.md@": "an example of a truncated reference, in the rule that catches them",
     "eval/README.md": (
         "never written. Four live documents named it as the home of the Phase 0 "
         "decision rule; the rule is in docs/EVAL-PLAN.md, which says so."
@@ -524,10 +533,28 @@ _RUN = re.compile(r"[A-Za-z0-9_./-]+")
 _SOURCE_DIRS = ("docs", "eval", "src", "tests", "policies")
 
 
+# Characters that are LEGAL in a filename but absent from `_RUN`. If one follows
+# a match, the name was cut short and the prefix we captured is not the name that
+# was written - `docs/EVAL-PLAN.md~` truncated to `docs/EVAL-PLAN.md`, which
+# exists, so a reference to a file that does not exist passed. Existence of a
+# prefix proves nothing about the whole, so a truncated reference is REPORTED
+# rather than resolved: the check fails closed on what it cannot read.
+#
+# `'` is deliberately absent: an apostrophe after a filename is an English
+# possessive far more often than part of a name ("AGENTS.md's rule"), and no
+# file in this repository has one.
+_TRUNCATING = set("~+@%=&!$^")
+
+
 def _candidates(text: str) -> set[str]:
-    """Every repo-shaped path mentioned, whatever it was dressed in."""
+    """Every repo-shaped path mentioned, whatever it was dressed in.
+
+    A candidate whose name was truncated comes back with its truncating
+    character attached, so it cannot resolve and is reported.
+    """
     out: set[str] = set()
-    for m in _RUN.finditer(_DECORATION.sub(" ", text)):
+    text = _DECORATION.sub(" ", text)
+    for m in _RUN.finditer(text):
         # leading/trailing `_` and `-` are emphasis, a trailing `.` or `,` is the
         # end of a sentence - none of them is part of a name
         ref = m.group(0).strip("_-,").rstrip(".")
@@ -536,10 +563,10 @@ def _candidates(text: str) -> set[str]:
         if not ref or ref.startswith("/"):
             continue
         head, _, rest = ref.partition("/")
-        if head in _SOURCE_DIRS and rest:
-            out.add(ref)
-        elif ref.endswith(".md") and ref.rsplit("/", 1)[-1] != ".md":
-            out.add(ref)
+        if not ((head in _SOURCE_DIRS and rest) or (ref.endswith(".md") and ref != ".md")):
+            continue
+        nxt = text[m.end() : m.end() + 1]
+        out.add(ref + nxt if nxt in _TRUNCATING else ref)
     return out
 
 

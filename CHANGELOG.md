@@ -105,8 +105,12 @@ in the same session, and one was in a test that passed for the wrong reason.
   not anticipate: deleted backticks, a directory with no extension, a directory
   with no trailing slash, and markdown italics. A directory counts as a
   reference and so does any `*.md`; links are checked in every document
-  including `docs/history/` and `docs/decisions/`. Verified by probing the
-  cross-product - eight targets x 27 ways of writing one - rather than the cases
+  including `docs/history/` and `docs/decisions/`. A reference whose name is cut
+  short by a character legal in a filename but outside the scanned set
+  (`docs/EVAL-PLAN.md~`, `...md+new`) is REPORTED rather than resolved: the
+  prefix exists, the file written does not, and the existence of a prefix proves
+  nothing about the whole. Verified by probing the cross-product - eleven
+  targets x 27 ways of writing one, 297 combinations - rather than the cases
   that came to mind. The first version looked only inside
   backticks, and the two references that survived it survived because their
   backticks had been removed to make it pass: an invariant a formatting change
