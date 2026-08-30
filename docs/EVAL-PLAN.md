@@ -15,18 +15,6 @@ experiments showed, and what must still run before any scored corpus run.
   read-only; `--resume` continues; STOP files and SIGINT are honoured;
   `python eval/score.py --campaign-dir runs/<id> --corpus eval/corpus`
   scores. Exit codes 0/2/3/4/5/6/7/130 (`eval/run.py` docstring).
-* **Malformation is first-class (M1, 0.4.1):** a cell whose FINAL adjudication carries an
-  error-severity finding the engine does NOT act on (`validate.UNHANDLED_CODES`:
-  `CLAIM_MISSING`, `DUPLICATE_RULING`, `DISSENT_EMPTY_WITH_CONTEST`,
-  `RESIDUAL_RISKS_EMPTY_ON_ACCEPT`, ...) is EXCLUDED from quality metrics and from
-  paired deltas: a record the engine judged incoherent is not evidence, and a delta
-  against one is confounded with the malformation. The per-arm `validator` block
-  reports the rate. **An arm with a higher malformed rate has not earned a better
-  score**, and the decision rule must read that block before the quality means.
-  Codes the engine already ACTS on (the `REF_*` family downgrades its ruling and is
-  measured by `unsupported_claim_rate`; `VERDICT_*` forces ACCEPT to ESCALATE) do NOT
-  exclude - that is the engine working, and excluding it would delete the denominator
-  for the very behaviour those metrics exist to report.
 * **Pre-registration notes (binding for the scorer):** arm 2 (`consensus`)
   is scored on the RAW summarizer verdict (the enforced one is recorded
   too); arms 3/3b/4 are paired only when their `propose_keys` are
@@ -36,6 +24,23 @@ experiments showed, and what must still run before any scored corpus run.
   **Caveat (testing critic, recorded):** `plan` keys are as readable to a
   worker as the others; `plan` and `control` are scored without
   containment by user decision, and their results carry the same E1 risk.
+  **Malformation is first-class (M1, 0.4.1), and BINDING.** A cell whose FINAL
+  adjudication carries an error-severity finding the engine does NOT act on
+  (`validate.UNHANDLED_CODES`: `CLAIM_MISSING`, `DUPLICATE_RULING`,
+  `DISSENT_EMPTY_WITH_CONTEST`, `RESIDUAL_RISKS_EMPTY_ON_ACCEPT`) is EXCLUDED from
+  quality metrics and from paired deltas: a record the engine judged incoherent is
+  not evidence, and a delta against one is confounded with the malformation.
+  Excluding creates a NEW bias - only arm 4 passes critiques to the validator, so
+  only it can emit `DISSENT_EMPTY_WITH_CONTEST`, and an arm that drops its
+  malformed cells is left with a cleaner SUBSAMPLE. So `summary.comparison.blocked`
+  is set MECHANICALLY whenever any arm dropped cells for validator findings, and
+  **while it is set the decision rule may not be applied to the per-arm means** -
+  a gate, not advice, the same posture as the E1 containment gate.
+  Codes the engine already ACTS on (`REF_*` downgrades its ruling and is measured by
+  `unsupported_claim_rate`; `VERDICT_*` forces ACCEPT to ESCALATE) do NOT exclude -
+  that is the engine working, and excluding it would delete the denominator for the
+  very behaviour those metrics exist to report.
+
 * A campaign cell whose ledger is unreadable is reserved pessimistically
   (every planned call of that arm, judge iterations included, at the worst
   case the retry driver can reach), so a corruption can halt later cells on

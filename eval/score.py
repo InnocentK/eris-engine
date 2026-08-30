@@ -485,8 +485,13 @@ def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
     ]
     if not matched:
         return None, {}
+    # The LAST matching event wins. Adjudication ids are deterministic
+    # (`stages.py`: `adj-{prefix}`), so a crash after `validate.findings` but
+    # before `stage.finished` leaves a stale event that a clean re-run reproduces
+    # under the SAME id. Summing every match would let the abandoned attempt
+    # exclude the outcome that replaced it - the attempt-vs-outcome error again.
     counts: dict[str, int] = {}
-    for payload in matched:
+    for payload in matched[-1:]:
         for f in payload.get("findings") or []:
             if isinstance(f, dict) and f.get("severity") == "error":
                 code = str(f.get("code", "?"))
@@ -551,6 +556,14 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         ar.arm is not Arm.SINGLE and cell.enforced is None
     ):
         exclusion = "incomplete"
+    elif ar.final_adjudication_id is not None and validator_errors is None:
+        # The cell HAS a final adjudication but no findings event for it, so the
+        # engine's verdict on that record is unknown. Unknown is not clean: the
+        # docstring above says so, and this is the branch that makes it true
+        # rather than merely stated. (`final_adjudication_id is None` - arm 1,
+        # which has no judge - stays scoreable; there is no adjudication to
+        # judge, which is different from one we cannot vouch for.)
+        exclusion = "validator_unknown"
     elif validator_errors:
         # M1: the engine itself judged this adjudication malformed. Scoring it
         # would let a cell whose record is internally broken contribute to
@@ -653,6 +666,7 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                     "ledger_invalid",
                     "no_scan",
                     "validator_errors",
+                    "validator_unknown",
                 )
             },
             # M1: first-class, not a footnote. `malformed` counts cells whose
@@ -663,6 +677,13 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                 "malformed": len([s for s in cells if s.validator_errors]),
                 "unknown": len([s for s in cells if s.validator_errors is None]),
                 "errors": sum(s.validator_errors or 0 for s in cells),
+                # a RATE, not just counts: 1-of-1 and 2-of-100 are not comparable
+                # as counts, and EVAL-PLAN's rule is stated in terms of a rate
+                "malformed_rate": (
+                    round(len([s for s in cells if s.validator_errors]) / len(cells), 4)
+                    if cells
+                    else None
+                ),
                 "codes": {
                     c: sum(s.validator_codes.get(c, 0) for s in cells)
                     for c in sorted({c for s in cells for c in s.validator_codes})
@@ -738,7 +759,9 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                     "output bytes from the base arm (or recorded none)"
                 )
                 entry["unshared_propose_keys"] = differing
-            elif s_treat.validator_errors or s_base.validator_errors:
+            elif (s_treat.validator_errors or s_base.validator_errors) or (
+                s_treat.exclusion == "validator_unknown" or s_base.exclusion == "validator_unknown"
+            ):
                 # M1: a paired delta attributes a difference to the TREATMENT.
                 # If either adjudication is malformed the difference is
                 # confounded with "this judge emitted CLAIM_MISSING", exactly as
@@ -746,8 +769,8 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                 # well formed before a delta means anything.
                 entry["paired"] = False
                 entry["reason"] = (
-                    f"validator errors: treatment {s_treat.validator_errors or 0}, "
-                    f"base {s_base.validator_errors or 0}"
+                    f"validator errors/unknown: treatment {s_treat.validator_errors}, "
+                    f"base {s_base.validator_errors}"
                 )
             elif not (s_treat.included and s_base.included):
                 entry["paired"] = False
@@ -790,6 +813,41 @@ def cell_dirs(campaign_dir: Path) -> list[Path]:
     return out
 
 
+def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
+    """Whether the per-arm quality means may be compared at all.
+
+    Blocked when any arm dropped cells for `validator_errors`/`validator_unknown`:
+    its mean is then over a cleaner subsample than the arms it is being compared
+    with, and "catch rate" stops meaning the same thing per arm. Mechanical, so
+    a reader cannot quote `per_arm[*].recall` without seeing it.
+    """
+    per_arm: dict[str, dict[str, Any]] = {}
+    for arm in sorted({s.arm for s in scores}):
+        cells = [s for s in scores if s.arm == arm]
+        dropped = len(
+            [s for s in cells if s.exclusion in ("validator_errors", "validator_unknown")]
+        )
+        per_arm[arm] = {
+            "cells": len(cells),
+            "dropped_for_validator": dropped,
+            "malformed_rate": round(dropped / len(cells), 4) if cells else None,
+        }
+    offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
+    return {
+        "blocked": bool(offenders),
+        "reason": (
+            "arms "
+            + ", ".join(offenders)
+            + " dropped cells for validator findings; their quality means are over a "
+            "cleaner subsample than the other arms and are NOT comparable. Resolve the "
+            "malformations or compare only pairs where both cells are well formed."
+        )
+        if offenders
+        else None,
+        "per_arm": per_arm,
+    }
+
+
 def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str, Any]:
     scores: list[CellScore] = []
     invalid: list[dict[str, str]] = []
@@ -819,6 +877,14 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         "skipped": skipped,
         "per_arm": aggregate(scores),
         "paired": paired_deltas(scores),
+        # M1 (panel): excluding malformed cells creates a NEW bias - only arm 4
+        # passes critiques to the validator, so only it can emit
+        # DISSENT_EMPTY_WITH_CONTEST, and an arm that drops its malformed cells
+        # is left with a cleaner SUBSAMPLE that can win on catch rate. The
+        # per-arm means are then computed over different populations and are not
+        # comparable. Saying so in prose is advice; this says it in the output,
+        # the way the E1 gate does.
+        "comparison": _comparison_block(scores),
         "validator": {
             "malformed_cells": len([s for s in scores if s.validator_errors]),
             "unknown_cells": len([s for s in scores if s.validator_errors is None]),

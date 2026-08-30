@@ -756,10 +756,14 @@ def test_unhandled_codes_is_exactly_the_set_that_changes_nothing() -> None:
     a code that downgrades a ruling or forces a verdict is HANDLED, one that
     leaves the record untouched is not.
     """
-    from eris.validate import UNHANDLED_CODES
+    from eris.validate import CODES, UNHANDLED_CODES
 
     C = {cid: claim(cid) for cid in ("c_01", "c_02")}
     good = Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])
+    ev_model = {
+        **EVIDENCE,
+        "e_m": evidence("e_m", origin=Origin.MODEL_ASSERTED, kind=EvidenceKind.MODEL_ASSERTION),
+    }
     ev_human = {
         **EVIDENCE,
         "e_h": evidence("e_h", origin=Origin.HUMAN_ENTERED, kind=EvidenceKind.DOCUMENT_QUOTE),
@@ -792,6 +796,12 @@ def test_unhandled_codes_is_exactly_the_set_that_changes_nothing() -> None:
             EVIDENCE,
         ),
         (
+            "REF_MODEL_ASSERTED",
+            [Ruling(claim_id="c_01", status=ClaimStatus.SUPPORTED, evidence_refs=["e_m"])],
+            {},
+            ev_model,
+        ),
+        (
             "CLAIM_MISSING",
             [Ruling(claim_id="ghost", status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"])],
             {},
@@ -811,6 +821,43 @@ def test_unhandled_codes_is_exactly_the_set_that_changes_nothing() -> None:
             EVIDENCE,
         ),
     ]
+    two_supported = [
+        Ruling(claim_id=c, status=ClaimStatus.SUPPORTED, evidence_refs=["e_01"]) for c in C
+    ]
+    cases += [
+        # HANDLED verdict codes - these must NOT be in UNHANDLED_CODES, or a
+        # correctly-escalated ACCEPT would be thrown away as malformed
+        ("VERDICT_UNSUPPORTED", [], {"verdict": Verdict.ACCEPT}, EVIDENCE),
+        (
+            "VERDICT_UNRESOLVED_CLAIMS",
+            [two_supported[0]],
+            {"verdict": Verdict.ACCEPT},
+            EVIDENCE,
+        ),
+    ]
+    covered = {c for c, _, _, _ in cases}
+    # Codes `enforce_rulings` cannot emit, each with the reason. A NEW code must
+    # be added to `cases` or to this map, so it cannot be introduced unclassified
+    # and silently leave its cells in the denominator.
+    not_from_enforce_rulings = {
+        "ESCALATED": "info severity, emitted alongside a handled escalation",
+        "ORIGIN_MISMATCH": "produced by validate_origin, which is never invoked",
+        "UNVERIFIED_CHALLENGE": "produced by validate_critique, which is never invoked",
+        "REF_PREDATES_CLAIM": "needs verification-phase evidence older than the claim",
+        "SEQ_GAP": "ledger chain validator, not an adjudication finding",
+        "HASH_MISMATCH": "ledger chain validator",
+        "SCHEMA_VERSION": "ledger chain validator",
+        "MALFORMED_LINE": "ledger chain validator",
+    }
+    unclassified = sorted(CODES - covered - set(not_from_enforce_rulings))
+    assert not unclassified, (
+        f"finding codes classified nowhere: {unclassified}. Every code must either have a "
+        "case here (which measures whether it is handled) or a stated reason it cannot come "
+        "from enforce_rulings - otherwise a new code can be added without anyone deciding "
+        "whether its cells are still evidence."
+    )
+    missing = sorted(UNHANDLED_CODES - covered - set(not_from_enforce_rulings))
+    assert not missing, f"UNHANDLED_CODES members with no case: {missing}"
     for code, rulings, kw, ev in cases:
         adj = adjudication(rulings, **kw)
         enforced, findings = enforce_rulings(adj, C, ev)

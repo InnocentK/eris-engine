@@ -32,6 +32,26 @@ could be full of incoherent adjudications and every metric would look clean.
 * `test_unhandled_codes_is_exactly_the_set_that_changes_nothing` pins the set
   against measured behaviour, so it cannot drift from the code.
 
+Post-change panel (OpenAI + xAI, both BLOCK) added, all verified and fixed:
+
+* `None` had a value but no CONSEQUENCE - a cell with an adjudication and no
+  findings event was still scored. Unknown is not clean: it is now excluded
+  (`validator_unknown`) and cannot pair.
+* The LAST findings event per adjudication id wins. Ids are deterministic
+  (`adj-{prefix}`), so a crash after `validate.findings` and before
+  `stage.finished` leaves a stale event the clean re-run reproduces under the
+  SAME id; summing every match let the abandoned attempt exclude the outcome
+  that replaced it - the attempt-vs-outcome error, inside the fix for M1.
+* **Excluding malformed cells creates a NEW bias.** Only arm 4 passes critiques
+  to the validator, so only it can emit `DISSENT_EMPTY_WITH_CONTEST`; an arm
+  that drops its malformed cells is left with a cleaner SUBSAMPLE and can win on
+  catch rate. `summary.comparison.blocked` is now set MECHANICALLY whenever any
+  arm dropped cells, and `docs/EVAL-PLAN.md` says under its BINDING heading that
+  the decision rule may not be applied while it is set - a gate, not advice.
+* The partition test is exhaustive over `CODES`: every code must have a case
+  (which MEASURES whether it is handled) or a stated reason it cannot come from
+  `enforce_rulings`. It immediately caught `REF_MODEL_ASSERTED` unclassified.
+
 Not done, deliberately: giving `CLAIM_MISSING` / `DISSENT_EMPTY_WITH_CONTEST`
 verdict powers is a protocol change of the same kind as H3 and belongs to the
 user. `validate_critique` and `validate_origin` are never invoked at all - a
