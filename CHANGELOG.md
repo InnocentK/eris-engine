@@ -14,6 +14,12 @@ string is TRUE. Six ledgers in `runs/` are of that vintage, so this was live.
   exact and hid the coarsely-classified ones, bypassing the gate. Both functions
   now read one shared `_matched_findings` extractor so they cannot disagree
   about which findings they describe.
+* The gate's EXPLANATION is true for both causes. It said the arm "has cells
+  from ledgers with no `Finding.acted`" - false twice over for a mixed cell,
+  whose ledger does have `acted` and only some of whose findings were scored
+  coarsely; a reader would hunt for a pre-0.4.2 ledger, find none, and conclude
+  the gate was wrong. The basis value is `coarse_codes` (not `legacy_codes`) and
+  the per-arm key is `coarsely_scored_cells`, because both cover a mixed cell.
 * `_validator_basis` reports how each cell was classified: `"acted"` (exact) or
   `"legacy_codes"` (coarse - it calls every `REF_*` handled and therefore
   UNDER-REPORTS malformation).

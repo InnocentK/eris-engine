@@ -1409,7 +1409,7 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
     modern = cellview([{"code": "REF_MISSING", "severity": "error", "acted": False}])
     legacy = cellview([{"code": "REF_MISSING", "severity": "error"}])
     assert _validator_basis(modern) == "acted"
-    assert _validator_basis(legacy) == "legacy_codes"
+    assert _validator_basis(legacy) == "coarse_codes"
 
     # MIXED: classification is per FINDING, so one event can have some findings
     # classified exactly and some coarsely. Asking "does ANY finding carry
@@ -1421,7 +1421,7 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
             {"code": "REF_MISSING", "severity": "error"},  # no `acted` -> coarse
         ]
     )
-    assert _validator_basis(mixed_f) == "legacy_codes", (
+    assert _validator_basis(mixed_f) == "coarse_codes", (
         "a cell with ANY finding lacking `acted` was classified coarsely at least once "
         "and must not report itself as exact"
     )
@@ -1473,12 +1473,16 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
     assert clean["blocked"] is False
 
     mixed = _comparison_block(
-        [score("indep_verify", "acted"), score("indep_verify_iter", "legacy_codes")]
+        [score("indep_verify", "acted"), score("indep_verify_iter", "coarse_codes")]
     )
     assert mixed["blocked"] is True
-    assert "under-reports" in mixed["reason"] and "indep_verify_iter" in mixed["reason"]
-    assert mixed["per_arm"]["indep_verify_iter"]["legacy_basis_cells"] == 1
-    assert mixed["per_arm"]["indep_verify"]["legacy_basis_cells"] == 0
+    assert "indep_verify_iter" in mixed["reason"]
+    assert "at least one finding lacks" in mixed["reason"]
+    assert "under-reports malformation" in mixed["reason"]
+    # the explanation must not claim the ledger has NO `acted` - a mixed cell has some
+    assert "ledgers with no" not in mixed["reason"]
+    assert mixed["per_arm"]["indep_verify_iter"]["coarsely_scored_cells"] == 1
+    assert mixed["per_arm"]["indep_verify"]["coarsely_scored_cells"] == 0
 
     # a MIXED cell reports `legacy_codes`, so the gate fires on it too
     assert (
@@ -1487,3 +1491,71 @@ def test_a_legacy_ledger_is_scored_coarsely_and_blocks_the_comparison() -> None:
         )["blocked"]
         is True
     )
+
+
+def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
+    """A gate that fires for the right reason must also SAY the right reason.
+
+    The first wording said the arm "has cells from ledgers with no
+    `Finding.acted`". For a cell that MIXES findings carrying `acted` with
+    findings that do not, that is false twice over - the ledger does have
+    `acted`, and only some findings were classified coarsely. A reader would
+    hunt for a pre-0.4.2 ledger and find none, and conclude the gate was wrong.
+    """
+    from eval.score import CellScore, _comparison_block
+
+    def score(arm: str, basis: str | None) -> Any:
+        return CellScore(
+            run_id=f"r-{arm}",
+            task_id="t",
+            arm=arm,
+            repeat_index=0,
+            category="control",
+            included=True,
+            exclusion=None,
+            verdict="REVISE",
+            verdict_basis="enforced",
+            precision=0.5,
+            recall=0.5,
+            tp=1,
+            fp=1,
+            fn=1,
+            distractor_hits=0,
+            unsupported_claim_rate=0.0,
+            downgrades=0,
+            confident_wrong=False,
+            abstained=False,
+            expected_abstain=False,
+            cost_spent_usd=1.0,
+            cost_attributed_usd=1.0,
+            cost_by_stage_spent={},
+            cost_by_stage_attributed={},
+            unknown_cost_records=0,
+            wall_ms=1,
+            attempts=1,
+            propose_keys=[],
+            validator_errors=0,
+            validator_codes={},
+            validator_basis=basis,
+            propose_blobs={},
+            contaminated=False,
+            scan_incomplete=False,
+            rescan_contaminated=False,
+            containment=None,
+        )
+
+    block = _comparison_block(
+        [score("indep_verify", "acted"), score("indep_verify_critique", "coarse_codes")]
+    )
+    assert block["blocked"] is True
+    reason = block["reason"]
+    # true of BOTH causes: an old ledger and a mixed cell
+    assert "at least one finding lacks" in reason
+    assert "written before 0.4.2, or a cell mixing findings" in reason
+    # and it must not assert the stronger, sometimes-false claim. Case-insensitive:
+    # the first version of this check missed a mutation that only changed "ledgers"
+    # to "Ledgers".
+    low = reason.lower()
+    assert "ledgers with no `finding.acted`" not in low
+    assert "with no `finding.acted`" not in low
+    assert block["per_arm"]["indep_verify_critique"]["coarsely_scored_cells"] == 1
