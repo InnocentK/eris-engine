@@ -419,7 +419,7 @@ class CellScore:
     # cell has no adjudication to judge - never conflate that with "clean".
     validator_errors: int | None
     validator_codes: dict[str, int]
-    # "acted" (exact) | "legacy_codes" (coarse, under-reports) | None
+    # "acted" (exact) | "coarse_codes" (>=1 finding lacked `acted`) | None
     validator_basis: str | None
     contaminated: bool
     scan_incomplete: bool
@@ -480,7 +480,7 @@ def _validator_basis(cell: CellData) -> str | None:
     """How `_validator_errors` classified this cell's findings.
 
     `"acted"` - EVERY finding records `Finding.acted`, so the classification is
-    exact. `"legacy_codes"` - at least one does not, so at least one finding was
+    exact. `"coarse_codes"` - at least one does not, so at least one finding was
     classified by the coarse `UNHANDLED_CODES` fallback, which calls every
     `REF_*` handled and therefore UNDER-REPORTS malformation.
 
@@ -492,7 +492,7 @@ def _validator_basis(cell: CellData) -> str | None:
     findings = _matched_findings(cell)
     if not findings:
         return None
-    return "acted" if all("acted" in f for f in findings) else "legacy_codes"
+    return "acted" if all("acted" in f for f in findings) else "coarse_codes"
 
 
 def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
@@ -906,10 +906,10 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
             "dropped_for_validator": dropped,
             "malformed_rate": round(dropped / len(cells), 4) if cells else None,
         }
-    legacy = sorted({s.arm for s in scores if s.validator_basis == "legacy_codes"})
+    coarse = sorted({s.arm for s in scores if s.validator_basis == "coarse_codes"})
     for arm, v in per_arm.items():
-        v["legacy_basis_cells"] = len(
-            [s for s in scores if s.arm == arm and s.validator_basis == "legacy_codes"]
+        v["coarsely_scored_cells"] = len(
+            [s for s in scores if s.arm == arm and s.validator_basis == "coarse_codes"]
         )
     offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
     reasons: list[str] = []
@@ -918,14 +918,16 @@ def _comparison_block(scores: Sequence[CellScore]) -> dict[str, Any]:
             "arms " + ", ".join(offenders) + " dropped cells for validator findings; their "
             "quality means are over a cleaner subsample than the other arms"
         )
-    if legacy:
-        # Honesty about the fallback: on a pre-0.4.2 ledger the coarse code set
+    if coarse:
+        # Honesty about the fallback: wherever `acted` is absent the coarse code set
         # calls every REF_* handled, so malformation is UNDER-reported there.
         # Comparing such an arm with one scored on `acted` compares two different
         # definitions of malformed.
         reasons.append(
-            "arms " + ", ".join(legacy) + " have cells from ledgers with no `Finding.acted`, "
-            "scored by the coarse legacy code set, which under-reports malformation"
+            "arms " + ", ".join(coarse) + " have cells where at least one finding lacks "
+            "`Finding.acted` and was therefore classified by the coarse code set - a ledger "
+            "written before 0.4.2, or a cell mixing findings that carry it with findings that "
+            "do not. That fallback calls every `REF_*` handled, so it under-reports malformation"
         )
     return {
         "blocked": bool(reasons),
