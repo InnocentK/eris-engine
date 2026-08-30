@@ -1291,3 +1291,49 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
         [cell("indep_verify", None), cell("indep_verify_iter", "validator_unknown")]
     )
     assert unknown["blocked"] is True
+
+
+def test_an_inert_REF_error_excludes_the_cell_even_though_its_code_is_handled() -> None:
+    """M1, stop-gate finding: the scorer must use `acted`, not the code.
+
+    `REF_MISSING` is in the HANDLED family - it downgrades a SUPPORTED ruling -
+    but on a CONTESTED or UNSUPPORTED ruling it is flagged and then ignored. A
+    code-keyed rule calls that handled and leaves the cell in the denominator,
+    which is exactly the M1 hole. `acted: false` in the event is authoritative.
+    """
+    from types import SimpleNamespace
+
+    from eval.score import _validator_errors
+
+    class _View:
+        def __init__(self, payloads: list[dict[str, Any]]) -> None:
+            self._p = payloads
+
+        def payloads(self, kind: str) -> list[dict[str, Any]]:
+            return self._p if kind == "validate.findings" else []
+
+    def cell(findings: list[dict[str, Any]]) -> Any:
+        return SimpleNamespace(
+            view=_View([{"adjudication_id": "adj-1", "findings": findings}]),
+            arm_run=SimpleNamespace(final_adjudication_id="adj-1"),
+        )
+
+    inert = {"code": "REF_MISSING", "severity": "error", "acted": False}
+    acted = {"code": "REF_MISSING", "severity": "error", "acted": True}
+
+    # inert REF_MISSING counts, despite its code being in the "handled" family
+    assert _validator_errors(cell([inert])) == (1, {"REF_MISSING": 1})
+    # the same code, actually acted on, does not
+    assert _validator_errors(cell([acted])) == (0, {})
+    # mixed: only the inert one counts
+    assert _validator_errors(cell([acted, inert, acted])) == (1, {"REF_MISSING": 1})
+    # an acted VERDICT_* finding does not count either
+    assert _validator_errors(
+        cell([{"code": "VERDICT_UNSUPPORTED", "severity": "error", "acted": True}])
+    ) == (0, {})
+
+    # LEGACY ledger with no `acted` key falls back to the code set
+    legacy_ref = {"code": "REF_MISSING", "severity": "error"}
+    legacy_claim = {"code": "CLAIM_MISSING", "severity": "error"}
+    assert _validator_errors(cell([legacy_ref])) == (0, {})  # coarse: assumed handled
+    assert _validator_errors(cell([legacy_claim])) == (1, {"CLAIM_MISSING": 1})

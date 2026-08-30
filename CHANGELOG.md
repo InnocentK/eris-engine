@@ -32,6 +32,15 @@ could be full of incoherent adjudications and every metric would look clean.
 * `test_unhandled_codes_is_exactly_the_set_that_changes_nothing` pins the set
   against measured behaviour, so it cannot drift from the code.
 
+**Findings carry `acted`, and the scorer uses it instead of the code.** A
+stop-gate found the code-keyed rule wrong in principle: only a SUPPORTED/REFUTED
+ruling is downgraded, so `REF_MISSING` is acted on for those and completely
+INERT on a CONTESTED or UNSUPPORTED ruling - the same code is handled in one
+ruling and ignored in the next. `Finding.acted` is set by `enforce_rulings`,
+which is the only place that knows, and written per finding into
+`validate.findings`. `UNHANDLED_CODES` remains only as the coarse fallback for
+ledgers <= 0.4.1 that carry no `acted` (it under-reports there, and says so).
+
 Post-change panel (OpenAI + xAI, both BLOCK) added, all verified and fixed:
 
 * `None` had a value but no CONSEQUENCE - a cell with an adjudication and no

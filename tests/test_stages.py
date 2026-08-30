@@ -1022,3 +1022,34 @@ def test_propose_stage_finished_records_whether_the_kept_proposal_was_reused(
     assert finished and finished[-1]["reused"] is False
     assert finished[-1]["idempotency_key"] == out.key
     w.writer.close()
+
+
+def test_the_ledger_records_whether_each_finding_was_acted_on(tmp_path: Path) -> None:
+    """M1: `validate.findings` must carry the REAL `acted` value per finding.
+
+    `eval/score.py` decides whether a cell is evidence from this field, so a
+    writer that hard-coded it would silently restore the M1 hole. A CONTESTED
+    ruling with a bad ref is flagged and then ignored (only SUPPORTED/REFUTED are
+    downgraded), so its finding must reach the ledger as `acted: false`.
+    """
+    w = World(tmp_path, {("grok", "propose"): [GOOD_PROPOSAL]})
+    _, prop = run_propose(w.ctx, "grok", w.pack)
+    assert prop is not None
+    cid = prop.claims[0].claim_id
+    adj = {
+        **good_adjudication([cid], ["nonexistent-evidence-id"]),
+        "rulings": [
+            {"claim_id": cid, "status": "CONTESTED", "evidence_refs": ["nope"], "note": ""}
+        ],
+    }
+    w.spy.answers[("judge", "adjudicate")] = [adj]
+    res = run_adjudicate(
+        w.ctx, "judge", w.pack, [prop], [], [], evidence_index(w.pack, []), role="adjudicator"
+    )
+    assert res.enforced is not None and res.enforced.downgrades == 0  # inert: not downgraded
+
+    event = next(e["payload"] for e in w.events() if e["kind"] == "validate.findings")
+    ref = next(f for f in event["findings"] if f["code"] == "REF_MISSING")
+    assert ref["acted"] is False, "an inert finding must not be recorded as acted"
+    assert ref["severity"] == "error"
+    w.writer.close()
