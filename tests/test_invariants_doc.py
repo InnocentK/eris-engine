@@ -496,19 +496,53 @@ UNCHECKED_DOCS: dict[str, str] = {
 # invariant - the first version of this rule was defeated by deleting a pair of
 # backticks. Directories count as well as files: `docs/decisions/` is a pointer
 # like any other.
-# A DIRECTORY is a pointer like any other, and a reference can be written four
-# ways: backticked or bare, with a trailing slash or without. THREE of the four
-# evaded the previous pattern, which demanded a file extension everywhere except
-# in the backticked-with-slash case. `_DIR` appears in both alternatives now and
-# demands neither an extension nor a slash, so all four are matched. Checked
-# against every document in the repository as written: it produces no false
-# positive, so nothing had to be loosened to make the suite pass.
-#
-# The lookbehind excludes `.` and `-` as well as word characters and `/`, so a
-# bare mention matches a WHOLE name: without it, `.github/copilot-instructions.md`
-# yielded a phantom `instructions.md` and `CLAUDE.local.md` a phantom `local.md`.
-_DIR = r"(?:docs|eval|src|tests|policies)/[A-Za-z0-9_./-]*"
-_MENTION = re.compile(rf"`([A-Za-z0-9_./-]+\.md|{_DIR})`|(?<![`/\w.-])({_DIR}|[A-Za-z0-9_-]+\.md)")
+# Formatting is REMOVED before anything is matched, rather than being enumerated
+# in the pattern. Every previous version of this rule was defeated by a way of
+# writing a path it did not anticipate - backticks deleted, a directory without
+# an extension, a directory without a trailing slash - and the last two were
+# `_docs/nowhere_` (markdown italics, whose underscore is a word character and
+# so was swallowed by the lookbehind) and `` `docs`/`nowhere` `` (backticks
+# around each segment). Enumerating decorations is a losing game; stripping them
+# is not. Backticks and asterisks cannot appear in a path, so they are deleted
+# outright, and a candidate's leading and trailing `_`/`-`/`,` are trimmed -
+# emphasis and punctuation, not name.
+# Backtick and asterisk become a SEPARATOR, not nothing. Deleting them merged
+# `AGENTS.md`/`GEMINI.md` - two files - into one phantom path, and turned the
+# glob `eval/corpus/*/snapshot/` into `eval/corpus//snapshot/`. As separators
+# they read correctly: a backtick delimits a span and an asterisk is either
+# emphasis or a wildcard, and in every one of those readings it ends the name.
+# The cost is that `` `docs`/`nowhere` `` - one path written as two spans - is
+# no longer seen as one path. That reading is genuinely ambiguous with the
+# `A`/`B` enumeration above, and getting the common case right is worth more.
+_DECORATION = re.compile(r"[`*]")
+_RUN = re.compile(r"[A-Za-z0-9_./-]+")
+
+# Directories whose contents are part of the SOURCE TREE. `runs/`, `cache/` and
+# `scratch/` are deliberately absent: they hold runtime artefacts that do not
+# exist in a checkout, so a reference to one cannot be resolved and is not a
+# fault. Stated here rather than left as an unexplained list.
+_SOURCE_DIRS = ("docs", "eval", "src", "tests", "policies")
+
+
+def _candidates(text: str) -> set[str]:
+    """Every repo-shaped path mentioned, whatever it was dressed in."""
+    out: set[str] = set()
+    for m in _RUN.finditer(_DECORATION.sub(" ", text)):
+        # leading/trailing `_` and `-` are emphasis, a trailing `.` or `,` is the
+        # end of a sentence - none of them is part of a name
+        ref = m.group(0).strip("_-,").rstrip(".")
+        # a leading slash is the tail of a wildcard that has just been split off
+        # (`eval/corpus/*/README.md` -> `/README.md`), not a path of its own
+        if not ref or ref.startswith("/"):
+            continue
+        head, _, rest = ref.partition("/")
+        if head in _SOURCE_DIRS and rest:
+            out.add(ref)
+        elif ref.endswith(".md") and ref.rsplit("/", 1)[-1] != ".md":
+            out.add(ref)
+    return out
+
+
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
 
 
@@ -555,13 +589,6 @@ def test_every_document_is_either_checked_or_exempt_for_a_stated_reason() -> Non
         )
 
 
-def _mentioned_paths(text: str) -> set[str]:
-    out: set[str] = set()
-    for m in _MENTION.finditer(text):
-        out.add(m.group(1) or m.group(2))
-    return out
-
-
 def test_the_deliberately_absent_list_is_still_true() -> None:
     """An allowlist that outlives its reason is a lie in a config file."""
     for ref, why in DELIBERATELY_ABSENT.items():
@@ -595,7 +622,7 @@ def test_live_docs_do_not_point_at_files_that_do_not_exist() -> None:
     assert live, "no live docs found - this test would check nothing"
     dangling: list[str] = []
     for doc in live:
-        for raw in sorted(_mentioned_paths(doc.read_text())):
+        for raw in sorted(_candidates(doc.read_text())):
             # `docs/decisions/` and `docs/decisions` name the same directory
             ref = raw.rstrip("/")
             if ref in DELIBERATELY_ABSENT or ref in EXTERNAL_CONVENTIONS:

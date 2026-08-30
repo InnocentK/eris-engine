@@ -98,13 +98,16 @@ in the same session, and one was in a test that passed for the wrong reason.
   condition and its map of where the pre-registration lives - as the home of the
   Phase 0 decision rule, and had never been written. `docs/EVAL-PLAN.md` says
   plainly that it carries the pre-registration, and states the rule once.
-* Backticked, bare and markdown-link forms are all checked; a directory counts
-  as well as a file, with or without a trailing slash; and links are checked in
-  every document including `docs/history/` and `docs/decisions/`. A reference
-  can be written four ways and three of them evaded an earlier version of the
-  rule, which demanded a file extension everywhere except in the
-  backticked-with-slash case. Sixty forms are probed - each target bare,
-  backticked, as a link, in a list item, in a table cell and in a heading. The first version looked only inside
+* Formatting is STRIPPED before matching rather than enumerated in a pattern.
+  Backticks and asterisks become separators and surrounding emphasis is
+  trimmed, so how a path is dressed cannot change whether it is seen. Four
+  successive versions of this rule were each defeated by a decoration they did
+  not anticipate: deleted backticks, a directory with no extension, a directory
+  with no trailing slash, and markdown italics. A directory counts as a
+  reference and so does any `*.md`; links are checked in every document
+  including `docs/history/` and `docs/decisions/`. Verified by probing the
+  cross-product - eight targets x 27 ways of writing one - rather than the cases
+  that came to mind. The first version looked only inside
   backticks, and the two references that survived it survived because their
   backticks had been removed to make it pass: an invariant a formatting change
   defeats is not one.
