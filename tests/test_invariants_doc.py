@@ -26,6 +26,7 @@ That is unautomatable and is what mutation-checking a new row is for. See
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -474,15 +475,79 @@ EXTERNAL_CONVENTIONS: frozenset[str] = frozenset(
     }
 )
 
+# Documents NOT mention-checked, each with its reason. Everything else in the
+# repository is checked, so a document added anywhere is covered the moment it
+# exists. The previous version named the two directories it DID check, which
+# meant every document written anywhere else - `eval/corpus/*/README.md`, say -
+# was silently exempt: an allowlist of what is checked fails open by
+# construction, and this one did.
+UNCHECKED_DOCS: dict[str, str] = {
+    "CHANGELOG.md": "a past release entry names the paths that existed at that release",
+    "docs/history/*": "frozen records; each body is as written, under a banner that says so",
+    "docs/decisions/*": "each records the world as it was when the decision was taken",
+    "eval/prompts/*": "frozen prompt text, hashed per run - role and rules, not documentation",
+    "eval/corpus/*/files/*": "corpus payload: the contents of a fixture repository",
+    "eval/corpus/*/snapshot/*": "generated from files/, and gitignored",
+}
+
 # Where a repo path can be written: inside backticks, as a markdown link target,
 # or bare in prose. All three are checked, because which one an author reaches
 # for is a formatting choice and an invariant that turns on formatting is not an
-# invariant. Any backticked `*.md` counts, not a hardcoded list of known
-# documents - a reference to a doc that does not exist is the fault whatever the
-# doc is called.
-_PATH = r"(?:docs|eval|src|tests|policies)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,5}"
-_MENTION = re.compile(rf"`([A-Za-z0-9_./-]+\.md|{_PATH})`|(?<![`/\w])({_PATH})")
+# invariant - the first version of this rule was defeated by deleting a pair of
+# backticks. Directories count as well as files: `docs/decisions/` is a pointer
+# like any other.
+_DIR = r"(?:docs|eval|src|tests|policies)/[A-Za-z0-9_./-]*"
+_PATH = rf"{_DIR}\.[A-Za-z0-9]{{1,5}}"
+# The lookbehind excludes `.` and `-` as well as word characters and `/`, so a
+# bare mention matches a WHOLE name: without it, `.github/copilot-instructions.md`
+# yielded a phantom `instructions.md` and `CLAUDE.local.md` a phantom `local.md`.
+_MENTION = re.compile(
+    rf"`([A-Za-z0-9_./-]+\.md|{_PATH}|{_DIR}/)`|(?<![`/\w.-])({_PATH}|[A-Za-z0-9_-]+\.md)"
+)
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
+
+
+# Documents whose LINKS are not checked either. Narrower than the mention
+# exemptions on purpose: `docs/history/` and `docs/decisions/` ARE link-checked,
+# because the banners marking the history files superseded were added by
+# pointing at the live documents and a banner whose links do not resolve is
+# worse than no banner. What is exempt here is content that is not ours to fix -
+# a fixture repository may legitimately contain a broken link, and saying so is
+# part of what makes it a realistic fixture.
+LINK_UNCHECKED: tuple[str, ...] = (
+    "eval/prompts/*",
+    "eval/corpus/*/files/*",
+    "eval/corpus/*/snapshot/*",
+)
+
+
+def _is_unchecked(rel: str) -> str | None:
+    """The reason this document is exempt from mention-checking, if it is."""
+    return next((why for pat, why in UNCHECKED_DOCS.items() if fnmatch(rel, pat)), None)
+
+
+def _all_docs() -> list[Path]:
+    return sorted(
+        p
+        for p in REPO.glob("**/*.md")
+        if not any(x in p.parts for x in (".venv", "node_modules", ".git", ".ruff_cache"))
+    )
+
+
+def test_every_document_is_either_checked_or_exempt_for_a_stated_reason() -> None:
+    """The exemption list is the whole scope, so it must be complete and true.
+
+    A document that matches no exemption is checked; one that matches an
+    exemption is not, and the reason is written down. Nothing is exempt by
+    having been overlooked, which is what a list of CHECKED directories allows.
+    """
+    docs = _all_docs()
+    assert docs, "no documents found - this test would check nothing"
+    for pat in UNCHECKED_DOCS:
+        assert any(fnmatch(str(d.relative_to(REPO)), pat) for d in docs), (
+            f"UNCHECKED_DOCS pattern {pat!r} matches no document; "
+            "an exemption for something that does not exist hides nothing and misleads"
+        )
 
 
 def _mentioned_paths(text: str) -> set[str]:
@@ -521,9 +586,7 @@ def test_live_docs_do_not_point_at_files_that_do_not_exist() -> None:
     past release entry names the paths that existed then, and rewriting it to
     match today would destroy the record it exists to be.
     """
-    live = sorted(
-        [p for p in REPO.glob("*.md") if p.name != "CHANGELOG.md"] + list(REPO.glob("docs/*.md"))
-    )
+    live = [d for d in _all_docs() if _is_unchecked(str(d.relative_to(REPO))) is None]
     assert live, "no live docs found - this test would check nothing"
     dangling: list[str] = []
     for doc in live:
@@ -548,8 +611,8 @@ def test_no_document_contains_a_broken_link() -> None:
     banner whose links do not resolve is worse than no banner.
     """
     broken: list[str] = []
-    for doc in sorted(REPO.glob("**/*.md")):
-        if any(part in (".venv", "node_modules", ".git") for part in doc.parts):
+    for doc in _all_docs():
+        if any(fnmatch(str(doc.relative_to(REPO)), pat) for pat in LINK_UNCHECKED):
             continue
         for m in _LINK.finditer(doc.read_text()):
             ref = m.group(1)

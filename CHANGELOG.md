@@ -98,13 +98,23 @@ in the same session, and one was in a test that passed for the wrong reason.
   condition and its map of where the pre-registration lives - as the home of the
   Phase 0 decision rule, and had never been written. `docs/EVAL-PLAN.md` says
   plainly that it carries the pre-registration, and states the rule once.
-* Backticked, bare and markdown-link forms are all checked, and links are
-  checked in EVERY document including `docs/history/`. The first version of the
-  rule looked only inside backticks, and the two references that survived it
-  survived because their backticks had been removed to make it pass: an
-  invariant a formatting change defeats is not one. Paths named because they do
-  NOT exist are listed in `DELIBERATELY_ABSENT` with a reason, and a second test
-  fails if one later starts existing.
+* Backticked, bare and markdown-link forms are all checked; directories count as
+  well as files; and links are checked in every document including
+  `docs/history/` and `docs/decisions/`. The first version looked only inside
+  backticks, and the two references that survived it survived because their
+  backticks had been removed to make it pass: an invariant a formatting change
+  defeats is not one.
+* Scope is a DENYLIST. Every document is checked unless it matches
+  `UNCHECKED_DOCS`, which carries a reason per entry and is asserted
+  non-vacuous. The version before this named the two directories it DID check -
+  root and `docs/` - so `eval/corpus/*/README.md` and anything else written
+  elsewhere was exempt by having been overlooked. An allowlist of what is
+  checked fails open by construction.
+* Paths named because they do NOT exist are listed in `DELIBERATELY_ABSENT` with
+  a reason, and a second test fails if one later starts existing. Other tools'
+  filenames are in `EXTERNAL_CONVENTIONS`. Links are exempt only for content
+  that is not ours to fix: a fixture repository may legitimately contain a
+  broken link.
 * `docs/history/*.md` carry a banner naming the live documents. The body of each
   is untouched; the banner says so, and says when it was added, rather than
   claiming the file is never edited while being an edit.
