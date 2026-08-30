@@ -984,11 +984,49 @@ def _validate_reachability() -> tuple[set[str], set[str], list[str]]:
 
     graph = {name: used(node) - {name} for name, node in funcs.items()}
 
+    # assumption 4: annotations are strings, so they do NOT evaluate at import.
+    # Without the future import they would, and every annotation would be an
+    # import-time reference this scan does not follow.
+    if not any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == "__future__"
+        and any(a.name == "annotations" for a in n.names)
+        for n in tree.body
+    ):
+        unmet.append("`from __future__ import annotations` is gone - annotations now evaluate")
+
+    def import_time_nodes(body: list[ast.stmt]) -> list[ast.AST]:
+        """Everything in `body` that RUNS when the module is imported.
+
+        Not just bare statements: a decorator, a default argument value, a class
+        base and every statement in a class body all execute at import. Skipping
+        `FunctionDef`/`ClassDef` wholesale - as this scan first did - misses all
+        four, so a dead function referenced in any of them would run at import
+        while the gate still called it unreachable.
+        """
+        out: list[ast.AST] = []
+        for n in body:
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
+                out.extend(n.decorator_list)
+                out.extend(d for d in n.args.defaults if d is not None)
+                out.extend(d for d in n.args.kw_defaults if d is not None)
+            elif isinstance(n, ast.ClassDef):
+                out.extend(n.decorator_list)
+                out.extend(n.bases)
+                out.extend(k.value for k in n.keywords)
+                # a class body executes at import; a method body does not
+                out.extend(import_time_nodes(n.body))
+                out.extend(
+                    s for s in n.body if not isinstance(s, ast.FunctionDef | ast.AsyncFunctionDef)
+                )
+            else:
+                out.append(n)
+        return out
+
     entries: set[str] = set()
-    # assumption 2: module-level statements of validate.py execute on import
-    for n in tree.body:
-        if not isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            entries |= used(n)
+    # assumption 2: everything that runs at import is a caller
+    for n in import_time_nodes(tree.body):
+        entries |= used(n)
     for pkg in ("src", "eval"):
         for f in (root / pkg).rglob("*.py"):
             src = f.read_text()

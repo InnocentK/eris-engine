@@ -85,15 +85,26 @@ silently:
 
 1. every definition is a module-level `def` - an `async def` or a class method
    would be invisible to the scan and its reachability never examined;
-2. module-level code in `validate.py` is a caller too, because it runs at
-   import - anything it references is an entry point;
+2. everything that RUNS at import is a caller, which is more than bare
+   module-level statements: a decorator, a default argument value, a class base
+   expression and every statement in a class body all execute at import. An
+   earlier version skipped `FunctionDef`/`ClassDef` wholesale and so missed all
+   four - a dead function referenced in any of them would have run at import
+   while the gate still called it unreachable;
 3. the module is never bound as an object (`import eris.validate`,
    `from eris import validate`, `importlib`) - that binding is what would make
    `getattr(mod, <computed>)` possible and defeat the analysis. A `getattr`
    with a matching string literal is counted as a use.
 
-Each is mutation-verified. Tests are excluded from the entry points
-deliberately: they are not a runtime path.
+4. `from __future__ import annotations` is present, so annotations are strings
+   and do NOT evaluate at import. Without it every annotation becomes an
+   import-time reference this scan does not follow.
+
+Each is mutation-verified, including all five import-time forms (class body,
+class decorator, class base, module-level default argument, and a method
+default - the last correctly trips assumption 1 instead, because a method is
+outside the model and the gate refuses to claim rather than guess). Tests are
+excluded from the entry points deliberately: they are not a runtime path.
 
 `has_errors(findings) -> bool` is the error-severity predicate; `eval/score.py`
 reimplements it inline as `f.get("severity") == "error"` because it reads
