@@ -8,6 +8,12 @@ inferred from the code for ledgers that carry no `acted`. The coupling test
 added in 0.4.1 asserts the plan ECHOES the scorer's string; it cannot assert the
 string is TRUE. Six ledgers in `runs/` are of that vintage, so this was live.
 
+* Classification is per FINDING, so `_validator_basis` is conservative: a cell
+  counts as coarsely scored when ANY of its findings lacks `acted`, not only
+  when all do. Asking "does any finding carry `acted`" reported a mixed cell as
+  exact and hid the coarsely-classified ones, bypassing the gate. Both functions
+  now read one shared `_matched_findings` extractor so they cannot disagree
+  about which findings they describe.
 * `_validator_basis` reports how each cell was classified: `"acted"` (exact) or
   `"legacy_codes"` (coarse - it calls every `REF_*` handled and therefore
   UNDER-REPORTS malformation).
