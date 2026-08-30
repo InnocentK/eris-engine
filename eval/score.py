@@ -635,6 +635,14 @@ def _matches(pred: Predicted, kf: KeyFinding, tolerance: int) -> bool:
         return False
     ps = pred.line_start
     pe = pred.line_end or ps
+    # A finding is a LOCATED claim, so a prediction has to point AT the planted
+    # finding rather than merely contain it. Overlap alone is symmetric: one
+    # sentence spanning a 47-line plan document overlapped all three planted
+    # findings and scored recall 1.0 without identifying anything. A prediction
+    # may be somewhat wider than the finding - a reviewer may quote a whole
+    # section - but not unboundedly wider.
+    if (pe - ps) > (kf.line_end - kf.line_start) + 2 * tolerance:
+        return False
     if not _overlap(ps, pe, kf.line_start, kf.line_end, tolerance):
         return False
     text = pred.description.lower()

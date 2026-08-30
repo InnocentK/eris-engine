@@ -14,7 +14,8 @@
       "line_end": 22,
       "severity": "high",
       "must_mention": [
-        "severity"
+        "severity",
+        "assign"
       ]
     },
     {
@@ -24,7 +25,8 @@
       "line_end": 36,
       "severity": "medium",
       "must_mention": [
-        "lint"
+        "lint",
+        "config"
       ]
     }
   ],

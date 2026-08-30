@@ -319,3 +319,31 @@ def test_a_control_key_and_its_task_agree_that_nothing_is_planted() -> None:
         elif cat == "plan":
             assert key.findings, f"{task_dir.name}: a plan task with no findings measures nothing"
     assert seen["control"] >= 1 and seen["plan"] >= 1, f"corpus is one-sided: {seen}"
+
+
+def test_generated_bytecode_does_not_make_a_task_permanently_unrunnable(tmp_path: Path) -> None:
+    """The copy excluded `__pycache__` while the freshness check still counted
+    it, so a stray one in `files/` - which importing the module once creates -
+    made the two trees differ FOREVER: the run was refused, the refusal said
+    "rebuild", and rebuilding could not fix it (stop review, 2026-08-30).
+
+    Both sides must exclude exactly the same things, and a real edit must still
+    be caught - an exclusion wide enough to hide drift would be worse than the
+    bug it fixed.
+    """
+    task = _task_dir(tmp_path)
+    build_snapshot(task, runner=lambda argv, cwd: None)
+    assert snapshot_matches_files(task) is True
+
+    pyc = task / "files" / "__pycache__"
+    pyc.mkdir()
+    (pyc / "calc.cpython-314.pyc").write_bytes(b"\x00stale docstring")
+    assert snapshot_matches_files(task) is True, "bytecode must not count as drift"
+
+    # rebuilt WITH the bytecode present, so the copy is what is under test here
+    build_snapshot(task, runner=lambda argv, cwd: None)
+    assert not (task / "snapshot" / "__pycache__").exists(), "and must not be copied"
+    assert snapshot_matches_files(task) is True
+
+    (task / "files" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    assert snapshot_matches_files(task) is False, "a real edit must still be caught"

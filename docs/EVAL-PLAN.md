@@ -93,6 +93,15 @@ M1 clause verbatim (coupled by test) and prints the caveats with every summary;
     reads the model's own severity label on its own claim and is reported
     alongside, never as a rule input - an arm can lower it by relabelling
     `critical` as `low` without changing anything it found.
+  * Mechanical scoring of a `plan` task is APPROXIMATE and is an upper bound
+    on precision. A match is a location overlap plus every `must_mention`
+    token; the tokens are a subject-and-object conjunction chosen to survive
+    paraphrase, and a prediction's span may not exceed the finding's by more
+    than twice the tolerance, so a whole-file claim identifies nothing. None of
+    that establishes that a matched finding is CORRECT - only that it is about
+    the right place and names the right things. Blind human adjudication,
+    already pre-registered above, is the arbiter; the mechanical number is not
+    to be reported as a catch rate without it.
   * The key canary detects a VERBATIM emission and nothing else. A worker that
     reads the key and paraphrases it emits no canary and is reported
     `contaminated: false`. **Absence of a canary hit is not evidence of a clean

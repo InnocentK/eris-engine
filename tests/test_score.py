@@ -1935,8 +1935,17 @@ def test_matching_is_flat_and_survives_a_key_larger_than_the_recursion_limit() -
             ],
         )
     )
-    m = match_findings([Predicted("src/app.py", 1, n, Severity.LOW, "null")] * 3, key)
-    assert (m.covered, m.tp, m.redundant, m.recall) == (n, 1, 2, 1.0)
+    # one LOCATED prediction per finding, each repeated once: a whole-file
+    # prediction would be rejected by the span bound and would prove nothing
+    # about scale
+    preds = [
+        Predicted("src/app.py", i + 1, i + 1, Severity.LOW, "null")
+        for i in range(n)
+        for _ in (0, 1)
+    ]
+    m = match_findings(preds, key)
+    assert (m.covered, m.fn, m.recall) == (n, 0, 1.0)
+    assert m.tp == n and m.redundant == n, "each finding named once, then repeated"
 
 
 def _cs(**over: Any) -> CellScore:
@@ -2597,3 +2606,39 @@ def test_a_severe_false_positive_alone_is_not_a_wrong_accept(tmp_path: Path) -> 
     assert cell["fp_severities"] == ["high"]
     assert cell["severe_false_positive"] is True
     assert cell["wrong_accept"] is False
+
+
+def test_a_prediction_spanning_the_file_does_not_match_everything_in_it() -> None:
+    """A finding is a LOCATED claim, so a prediction must point AT one rather
+    than merely contain it. Overlap alone is symmetric: one sentence spanning a
+    47-line plan document overlapped all three planted findings and scored
+    recall 1.0 without identifying anything (stop review, 2026-08-30).
+
+    A reviewer may legitimately cite a whole section, so the bound is the
+    finding's own span plus twice the tolerance - wider than the finding,
+    nowhere near the file.
+    """
+    key = Key.model_validate(
+        key_dict(
+            line_tolerance=3,
+            findings=[
+                {
+                    "id": f"k{i}",
+                    "path": "PLAN.md",
+                    "line_start": s,
+                    "line_end": s + 4,
+                    "severity": "high",
+                    "must_mention": ["null"],
+                }
+                for i, s in enumerate((5, 20, 40))
+            ],
+        )
+    )
+    sweep = match_findings([Predicted("PLAN.md", 1, 47, Severity.LOW, "null everywhere")], key)
+    assert (sweep.covered, sweep.recall) == (0, 0.0), "a whole-file claim identifies nothing"
+
+    located = match_findings([Predicted("PLAN.md", 20, 24, Severity.HIGH, "null here")], key)
+    assert located.covered == 1
+
+    section = match_findings([Predicted("PLAN.md", 18, 27, Severity.HIGH, "null here")], key)
+    assert section.covered == 1, "quoting a whole section is still a located claim"

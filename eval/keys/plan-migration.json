@@ -14,7 +14,8 @@
       "line_end": 34,
       "severity": "high",
       "must_mention": [
-        "marker"
+        "marker",
+        "answers"
       ]
     },
     {
@@ -24,7 +25,8 @@
       "line_end": 41,
       "severity": "medium",
       "must_mention": [
-        "workspace"
+        "workspace",
+        "generat"
       ]
     },
     {
@@ -34,7 +36,8 @@
       "line_end": 47,
       "severity": "medium",
       "must_mention": [
-        "graded"
+        "graded",
+        "pydantic"
       ]
     }
   ],
