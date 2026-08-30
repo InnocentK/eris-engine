@@ -783,8 +783,8 @@ class CellScore:
     redundant: int
     distractor_hits: int
     # the severities of the FALSE positives, so a report can ask about severe
-    # ones without going back through `confident_wrong`, which also fires on a
-    # wrong ACCEPT and is therefore a different question
+    # ones directly, rather than through a combined flag that also fires on a
+    # wrong ACCEPT and so answers a different question
     fp_severities: list[str]
     unsupported_claim_rate: float | None
     # the counts behind that rate. Without them the aggregate could only average
@@ -798,7 +798,18 @@ class CellScore:
     post_scan_errors: int
     orphan_invocations: int
     downgrades: int
-    confident_wrong: bool
+    # SPLIT deliberately (user decision, 2026-08-30). `wrong_accept` is
+    # mechanical: the engine said ACCEPT where the key says it must not, and
+    # nothing a model writes about itself can move it. `severe_false_positive`
+    # reads the model's OWN severity label on its OWN claim, so an arm can lower
+    # it by grading its claims more mildly with no change in what it got right.
+    # They were one field, `confident_wrong`, and the pre-registered
+    # build/don't-build rule read that field - meaning one of the two branches
+    # authorising a whole orchestrator could be satisfied by a tone change. The
+    # rule now reads `wrong_accept`; the severity number is reported beside it
+    # and is not load-bearing.
+    wrong_accept: bool
+    severe_false_positive: bool
     abstained: bool
     expected_abstain: bool
     cost_spent_usd: float
@@ -1058,9 +1069,11 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
     expected_abstain = (
         ar.category is TaskCategory.INSUFFICIENT or Verdict.ABSTAIN in key.expected_verdict
     )
-    confident_wrong = exclusion is None and (
-        (verdict is Verdict.ACCEPT and Verdict.ACCEPT not in key.expected_verdict)
-        or any(s in ("high", "critical") for s in matching.fp_severities)
+    wrong_accept = exclusion is None and (
+        verdict is Verdict.ACCEPT and Verdict.ACCEPT not in key.expected_verdict
+    )
+    severe_false_positive = exclusion is None and any(
+        s in ("high", "critical") for s in matching.fp_severities
     )
     wall: int | None = None
     if cell.started_ts and cell.finished_ts:
@@ -1093,7 +1106,8 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         downgrades_n=enforced.downgrades if enforced is not None else 0,
         rulings_n=len(enforced.rulings) if enforced is not None else 0,
         downgrades=enforced.downgrades if enforced else 0,
-        confident_wrong=confident_wrong,
+        wrong_accept=wrong_accept,
+        severe_false_positive=severe_false_positive,
         abstained=verdict is Verdict.ABSTAIN,
         expected_abstain=expected_abstain,
         cost_spent_usd=totals.spent_usd,
@@ -1200,9 +1214,10 @@ def _control_block(inc: Sequence[CellScore]) -> dict[str, Any]:
         "fpr": round(flagged / len(ctl), 4),
         "mean_false_positives": round(sum(s.fp for s in ctl) / len(ctl), 4),
         # Computed from the FALSE-POSITIVE severities directly, not from
-        # `confident_wrong` - which also fires on a wrong ACCEPT verdict and so
+        # the combined flag that also fires on a wrong ACCEPT verdict, which
         # answers a different question than "invented a severe defect in clean
-        # code".
+        # code". Same severity caveat as `severe_false_positive_rate`: this is
+        # the model's own label on its own claim.
         "severe_cells": len(
             [s for s in ctl if any(v in ("high", "critical") for v in s.fp_severities)]
         ),
@@ -1226,7 +1241,8 @@ def _by_category(inc: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             "cells": len(cells),
             "precision": _rates(cells, "precision"),
             "recall": _rates(cells, "recall"),
-            "confident_wrong_rate": _mean([float(s.confident_wrong) for s in cells]),
+            "wrong_accept_rate": _mean([float(s.wrong_accept) for s in cells]),
+            "severe_false_positive_rate": _mean([float(s.severe_false_positive) for s in cells]),
             "distractor_hits": sum(s.distractor_hits for s in cells),
             "redundant": sum(s.redundant for s in cells),
         }
@@ -1302,7 +1318,11 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                 "cells_counted": len([s for s in inc if s.unsupported_claim_rate is not None]),
                 "cells_included": len(inc),
             },
-            "confident_wrong_rate": _mean([float(s.confident_wrong) for s in inc]),
+            # the decision rule reads `wrong_accept_rate`. `severe_false_positive_rate`
+            # is reported beside it and is NOT an input to any rule: it is the
+            # model's own severity label on its own claim.
+            "wrong_accept_rate": _mean([float(s.wrong_accept) for s in inc]),
+            "severe_false_positive_rate": _mean([float(s.severe_false_positive) for s in inc]),
             "distractor_hits": sum(s.distractor_hits for s in inc),
             # Predictions that repeated a key finding another prediction was
             # already credited with. Outside `precision` by definition (see
@@ -1416,8 +1436,9 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                 for metric in ("precision", "recall"):
                     a, b = getattr(s_treat, metric), getattr(s_base, metric)
                     entry[f"delta_{metric}"] = None if a is None or b is None else round(a - b, 4)
-                entry["delta_confident_wrong"] = int(s_treat.confident_wrong) - int(
-                    s_base.confident_wrong
+                entry["delta_wrong_accept"] = int(s_treat.wrong_accept) - int(s_base.wrong_accept)
+                entry["delta_severe_false_positive"] = int(s_treat.severe_false_positive) - int(
+                    s_base.severe_false_positive
                 )
                 entry["delta_cost_spent_usd"] = round(
                     s_treat.cost_spent_usd - s_base.cost_spent_usd, 6
@@ -1691,14 +1712,14 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             M1_PRE_REGISTRATION,
             "categories revert/planted/insufficient require ArmRun.containment == container (E1)",
             "containment basis: " + CONTAINMENT_BASIS,
-            "PANEL 2026-08-30, NOT fixed and load-bearing on any reading of these numbers: "
-            "`confident_wrong` is driven by the model's OWN self-reported severity - an "
-            "unmatched `critical` prediction sets it, the identical prediction labelled `low` "
-            "does not. There is no confidence field anywhere in the wire schema. An arm can "
-            "therefore satisfy the pre-registered `halves confident-wrong` branch by grading "
-            "its own claims more mildly, with no change in what it got right. Read it as "
-            "`severe-false-positive-or-wrong-accept rate`, and do not read a decision rule off "
-            "it without saying so.",
+            "The decision rule reads `wrong_accept_rate`, NOT severity. A single "
+            "`confident_wrong` flag combined a mechanical fact (the engine said ACCEPT where "
+            "the key says it must not) with the model's OWN severity label on its OWN claim - "
+            "an unmatched `critical` prediction set it, the identical prediction labelled "
+            "`low` did not - and there is no confidence field anywhere in the wire schema. One "
+            "of the two branches authorising a whole orchestrator could therefore be satisfied "
+            "by an arm grading its claims more mildly. Split by user decision 2026-08-30: "
+            "`severe_false_positive_rate` is reported beside it and is an input to no rule.",
             "PANEL 2026-08-30: the canary detects a VERBATIM emission of the key token and "
             "nothing else. A worker that reads the key and paraphrases it emits no canary, is "
             "reported `contaminated: false`, and scores as if it had reasoned. Absence of a "

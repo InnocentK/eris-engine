@@ -75,16 +75,16 @@ experiments showed, and what must still run before any scored corpus run.
   evidence are cached under an idempotency key that excludes the arm.
 * >= 2 repeats per cell (`repeat_index` is in the key).
 * Metrics: per-finding precision AND recall (file+line overlap with the fix
-  hunk), unsupported-claim rate (script-checked refs), confident-wrong rate,
-  abstention appropriateness, cost, wall-clock.
+  hunk), unsupported-claim rate (script-checked refs), wrong-ACCEPT rate,
+  severe-false-positive rate, abstention appropriateness, cost, wall-clock.
   * Recall is a COVERAGE of key findings and precision counts DISTINCT true
     claims: repeating a finding changes neither. Both are reported pooled
     (`micro`, the per-finding reading above) and per-cell (`macro`).
-  * `confident_wrong` is driven by the model's OWN self-reported severity;
-    there is no confidence field in the wire schema. An arm can satisfy the
-    "halves confident-wrong" branch of the decision rule by grading its own
-    claims more mildly, with no change in what it got right. Read it as a
-    severe-false-positive-or-wrong-accept rate (panel, 2026-08-30).
+  * `wrong_accept_rate` (the decision rule's input) is mechanical: the
+    verdict against the key's `expected_verdict`. `severe_false_positive_rate`
+    reads the model's own severity label on its own claim and is reported
+    alongside, never as a rule input - an arm can lower it by relabelling
+    `critical` as `low` without changing anything it found.
   * The key canary detects a VERBATIM emission and nothing else. A worker that
     reads the key and paraphrases it emits no canary and is reported
     `contaminated: false`. **Absence of a canary hit is not evidence of a clean
@@ -95,7 +95,16 @@ experiments showed, and what must still run before any scored corpus run.
 * Corpus tasks are history-truncated snapshots built by `eris.snapshot`.
 * Pre-registered rule (draft, to be finalised in `eval/README.md`): build
   the orchestrator only if arm 4 beats arm 3 by >= 10 points catch rate or
-  halves confident-wrong at <= 2x cost, AND arm 3 beats the incumbents.
+  halves the **wrong-ACCEPT rate** at <= 2x cost, AND arm 3 beats the
+  incumbents.
+  * `wrong_accept_rate` and NOT `confident_wrong_rate`, by user decision
+    2026-08-30. The old flag combined a mechanical fact - the engine said
+    ACCEPT where the key says it must not - with the model's own severity
+    label on its own claim, and there is no confidence field anywhere in the
+    wire schema. An arm could therefore satisfy this branch by grading its
+    claims more mildly, with no change in what it got right: a tone change
+    authorising an orchestrator. `severe_false_positive_rate` is still
+    reported, beside it, and is an input to no rule.
 
 ## Flag experiments already run (2026-08-21, this machine)
 Captured envelopes: `tests/fixtures/envelopes/`.

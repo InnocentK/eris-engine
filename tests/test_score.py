@@ -487,7 +487,9 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     assert by["consensus"]["verdict_basis"] == "raw" and by["consensus"]["verdict"] == "ACCEPT"
     # the consensus fixture's findings are HANDLED (VERDICT_* forced ESCALATE),
     # so the cell is NOT excluded and still feeds quality metrics
-    assert by["consensus"]["confident_wrong"] is True
+    # the consensus fixture ACCEPTs a task whose key does not expect ACCEPT:
+    # mechanical, and nothing the model writes about itself can move it
+    assert by["consensus"]["wrong_accept"] is True
     # judged arms: enforced verdict; unlinked finding rule (the proposal's finding links a claim
     # ruled nothing -> not asserted) -> recall 0 with tolerance
     assert (
@@ -522,7 +524,7 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     # summary carries the same counts across all cells
     assert per_arm["indep_verify_critique"]["validator"]["malformed"] == 1
     assert per_arm["indep_verify_critique"]["excluded"]["validator_errors"] == 1
-    assert per_arm["consensus"]["confident_wrong_rate"] == 1.0
+    assert per_arm["consensus"]["wrong_accept_rate"] == 1.0
     assert per_arm["indep_verify_critique"]["validator"]["codes"] == {
         "DISSENT_EMPTY_WITH_CONTEST": 1
     }
@@ -581,7 +583,8 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -901,7 +904,8 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1112,7 +1116,8 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1267,7 +1272,8 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1386,7 +1392,8 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1594,7 +1601,8 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1679,7 +1687,8 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
-            confident_wrong=False,
+            severe_false_positive=False,
+            wrong_accept=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1959,7 +1968,8 @@ def _cs(**over: Any) -> CellScore:
         downgrades_n=0,
         rulings_n=0,
         downgrades=0,
-        confident_wrong=False,
+        severe_false_positive=False,
+        wrong_accept=False,
         abstained=False,
         expected_abstain=False,
         cost_spent_usd=0.0,
@@ -2057,7 +2067,7 @@ def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
     assert other["fpr"] == 1.0 and other["mean_false_positives"] == 1.0
 
     # `severe_cells` comes from the FALSE-POSITIVE severities, not from
-    # `confident_wrong`, which also fires on a wrong ACCEPT verdict and so
+    # a combined flag that also fires on a wrong ACCEPT verdict and so
     # answers a different question than "invented a severe defect in clean code"
     sev = aggregate(
         [
@@ -2065,9 +2075,9 @@ def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
             _cs(category="control", fp=1, fp_severities=["high"], precision=0.0),
             _cs(category="control", fp=1, fp_severities=["low"], precision=0.0),
             # confidently wrong for a VERDICT reason, with no false positive at all:
-            # counted by `confident_wrong` and NOT by `severe_cells`, which is the
-            # whole difference between the two
-            _cs(category="control", fp=0, confident_wrong=True),
+            # a wrong ACCEPT is NOT a severe false positive: the whole point of
+            # keeping the two apart
+            _cs(category="control", fp=0, wrong_accept=True),
         ]
     )["single:w"]["control"]
     assert sev["severe_cells"] == 2
@@ -2504,3 +2514,86 @@ def test_the_unsupported_claim_rate_is_pooled_as_well_as_averaged() -> None:
     assert agg["macro"] == 0.0556
     assert (agg["downgrades"], agg["rulings"]) == (1, 10)
     assert (agg["cells_counted"], agg["cells_included"]) == (2, 3)
+
+
+def test_wrong_accept_is_mechanical_and_severity_cannot_move_it() -> None:
+    """The two halves of the old `confident_wrong` flag, kept apart.
+
+    `wrong_accept` compares the engine's verdict with the key's
+    `expected_verdict`: nothing a model writes about itself can move it.
+    `severe_false_positive` reads the model's OWN severity label on its OWN
+    claim, so relabelling `critical` as `low` lowers it while the run finds and
+    misses exactly the same things. Combined into one flag - which the
+    pre-registered build/don't-build rule read - that made a tone change enough
+    to satisfy one of the two branches authorising an orchestrator.
+    """
+    loud = _cs(wrong_accept=True, severe_false_positive=True)
+    quiet = _cs(wrong_accept=True, severe_false_positive=False)
+    agg_loud = aggregate([loud])["single:w"]
+    agg_quiet = aggregate([quiet])["single:w"]
+
+    # relabelling moves the severity number...
+    assert agg_loud["severe_false_positive_rate"] == 1.0
+    assert agg_quiet["severe_false_positive_rate"] == 0.0
+    # ...and cannot touch the one the decision rule reads
+    assert agg_loud["wrong_accept_rate"] == agg_quiet["wrong_accept_rate"] == 1.0
+
+
+def test_the_decision_rule_metric_is_reported_apart_from_the_severity_one() -> None:
+    """Both rates and both paired deltas are published under their own names, so
+    no reader can quote "the confident-wrong rate" and mean either one.
+    """
+    agg = aggregate([_cs(wrong_accept=False, severe_false_positive=True)])["single:w"]
+    assert agg["wrong_accept_rate"] == 0.0 and agg["severe_false_positive_rate"] == 1.0
+    assert "confident_wrong_rate" not in agg
+
+    same = ["a" * 64]
+    blobs = {"a" * 64: ["b" * 64]}
+    pair = paired_deltas(
+        [
+            _cs(arm="indep_verify", propose_keys=same, propose_blobs=blobs, wrong_accept=True),
+            _cs(
+                arm="indep_verify_critique",
+                propose_keys=same,
+                propose_blobs=blobs,
+                wrong_accept=False,
+                severe_false_positive=True,
+            ),
+        ]
+    )
+    row = {p["pair"]: p for p in pair}["4-3"]
+    assert row["paired"] is True
+    assert row["delta_wrong_accept"] == -1
+    assert row["delta_severe_false_positive"] == 1
+
+
+def test_a_severe_false_positive_alone_is_not_a_wrong_accept(tmp_path: Path) -> None:
+    """Through the real scoring path, not a hand-built CellScore.
+
+    The single arm reports a high-severity finding that matches nothing in the
+    key, and gives no verdict at all. That is a severe false positive and it is
+    NOT a wrong ACCEPT - the two used to be one flag, so this cell would have
+    been counted against the branch of the decision rule that authorises
+    building an orchestrator, on the strength of the model's own severity label.
+    """
+    w = world(tmp_path)
+    write_key(
+        w,
+        findings=[
+            {
+                "id": "k1",
+                "path": "src/other.py",
+                "line_start": 80,
+                "line_end": 81,
+                "severity": "high",
+                "must_mention": ["zzz"],
+            }
+        ],
+    )
+    cdir = campaign(w, tmp_path, "single")
+    cell = score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"][0]
+
+    assert cell["verdict"] is None, "arm 1 has no judge, so there is no ACCEPT to be wrong about"
+    assert cell["fp_severities"] == ["high"]
+    assert cell["severe_false_positive"] is True
+    assert cell["wrong_accept"] is False
