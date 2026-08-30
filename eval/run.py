@@ -117,6 +117,7 @@ from eris.writer import (
     WriterError,
     WriterLocked,
 )
+from eval.make_control_snapshot import snapshot_matches_files
 
 DEFAULT_POLICY = "policies/default.yaml"
 DEFAULT_PROMPTS = "eval/prompts"
@@ -674,14 +675,33 @@ def load_harness(
 
 
 def load_task(task_file: Path) -> tuple[TaskSpec, Path]:
-    """``task.json`` + the snapshot directory it names (relative to the file)."""
+    """``task.json`` + the snapshot directory it names (relative to the file).
+
+    Refuses a snapshot that no longer matches the committed ``files/`` tree it
+    was generated from. The two are versioned differently - ``files/`` is in
+    git, ``snapshot/`` is gitignored and rebuilt - so drift is silent: a
+    campaign would measure the OLD tree while the repository shows the new one,
+    and the ledger's ``snapshot_sha`` would be internally consistent while
+    describing a tree nobody reviewed. This was not hypothetical; the plumbing
+    control's snapshot was found stale on 2026-08-30. Checked here, where every
+    campaign and every single-cell run passes, and BEFORE any worker is spawned.
+    """
     task = TaskSpec.model_validate_json(Path(task_file).read_bytes())
     snapshot = Path(task.snapshot)
     if not snapshot.is_absolute():
         snapshot = Path(task_file).resolve().parent / snapshot
     snapshot = snapshot.resolve()
     if not snapshot.is_dir():
-        raise LaunchRefused(f"snapshot {snapshot} is not a directory")
+        raise LaunchRefused(
+            f"snapshot {snapshot} is not a directory. Snapshots are generated, not committed: "
+            f"build them with `python eval/make_control_snapshot.py <corpus> --all`"
+        )
+    if snapshot_matches_files(snapshot.parent) is False:
+        raise LaunchRefused(
+            f"snapshot {snapshot} does not match the committed {snapshot.parent / 'files'} it was "
+            f"built from - it is stale, and a run would measure a tree that is not in the "
+            f"repository. Rebuild: `python eval/make_control_snapshot.py {snapshot.parent} `"
+        )
     return task, snapshot
 
 

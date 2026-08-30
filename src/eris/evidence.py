@@ -154,7 +154,17 @@ class TaskSpec(BaseModel):
     # scorer refuses to score it. An explicit --task-file still runs it (that
     # is the whole point of a plumbing task). Default True so every real
     # corpus entry is scored unless someone opts out on purpose.
-    scored: bool = True
+    #
+    # STRICT, because two components read this flag and only one reads it
+    # through pydantic. `eval/score.py` cannot import this module - the scorer's
+    # import guard forbids pulling `eris.verify` and `subprocess` into a
+    # read-only tool - so it parses `task.json` as plain JSON and opts out only
+    # on a literal `false`. Under lax coercion `"scored": "false"` (or `0`,
+    # `"no"`, `"off"`) meant the RUNNER skipped the task while the SCORER still
+    # expected it, and the campaign reported missing cells instead of a bad
+    # task file. Strict makes every non-bool a ValidationError, which both
+    # readers already treat the same way: scored, and failing loudly later.
+    scored: bool = Field(default=True, strict=True)
 
 
 def derive_nonce(

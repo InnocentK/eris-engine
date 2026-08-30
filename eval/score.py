@@ -381,9 +381,24 @@ class Matching:
     distractor_hits: int
     matched_ids: list[str]
     fp_severities: list[str]
+    # A prediction that matches a key finding some OTHER prediction is already
+    # credited with. It is not a false positive - what it says is true - but it
+    # names no new key finding, so it raises neither tp nor recall. It used to
+    # be dropped silently, which shrank precision's denominator and let a run
+    # that repeated one true finding ten times read as flawless. It is counted
+    # and REPORTED instead: `precision` still excludes it, and a reader who
+    # wants the per-utterance rate can compute `tp / (tp + fp + redundant)`.
+    redundant: int = 0
 
     @property
     def precision(self) -> float | None:
+        """Of the DISTINCT claims made, the fraction that were true.
+
+        Redundant repeats are outside the denominator deliberately: repeating a
+        true finding is not asserting a false one. `redundant` is reported
+        alongside so the choice is visible and reversible by the reader, rather
+        than being made silently by a `continue`.
+        """
         return None if self.tp + self.fp == 0 else self.tp / (self.tp + self.fp)
 
     @property
@@ -391,24 +406,64 @@ class Matching:
         return None if self.tp + self.fn == 0 else self.tp / (self.tp + self.fn)
 
 
+def _credit(predicted: Sequence[Predicted], key: Key) -> tuple[list[list[str]], dict[str, int]]:
+    """Assign predictions to key findings so that as many DISTINCT key findings
+    as possible are credited - a maximum bipartite matching, by augmenting paths.
+
+    First-come greedy assignment made the score depend on the ORDER a worker
+    happened to list its findings. A broad prediction that mentions two nearby
+    key findings would consume the one a later, more specific prediction needed,
+    and that later prediction would then be uncredited: recall fell for a run
+    that had in fact found everything. The SIZE of a maximum matching is unique,
+    so that order dependence is gone.
+
+    Maximality is also what makes "redundant" mean something. If a prediction is
+    left uncredited but still `_matches` a key finding, then by maximality it
+    cannot be credited without un-crediting another - it identifies no key
+    finding that is not already found. That is a fact about the assignment, not
+    a guess about intent.
+
+    Recursion depth is bounded by the number of KEY findings, not predictions:
+    every nested call adds at least one key-finding id to `seen` before
+    recursing, so a worker emitting thousands of findings cannot exhaust the
+    stack.
+    """
+    adj = [
+        [kf.id for kf in key.findings if _matches(pred, kf, key.line_tolerance)]
+        for pred in predicted
+    ]
+    owner: dict[str, int] = {}
+
+    def augment(i: int, seen: set[str]) -> bool:
+        for kid in adj[i]:
+            if kid in seen:
+                continue
+            seen.add(kid)
+            if kid not in owner or augment(owner[kid], seen):
+                owner[kid] = i
+                return True
+        return False
+
+    for i in range(len(predicted)):
+        augment(i, set())
+    return adj, owner
+
+
 def match_findings(predicted: Sequence[Predicted], key: Key) -> Matching:
-    matched: set[str] = set()
+    adj, owner = _credit(predicted, key)
+    credited = set(owner.values())
     fp = 0
     fp_sev: list[str] = []
+    redundant = 0
     distractor_hits = 0
-    for pred in predicted:
-        hit = next(
-            (
-                kf
-                for kf in key.findings
-                if kf.id not in matched and _matches(pred, kf, key.line_tolerance)
-            ),
-            None,
-        )
-        if hit is None:
-            hit = next((kf for kf in key.findings if _matches(pred, kf, key.line_tolerance)), None)
-        if hit is not None:
-            matched.add(hit.id)
+    for i, pred in enumerate(predicted):
+        if i in credited:
+            continue
+        if adj[i]:
+            # True, but names nothing new. NOT a false positive, and so
+            # deliberately NOT in `fp_severities`: a run is not "confidently
+            # wrong" for saying a correct thing twice.
+            redundant += 1
             continue
         fp += 1
         fp_sev.append(pred.severity.value)
@@ -425,7 +480,13 @@ def match_findings(predicted: Sequence[Predicted], key: Key) -> Matching:
         ):
             distractor_hits += 1
     return Matching(
-        len(matched), fp, len(key.findings) - len(matched), distractor_hits, sorted(matched), fp_sev
+        len(owner),
+        fp,
+        len(key.findings) - len(owner),
+        distractor_hits,
+        sorted(owner),
+        fp_sev,
+        redundant,
     )
 
 
@@ -448,6 +509,7 @@ class CellScore:
     tp: int
     fp: int
     fn: int
+    redundant: int
     distractor_hits: int
     unsupported_claim_rate: float | None
     downgrades: int
@@ -712,6 +774,7 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         tp=matching.tp,
         fp=matching.fp,
         fn=matching.fn,
+        redundant=matching.redundant,
         distractor_hits=matching.distractor_hits,
         unsupported_claim_rate=rate,
         downgrades=enforced.downgrades if enforced else 0,
@@ -747,6 +810,96 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
 def _mean(values: Sequence[float | None]) -> float | None:
     present = [v for v in values if v is not None]
     return round(sum(present) / len(present), 4) if present else None
+
+
+def _rates(inc: Sequence[CellScore], which: Literal["precision", "recall"]) -> dict[str, Any]:
+    """Pooled and per-cell rates side by side, plus the denominators.
+
+    `micro` pools the counts: EVAL-PLAN's "per-finding" reading, and the one
+    "catch rate" means in the pre-registered decision rule - of every planted
+    finding, how many were caught. `macro` averages the per-cell rates, which
+    weighs a one-finding task equally with a ten-finding one.
+
+    `cells_counted` is reported because macro SILENTLY DROPS cells whose rate is
+    None. For precision that is every cell where the arm predicted nothing: an
+    arm that stays silent half the time would otherwise have its precision
+    computed only over the half where it spoke, and silence would be free. The
+    count makes that visible instead; `silent_cells` names it outright.
+    """
+    tp = sum(s.tp for s in inc)
+    other = sum(s.fp for s in inc) if which == "precision" else sum(s.fn for s in inc)
+    per_cell = [getattr(s, which) for s in inc]
+    out: dict[str, Any] = {
+        "micro": round(tp / (tp + other), 4) if tp + other else None,
+        "macro": _mean(per_cell),
+        "cells_counted": len([v for v in per_cell if v is not None]),
+        "cells_included": len(inc),
+    }
+    if which == "precision":
+        red = sum(s.redundant for s in inc)
+        # The per-utterance rate: the same pooled precision with redundant
+        # repeats back in the denominator. `Matching.precision` leaves them out
+        # deliberately - repeating a true finding is not asserting a false one -
+        # and this is the number that makes that choice reversible by a reader
+        # who disagrees, rather than something only the code knows.
+        out["micro_with_redundant"] = (
+            round(tp / (tp + other + red), 4) if tp + other + red else None
+        )
+        out["silent_cells"] = len([s for s in inc if s.tp + s.fp + s.redundant == 0])
+    return out
+
+
+def _control_block(inc: Sequence[CellScore]) -> dict[str, Any]:
+    """What the clean controls measure, which precision and recall cannot.
+
+    A control task has NO planted finding, so its recall is undefined and it
+    contributes nothing to the pooled catch rate. Its whole purpose is the
+    opposite question - does the arm invent a defect in code that has none - and
+    that answer was reaching the summary only as a diluted term inside an
+    overall precision, where a high catch rate on the planted tasks can hide it.
+
+    Reported as a RATE over control cells (how often the arm flagged anything at
+    all) as well as a mean count, because one arm that fires once on every
+    control and one that fires ten times on a tenth of them are different
+    failures and sum(fp) alone cannot tell them apart.
+    """
+    ctl = [s for s in inc if s.category == TaskCategory.CONTROL.value]
+    if not ctl:
+        return {"cells": 0, "flagged_cells": None, "fpr": None, "mean_false_positives": None}
+    flagged = len([s for s in ctl if s.fp > 0])
+    return {
+        "cells": len(ctl),
+        "flagged_cells": flagged,
+        "fpr": round(flagged / len(ctl), 4),
+        "mean_false_positives": round(sum(s.fp for s in ctl) / len(ctl), 4),
+        "high_or_critical_cells": len([s for s in ctl if s.confident_wrong]),
+    }
+
+
+def _by_category(inc: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
+    """The same rates, stratified.
+
+    Pooled over every category, an arm's headline moves with the CATEGORY MIX
+    of the cells that survived exclusion - and cells are excluded per arm, for
+    contamination, budget and validator findings, so the mix is not guaranteed
+    equal across the arms being compared. An arm can win on the pooled number
+    while losing on each category it shares with the other. Stratifying makes
+    that visible; it does not fix it, and nothing here re-weights or pools the
+    strata back into a single "adjusted" figure, which would be a new choice
+    hidden inside a number.
+    """
+    return {
+        cat: {
+            "cells": len(cells),
+            "precision": _rates(cells, "precision"),
+            "recall": _rates(cells, "recall"),
+            "confident_wrong_rate": _mean([float(s.confident_wrong) for s in cells]),
+            "distractor_hits": sum(s.distractor_hits for s in cells),
+            "redundant": sum(s.redundant for s in cells),
+        }
+        for cat in sorted({s.category for s in inc})
+        for cells in ([s for s in inc if s.category == cat],)
+    }
 
 
 def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
@@ -789,11 +942,30 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                     for c in sorted({c for s in cells for c in s.validator_codes})
                 },
             },
-            "precision": _mean([s.precision for s in inc]),
-            "recall": _mean([s.recall for s in inc]),
+            # EVAL-PLAN pre-registers "per-finding precision AND recall", which
+            # is the POOLED (micro) rate: every key finding counts once,
+            # wherever it lives. The previous single number was the mean of
+            # per-CELL rates (macro), under which a task carrying one planted
+            # bug weighs as much as a task carrying ten - so an arm could win
+            # the headline by doing well on the thin tasks. Both are reported,
+            # each named, because a reader must not be able to quote "the"
+            # precision without having chosen which one.
+            "precision": _rates(inc, "precision"),
+            "recall": _rates(inc, "recall"),
             "unsupported_claim_rate": _mean([s.unsupported_claim_rate for s in inc]),
             "confident_wrong_rate": _mean([float(s.confident_wrong) for s in inc]),
             "distractor_hits": sum(s.distractor_hits for s in inc),
+            # Predictions that repeated a key finding another prediction was
+            # already credited with. Outside `precision` by definition (see
+            # `Matching.precision`), reported so that choice stays visible: an
+            # arm with a high count produced redundant output, and precision
+            # does not charge it for that.
+            "redundant": sum(s.redundant for s in inc),
+            # A5: clean controls answer a question precision cannot, and the
+            # pooled rates move with the surviving category mix. Both are
+            # first-class rather than derivable-in-principle from `cells`.
+            "control": _control_block(inc),
+            "by_category": _by_category(inc),
             "abstention": {
                 "expected_and_abstained": len(
                     [s for s in inc if s.expected_abstain and s.abstained]

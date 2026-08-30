@@ -168,6 +168,12 @@ it - see that directory's README.
 The scored corpus: ~25-30 tasks from Athena's history: ~10 hunk-level reverts of real fixed
 defects, 5 planted bugs, 5 plan reviews with known pitfalls, 5 clean controls,
 2 insufficient-evidence tasks (correct answer = ABSTAIN). Keys in
-`eval/corpus/<task>/key.json`; snapshots built with `eris.snapshot` at the
-pre-fix sha. Scoring by `eval/score.py` (mechanical location match + blind
+`eval/keys/<task_id>.json` - a SIBLING of the corpus, never inside it: a worker
+runs with cwd = `<task>/snapshot` and E1 proved claude/codex/grok read the
+snapshot's parent, so a key beside `task.json` is readable by the thing being
+graded. `eval/score.py::load_key` refuses one it finds there, and every scored
+key carries an `ERIS-KEY-CANARY-*` token so a verbatim read is detectable.
+Snapshots built with `eris.snapshot` at the pre-fix sha, or from a committed
+`files/` tree via `python eval/make_control_snapshot.py eval/corpus --all`;
+they are gitignored, so a fresh clone must build them before any run. Scoring by `eval/score.py` (mechanical location match + blind
 human adjudication; no participating model grades its own run).

@@ -16,6 +16,7 @@ from eval.run import main as run_main
 from eval.score import (
     EXIT_GATE,
     EXIT_OK,
+    CellScore,
     GateRefused,
     Key,
     Predicted,
@@ -26,6 +27,7 @@ from eval.score import (
     paired_deltas,
     read_cell,
     score_campaign,
+    task_is_scored,
 )
 from pydantic import ValidationError
 
@@ -492,7 +494,7 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     assert pairs["4-3"]["paired"] is False and "validator errors" in pairs["4-3"]["reason"]
     assert "delta_recall" not in pairs["4-3"]  # no delta is emitted for an unpaired cell
     per_arm = summary["per_arm"]
-    assert per_arm["single"]["recall"] == 1.0
+    assert per_arm["single"]["recall"]["micro"] == 1.0
     # M1 reporting: the malformation is first-class per arm, and the campaign
     # summary carries the same counts across all cells
     assert per_arm["indep_verify_critique"]["validator"]["malformed"] == 1
@@ -528,8 +530,6 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
         recall: float | None = 0.5,
         blobs: dict[str, list[str]] | None = None,
     ) -> Any:
-        from eval.score import CellScore
-
         return CellScore(
             run_id=f"r-{arm}",
             task_id="t",
@@ -545,6 +545,7 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -793,8 +794,6 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
     arm ran `--fresh` and produced B, so "the treatment reused something" does
     not mean "the two arms shared a world".
     """
-    from eval.score import CellScore
-
     ka, kb = "a" * 64, "b" * 64
 
     def cell(arm: str, blobs: dict[str, list[str]]) -> Any:
@@ -813,6 +812,7 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -997,7 +997,6 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
     than on evidence of sameness. Reachable whenever every worker in an arm is
     absent, or no propose stage finished ok.
     """
-    from eval.score import CellScore
 
     def cell(arm: str, keys: list[str], blobs: dict[str, list[str]]) -> Any:
         return CellScore(
@@ -1015,6 +1014,7 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -1160,6 +1160,7 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -1269,6 +1270,7 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -1467,6 +1469,7 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -1542,6 +1545,7 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             tp=1,
             fp=1,
             fn=1,
+            redundant=0,
             distractor_hits=0,
             unsupported_claim_rate=0.0,
             downgrades=0,
@@ -1636,3 +1640,301 @@ def test_the_shipped_key_is_outside_the_corpus_and_has_a_canary() -> None:
         assert any(
             s.startswith("ERIS-KEY-CANARY-") for s in body.get("scan", {}).get("extra_strings", [])
         ), f"{key_file.name} has no canary"
+
+
+def test_a_repeated_true_finding_is_counted_as_redundant_not_dropped() -> None:
+    """Precision's denominator must account for every distinct prediction.
+
+    The old matcher, when a prediction matched only an already-credited key
+    finding, fell back to that same finding and `continue`d - so the repeat was
+    neither a true positive nor a false one. It vanished. A run that named one
+    real bug three times and nothing else scored precision 1.0 out of a single
+    counted prediction, and nothing in the output said two others had been
+    swallowed. Precision could read better than the proposals actually were.
+
+    It is still NOT a false positive - what it says is true - so it stays out of
+    the denominator by an explicit, reported decision rather than a silent one.
+    """
+    key = Key.model_validate(key_dict())
+    once = Predicted("src/app.py", 10, 11, Severity.HIGH, "null deref here")
+    again = Predicted("src/app.py", 11, 12, Severity.HIGH, "null deref, again")
+    m = match_findings([once, again], key)
+    assert (m.tp, m.fp, m.fn, m.redundant) == (1, 0, 0, 1)
+    assert m.precision == 1.0
+
+    # and it is not treated as a wrong claim: `confident_wrong` keys off
+    # fp_severities, and repeating something true is not being confidently wrong
+    assert m.fp_severities == []
+
+
+def test_crediting_does_not_depend_on_the_order_findings_were_listed() -> None:
+    """Greedy first-come assignment let listing order change the score.
+
+    `broad` matches both key findings; `narrow` matches only k1. Assigned
+    greedily in the order given, `broad` takes k1 - the first key finding it
+    matches - `narrow` then finds nothing unclaimed, and a run that identified
+    BOTH bugs is credited with one. The same two predictions in the other order
+    score 2. Recall would have measured the sequence a worker happened to emit
+    rather than what it found. Augmenting re-seats `broad` onto k2 and credits
+    both, in either order.
+    """
+    key = Key.model_validate(
+        key_dict(
+            findings=[
+                {
+                    "id": "k1",
+                    "path": "src/app.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "severity": "high",
+                    "must_mention": ["alpha"],
+                },
+                {
+                    "id": "k2",
+                    "path": "src/app.py",
+                    "line_start": 3,
+                    "line_end": 4,
+                    "severity": "high",
+                    "must_mention": ["beta"],
+                },
+            ]
+        )
+    )
+    broad = Predicted("src/app.py", 1, 4, Severity.HIGH, "alpha and beta are both wrong")
+    narrow = Predicted("src/app.py", 1, 2, Severity.HIGH, "alpha is wrong")
+
+    for order in ([broad, narrow], [narrow, broad]):
+        m = match_findings(order, key)
+        assert (m.tp, m.fp, m.fn, m.redundant) == (2, 0, 0, 0), [p.description for p in order]
+        assert m.matched_ids == ["k1", "k2"]
+        assert m.recall == 1.0
+
+
+def test_a_prediction_matching_nothing_is_still_a_false_positive() -> None:
+    """The redundant bucket must not become a place for wrong claims to hide."""
+    key = Key.model_validate(key_dict())
+    wrong = Predicted("src/app.py", 10, 11, Severity.CRITICAL, "unrelated - no keyword")
+    m = match_findings([wrong], key)
+    assert (m.tp, m.fp, m.redundant) == (0, 1, 0)
+    assert m.fp_severities == ["critical"]
+
+
+def test_credit_recursion_is_bounded_by_key_findings_not_predictions() -> None:
+    """A worker's output size is not under our control; the stack must not be.
+
+    Augmenting recursion descends once per key finding it has not yet tried, so
+    depth is bounded by len(key.findings) however many predictions arrive. Ten
+    thousand mutually-matching predictions would overflow a per-prediction
+    recursion at CPython's default limit of 1000.
+    """
+    key = Key.model_validate(key_dict())
+    preds = [Predicted("src/app.py", 10, 11, Severity.LOW, "null") for _ in range(10_000)]
+    m = match_findings(preds, key)
+    assert (m.tp, m.fp, m.redundant) == (1, 0, 9_999)
+
+
+def _cs(**over: Any) -> CellScore:
+    """A minimal included cell; only the counting fields matter to `aggregate`."""
+    base: dict[str, Any] = dict(
+        run_id="r",
+        task_id="t",
+        arm="single",
+        repeat_index=0,
+        category="control",
+        included=True,
+        exclusion=None,
+        verdict="REVISE",
+        verdict_basis="enforced",
+        precision=None,
+        recall=None,
+        tp=0,
+        fp=0,
+        fn=0,
+        redundant=0,
+        distractor_hits=0,
+        unsupported_claim_rate=None,
+        downgrades=0,
+        confident_wrong=False,
+        abstained=False,
+        expected_abstain=False,
+        cost_spent_usd=0.0,
+        cost_attributed_usd=0.0,
+        cost_by_stage_spent={},
+        cost_by_stage_attributed={},
+        unknown_cost_records=0,
+        wall_ms=None,
+        attempts=1,
+        propose_keys=[],
+        propose_blobs={},
+        validator_errors=0,
+        validator_codes={},
+        validator_basis="acted",
+        contaminated=False,
+        scan_incomplete=False,
+        rescan_contaminated=False,
+        containment=None,
+    )
+    base.update(over)
+    return CellScore(**base)
+
+
+def test_pooled_and_per_cell_rates_are_both_reported_and_named() -> None:
+    """EVAL-PLAN pre-registers "per-finding" rates; the aggregate reported a
+    per-CELL mean under the bare name `recall`.
+
+    One cell catches the single planted bug in a thin task; the other catches
+    one of nine in a fat one. Per finding, 2 of 10 were caught - 0.2. Averaged
+    per cell it is (1.0 + 0.111)/2 = 0.5555, and an arm that did well only where
+    there was little to find would carry the headline. Both are emitted, each
+    under its own name, so `per_arm[*]["recall"]` cannot be quoted as a number
+    without choosing which question it answers.
+    """
+    agg = aggregate([_cs(tp=1, fn=0, recall=1.0), _cs(tp=1, fn=8, recall=round(1 / 9, 4))])
+    assert agg["single"]["recall"]["micro"] == 0.2
+    assert agg["single"]["recall"]["macro"] == 0.5555
+    assert agg["single"]["recall"]["cells_counted"] == 2
+
+
+def test_silent_cells_are_named_rather_than_dropped_from_precision() -> None:
+    """A cell that predicted nothing has precision None, and the per-cell mean
+    drops it: an arm that stays quiet has its precision computed only over the
+    cells where it spoke, so silence costs nothing. Micro pooling drops it too -
+    it contributes to neither numerator nor denominator - which is arithmetic,
+    not a fix. What closes the hole is REPORTING it: `cells_counted` against
+    `cells_included`, and `silent_cells` outright.
+    """
+    agg = aggregate([_cs(tp=1, fp=0, precision=1.0), _cs(tp=0, fp=0, precision=None)])
+    p = agg["single"]["precision"]
+    assert p["micro"] == 1.0 and p["macro"] == 1.0
+    assert (p["cells_counted"], p["cells_included"], p["silent_cells"]) == (1, 2, 1)
+
+
+def test_precision_with_redundant_back_in_the_denominator_is_published() -> None:
+    """`Matching.precision` leaves redundant repeats out of the denominator on
+    purpose. That is a judgement call, so the number a reader needs to overrule
+    it is published rather than left for them to recompute from raw cells.
+    """
+    agg = aggregate([_cs(tp=1, fp=1, redundant=2, precision=0.5)])
+    p = agg["single"]["precision"]
+    assert p["micro"] == 0.5 and p["micro_with_redundant"] == 0.25
+    assert agg["single"]["redundant"] == 2
+
+
+def test_clean_controls_report_a_false_positive_rate_of_their_own() -> None:
+    """A control has no planted finding, so recall is undefined and the pooled
+    catch rate never sees it. The one question it exists to answer - does the
+    arm invent a defect in clean code - was reaching the summary only as a
+    diluted term inside overall precision, where a good catch rate on the
+    planted tasks offsets it.
+
+    A rate AND a mean, because one arm firing once on every control and another
+    firing four times on a quarter of them have the same sum(fp) and are
+    different failures.
+    """
+    ctl = [
+        _cs(category="control", fp=4, precision=0.0),
+        _cs(category="control", fp=0),
+        _cs(category="control", fp=0),
+        _cs(category="control", fp=0),
+    ]
+    block = aggregate(ctl)["single"]["control"]
+    assert (block["cells"], block["flagged_cells"], block["fpr"]) == (4, 1, 0.25)
+    assert block["mean_false_positives"] == 1.0
+
+    # an arm with the same sum(fp) spread across every control is distinguished
+    spread = [_cs(category="control", fp=1, precision=0.0) for _ in range(4)]
+    other = aggregate(spread)["single"]["control"]
+    assert other["fpr"] == 1.0 and other["mean_false_positives"] == 1.0
+
+    # and an arm with no controls at all says so rather than reporting 0.0
+    assert (
+        aggregate([_cs(category="planted", tp=1, recall=1.0)])["single"]["control"]["fpr"] is None
+    )
+
+
+def test_rates_are_stratified_by_category() -> None:
+    """Cells are excluded PER ARM - contamination, budget, validator findings -
+    so the surviving category mix is not guaranteed equal across the arms being
+    compared, and a pooled headline moves with the mix. Here the pooled recall
+    is 0.5 while the arm caught everything planted and nothing reverted; the
+    strata say which.
+    """
+    agg = aggregate(
+        [
+            _cs(category="planted", tp=2, fn=0, recall=1.0),
+            _cs(category="revert", tp=0, fn=2, recall=0.0),
+        ]
+    )["single"]
+    assert agg["recall"]["micro"] == 0.5
+    assert agg["by_category"]["planted"]["recall"]["micro"] == 1.0
+    assert agg["by_category"]["revert"]["recall"]["micro"] == 0.0
+    assert agg["by_category"]["planted"]["cells"] == 1
+
+
+@pytest.mark.parametrize(
+    "flag", [True, False, 0, 1, "false", "true", "no", "off", "yes", None, [], {}, 2, -1]
+)
+def test_the_runner_and_the_scorer_agree_on_what_is_a_scored_task(
+    tmp_path: Path, flag: object
+) -> None:
+    """One predicate, two implementations, and they must not drift.
+
+    `eval/score.py` cannot import `eris.evidence`: the scorer's import guard
+    forbids dragging `eris.verify` and `subprocess` into a read-only tool. So it
+    parses `task.json` as plain JSON and opts out only on a literal `false`,
+    while `eval/run.py` reads the same flag through pydantic. Under lax
+    coercion those disagreed on `0`, `"false"`, `"no"` and `"off"`: discovery
+    SKIPPED the task and the scorer still expected it, so a mistyped flag
+    surfaced as missing cells rather than as a bad task file. The flag is strict
+    now; this asserts the agreement directly, on every shape, rather than
+    trusting that two files stay in step.
+    """
+    from eval.run import task_is_scored as runner_reads
+
+    body: dict[str, Any] = {
+        "task_id": "t_01",
+        "question": "q",
+        "category": "control",
+        "snapshot": "s",
+    }
+    if flag is not ...:
+        body["scored"] = flag
+    task_dir = tmp_path / "corpus" / "t_01"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.json").write_text(json.dumps(body))
+
+    assert runner_reads(task_dir / "task.json") == task_is_scored(tmp_path / "corpus", "t_01"), (
+        f"runner and scorer disagree on scored={flag!r}"
+    )
+
+
+def test_only_a_literal_false_opts_a_task_out_of_scoring(tmp_path: Path) -> None:
+    """The agreement above would also be satisfied by both readers saying
+    False for everything. Pin the direction: a real `false` opts out, and a
+    truthy-looking string does NOT quietly opt out.
+    """
+    from eval.run import task_is_scored as runner_reads
+
+    def write(name: str, flag: object) -> Path:
+        # named, not derived from `flag`: `str(False)` and `str("false")` differ
+        # only in case, and this repo is developed on a case-insensitive
+        # filesystem where the two would collide into one directory
+        d = tmp_path / name / "t_01"
+        d.mkdir(parents=True)
+        (d / "task.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "t_01",
+                    "question": "q",
+                    "category": "control",
+                    "snapshot": "s",
+                    "scored": flag,
+                }
+            )
+        )
+        return d / "task.json"
+
+    assert runner_reads(write("bool_false", False)) is False
+    assert task_is_scored(tmp_path / "bool_false", "t_01") is False
+    assert runner_reads(write("str_false", "false")) is True
+    assert task_is_scored(tmp_path / "str_false", "t_01") is True

@@ -11,7 +11,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from eval.make_control_snapshot import COMMIT_IDENTITY, build_snapshot, git_commands, main
+from eval.make_control_snapshot import (
+    COMMIT_IDENTITY,
+    build_snapshot,
+    corpus_task_dirs,
+    git_commands,
+    main,
+    snapshot_matches_files,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 PLUMBING = REPO / "eval" / "corpus" / "plumbing-control"
@@ -75,3 +82,93 @@ def test_the_plumbing_control_is_generated_not_committed() -> None:
     assert "eval/corpus/*/snapshot/" in ignore
     spec = json.loads((PLUMBING / "task.json").read_bytes())
     assert spec["snapshot"] == "snapshot" and spec["scored"] is False
+
+
+def test_a_snapshot_that_drifted_from_its_committed_files_is_detected(tmp_path: Path) -> None:
+    """`files/` is committed and `snapshot/` is gitignored, so they are versioned
+    differently and drift silently. Edit a corpus file, forget to rebuild, and a
+    campaign measures the OLD tree while the repository shows the new one - with
+    a `snapshot_sha` that is internally consistent and describes a tree nobody
+    reviewed. This is not hypothetical: the plumbing control's snapshot was
+    found stale on 2026-08-30, its README and docstrings several edits behind.
+
+    Compared modulo `.git`, which the snapshot has and the source does not - so
+    a freshly built snapshot must compare EQUAL, not merely "close".
+    """
+    task = _task_dir(tmp_path)
+    assert snapshot_matches_files(task) is None  # nothing built yet
+
+    build_snapshot(task, runner=lambda argv, cwd: None)
+    assert snapshot_matches_files(task) is True
+
+    (task / "files" / "calc.py").write_text("def add(a, b):\n    return a + b  # edited\n")
+    assert snapshot_matches_files(task) is False
+
+    build_snapshot(task, runner=lambda argv, cwd: None)
+    assert snapshot_matches_files(task) is True
+
+
+def test_a_stale_snapshot_stops_a_run_before_any_worker_is_spawned(tmp_path: Path) -> None:
+    """The check is worthless if it only reports; it must REFUSE, and refuse at
+    the point every campaign and every single-cell run passes through, before
+    money is spent.
+    """
+    from eval.run import load_task
+
+    from eris.launch import LaunchRefused
+
+    task = _task_dir(tmp_path)
+    build_snapshot(task, runner=lambda argv, cwd: None)
+    (task / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "t_01",
+                "question": "q",
+                "category": "control",
+                "snapshot": "snapshot",
+            }
+        )
+    )
+    assert load_task(task / "task.json")[1] == (task / "snapshot").resolve()
+
+    (task / "files" / "calc.py").write_text("def add(a, b):\n    return a + b  # drifted\n")
+    with pytest.raises(LaunchRefused, match="stale"):
+        load_task(task / "task.json")
+
+
+def test_the_builder_can_make_every_snapshot_a_clone_is_missing(tmp_path: Path) -> None:
+    """Snapshots are gitignored, so a fresh checkout has NONE and every run
+    refuses. `--all` is the one command that makes a clone runnable; without it
+    the corpus has to be rebuilt task by task, by hand, from memory.
+    """
+    corpus = tmp_path / "corpus"
+    for name in ("t_01", "t_02"):
+        d = corpus / name
+        (d / "files").mkdir(parents=True)
+        (d / "files" / "calc.py").write_text(f"# {name}\n")
+        (d / "task.json").write_text("{}")
+    # a task with no files/ tree is built by eris.snapshot from a real repo and
+    # is not this command's business
+    (corpus / "t_03").mkdir()
+    (corpus / "t_03" / "task.json").write_text("{}")
+
+    assert corpus_task_dirs(corpus) == [corpus / "t_01", corpus / "t_02"]
+
+    calls: list[Path] = []
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("eval.make_control_snapshot._run", lambda argv, cwd: calls.append(cwd))
+    try:
+        assert main([str(corpus), "--all"]) == 0
+    finally:
+        monkey.undo()
+    assert {c.parent.name for c in calls} == {"t_01", "t_02"}
+    assert snapshot_matches_files(corpus / "t_01") is True
+
+
+def test_the_shipped_corpus_snapshots_are_current() -> None:
+    """The real corpus on disk, not a fixture."""
+    for task_dir in corpus_task_dirs(REPO / "eval" / "corpus"):
+        assert snapshot_matches_files(task_dir) is not False, (
+            f"{task_dir.name}: snapshot is stale - rebuild with "
+            f"`python eval/make_control_snapshot.py eval/corpus --all`"
+        )

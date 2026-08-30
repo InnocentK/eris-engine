@@ -19,7 +19,9 @@ import argparse
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from eris.sanitize import tree_sha256
 
 Runner = Callable[[Sequence[str], Path], None]
 
@@ -75,14 +77,60 @@ def build_snapshot(
     return snapshot
 
 
+def _not_git(rel: PurePosixPath) -> bool:
+    return rel.parts[:1] == (".git",)
+
+
+def snapshot_matches_files(task_dir: Path) -> bool | None:
+    """Is ``<task>/snapshot`` still the tree ``<task>/files`` describes?
+
+    None when the question does not apply - no ``files/`` (a snapshot built by
+    ``eris.snapshot`` from a real repository at a sha) or no ``snapshot/`` yet.
+
+    This exists because the two trees are versioned differently and cannot drift
+    loudly: ``files/`` is committed, ``snapshot/`` is generated and gitignored,
+    so editing a corpus file and forgetting to rebuild leaves a campaign
+    measuring the OLD tree while the repository shows the new one. The ledger's
+    ``snapshot_sha`` would be internally consistent and still describe a tree
+    nobody reviewed. Compared modulo ``.git``, which the snapshot has and the
+    source does not.
+    """
+    task_dir = Path(task_dir)
+    files, snapshot = task_dir / "files", task_dir / "snapshot"
+    if not files.is_dir() or not snapshot.is_dir():
+        return None
+    return tree_sha256(files) == tree_sha256(snapshot, skip=_not_git)
+
+
+def corpus_task_dirs(corpus: Path) -> list[Path]:
+    """Every corpus task that is built from a committed ``files/`` tree."""
+    return sorted(
+        p.parent for p in Path(corpus).glob("*/task.json") if (p.parent / "files").is_dir()
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="eval/make_control_snapshot.py", description=__doc__)
-    parser.add_argument("task_dir", help="corpus task directory (must contain files/)")
+    parser.add_argument(
+        "task_dir",
+        help="corpus task directory (must contain files/), or a corpus root with --all",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="treat task_dir as a corpus root and build every task under it. Snapshots are "
+        "gitignored, so a fresh clone has NONE and a campaign refuses to start; this is the "
+        "one command that makes a checkout runnable.",
+    )
     parser.add_argument("--git", default="git")
     parser.add_argument("--message", default="corpus snapshot")
     args = parser.parse_args(argv)
-    snapshot = build_snapshot(Path(args.task_dir), git=args.git, message=args.message)
-    print(f"built {snapshot}")
+    targets = corpus_task_dirs(Path(args.task_dir)) if args.all else [Path(args.task_dir)]
+    if not targets:
+        raise SystemExit(f"no corpus task with a files/ tree under {args.task_dir}")
+    for task_dir in targets:
+        snapshot = build_snapshot(task_dir, git=args.git, message=args.message)
+        print(f"built {snapshot}")
     return 0
 
 
