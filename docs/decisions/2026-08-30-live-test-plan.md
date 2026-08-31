@@ -567,10 +567,14 @@ the same error as defaulting to `standalone` on no evidence, moved one branch
 over.
 
 No code path writes both. `cmd_campaign` appends `campaign.started` to the
-campaign dir and never `run.started` (verified by extracting the function body
-and searching it); `run_cell` and `cmd_invoke` append `run.started` to their own
-dirs. A directory carrying both is not what either command would have made, so
-nothing in this gate knows which resume form applies, and it now says so.
+campaign dir and never `run.started`; `run_cell` and `cmd_invoke` append
+`run.started` to their own dirs. A directory carrying both is not what either
+command would have made, so nothing in this gate knows which resume form
+applies, and it now says so.
+
+That mutual exclusion is load-bearing for the whole classifier, and when this
+section was first written it rested on a grep of `cmd_campaign` taken once - an
+invariant asserted, not enforced (S0-10).
 
 Three cases exercised with real `RunWriter` fixtures: both markers -> `unknown`
 with the reason named; `campaign.started` alone -> campaign; `run.started` alone
@@ -586,6 +590,50 @@ about the cases: **the classifier may only speak when the evidence is
 unambiguous, and every other input - missing, empty, corrupt, contradictory -
 takes the same silent branch.** That is now one `unknown` path with five
 reasons, not five branches with four answers.
+
+### S0-10. The rationale asserted an invariant the code did not enforce
+
+Caught by the Codex stop review, on the fix for S0-9. The classifier's whole
+fail-closed structure rests on one fact: a campaign directory's ledger carries
+`campaign.started` and never `run.started`, and a standalone run's carries the
+reverse. The comment stated that as though the code guaranteed it. Nothing did.
+It was a grep of `cmd_campaign` taken at one moment, and a later edit that
+appended `run.started` to the campaign writer would have made the gate print
+`--resume c2` for a real campaign - which argparse rejects with
+`invalid choice: 'c2' (choose from 'status')` - with no test failing anywhere.
+
+An unenforced invariant in a rationale is worse than no rationale: it reads as a
+guarantee, so the next reader stops checking.
+
+Now enforced by
+`tests/test_run_harness.py::test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker`,
+which runs a real campaign and a real standalone run through the harness and
+asserts the exclusion in three places: the campaign directory's own ledger, each
+cell directory's ledger, and the standalone run's ledger.
+
+**Mutation-checked in both directions**, because a test that has never failed
+has not been shown to test anything:
+
+* appending `run.started` to `cmd_campaign`'s writer -> fails with "a campaign
+  directory's own ledger gained `run.started`: the live-run gate would now print
+  the standalone resume flag for a campaign";
+* appending `campaign.started` in `run_cell` -> fails with
+  "t_01-r0-single-grok gained `campaign.started`".
+
+Both mutations were reverted and `git diff` confirmed clean.
+
+A second overclaim in the same comment: torn-tail tolerance was justified by
+"both markers are written at the head of the file", which is also unenforced.
+Rewritten to the reason that actually holds regardless of position - if a tear
+removes a marker there is no positive evidence left, so the classifier reports
+`unknown`, the silent branch. Tolerance cannot manufacture an answer.
+
+**Five rounds.** The first four were the same defect migrating between branches
+(S0-9). This one is that defect moved out of the code and into the prose about
+the code: having made the branch structure fail closed, I explained why it was
+safe using a fact I had checked once by hand and then described as a property of
+the system. The check that closes it is the same one that closes the others -
+make the claim fail before believing it.
 
 ## Panel review (B3) — done, 2026-08-30
 

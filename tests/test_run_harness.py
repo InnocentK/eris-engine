@@ -1814,3 +1814,77 @@ def test_key_content_anywhere_in_the_task_stops_the_run(tmp_path: Path) -> None:
     peek.unlink()
 
     assert load_task(w["task"])[0].task_id == "t_01"
+
+
+def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
+    tmp_path: Path,
+) -> None:
+    """The two start markers are mutually exclusive, per directory.
+
+    `eval/live_preconditions.sh` classifies a COLLIDED run id by reading the
+    directory's own ledger: `campaign.started` means campaign (resume with a
+    bare `--resume`), `run.started` means standalone (resume with
+    `--resume <RUN_ID>`), and anything else - missing, empty, chain-corrupt, or
+    carrying BOTH - refuses to print a resume form at all.
+
+    That classifier is only sound while the markers stay mutually exclusive,
+    and nothing enforced it: its rationale asserted the invariant from a grep of
+    `cmd_campaign` taken at one moment (stop review, 2026-08-31). Appending
+    `run.started` to the campaign writer would make the gate print the
+    standalone flag for a real campaign directory - `--resume c2`, which
+    argparse rejects as `invalid choice: 'c2' (choose from 'status')` - and no
+    test would have noticed.
+    """
+    w = world(tmp_path)
+    home = tmp_path / "home"
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c2",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+        ],
+        out=io.StringIO(),
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_OK
+
+    campaign_kinds = set(events_of(w["runs"] / "c2").kinds())
+    assert "campaign.started" in campaign_kinds
+    assert "run.started" not in campaign_kinds, (
+        "a campaign directory's own ledger gained `run.started`: the live-run "
+        "gate would now print the standalone resume flag for a campaign"
+    )
+
+    cell_dirs = [p for p in (w["runs"] / "c2").iterdir() if p.is_dir() and p.name != "blobs"]
+    assert cell_dirs, "campaign wrote no cell directories"
+    for cell in cell_dirs:
+        cell_kinds = set(events_of(cell).kinds())
+        assert "run.started" in cell_kinds
+        assert "campaign.started" not in cell_kinds, f"{cell.name} gained `campaign.started`"
+
+    out = io.StringIO()
+    rc = main(
+        run_args(w, "single", run_id="solo"),
+        out=out,
+        err=io.StringIO(),
+        home=home,
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_OK, out.getvalue()
+    solo_kinds = set(events_of(Path(json.loads(out.getvalue())["run_dir"])).kinds())
+    assert "run.started" in solo_kinds
+    assert "campaign.started" not in solo_kinds, (
+        "a standalone run's ledger gained `campaign.started`: the live-run gate "
+        "would now print the campaign resume flag for a standalone run"
+    )

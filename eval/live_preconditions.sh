@@ -175,9 +175,10 @@ for rid in sys.argv[4:]:
             # The engine's own reader, so a ledger whose hash chain does not
             # validate is REFUSED here exactly as `eval/score.py` refuses it,
             # instead of being parsed line by line and believed. A torn
-            # (unterminated) tail is tolerated, as everywhere else in Eris; it
-            # cannot affect the answer, because both markers below are written
-            # at the head of the file.
+            # (unterminated) tail is tolerated, as everywhere else in Eris.
+            # Tolerance cannot manufacture an answer: if a tear removed a start
+            # marker there is no positive evidence left and the classifier
+            # reports `unknown`, which is the silent branch.
             kinds = set(LedgerView.from_path(events).kinds())
         except LedgerCorrupt:
             kinds, why = set(), "ledger hash chain does not validate"
@@ -186,18 +187,25 @@ for rid in sys.argv[4:]:
         # POSITIVE evidence for each kind, never inference from absence.
         # `cmd_campaign` appends `campaign.started` to the campaign dir and no
         # `run.started`; a standalone `run` appends `run.started` and no
-        # `campaign.started`. An earlier version defaulted to "standalone" and
+        # `campaign.started`. That mutual exclusion is the load-bearing fact
+        # here and it is ENFORCED, not asserted: see
+        # `tests/test_run_harness.py::
+        #  test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker`,
+        # which fails if either marker appears in the other's ledger. It was a
+        # grep of `cmd_campaign` until the stop review pointed out that this
+        # rationale claimed an invariant nothing checked. An earlier version
+        # defaulted to "standalone" and
         # only flipped on seeing `campaign.started`, so an EMPTY ledger - and
         # one torn or corrupt before that event was written - got confident
         # standalone advice from no evidence at all.
         is_camp = "campaign.started" in kinds
         is_run = "run.started" in kinds
         if is_camp and is_run:
-            # CONFLICTING evidence is not a tie to be broken by precedence. No
-            # code path writes both: `cmd_campaign` appends `campaign.started`
-            # to the campaign dir and never `run.started`; `run_cell` and
-            # `cmd_invoke` append `run.started` to their own dirs. Both present
-            # means the directory is not what either command would have made,
+            # CONFLICTING evidence is not a tie to be broken by precedence.
+            # No code path writes both, and the test named above is what keeps
+            # that true rather than a grep of `cmd_campaign` taken once. Both
+            # present means the directory is not what either command would have
+            # made,
             # so nothing here knows which resume form applies. An earlier
             # version silently preferred `campaign` - the same error as
             # defaulting to `standalone` on no evidence, one branch over.
