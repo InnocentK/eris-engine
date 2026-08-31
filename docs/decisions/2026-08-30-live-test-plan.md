@@ -911,6 +911,45 @@ refuse what it cannot see, and to say where its sight ends. Writing the limit
 down is what stops the next reader - me - from trusting a green test further
 than it reaches.
 
+### S0-17. The same splat oversight, in the branch added to fix the last one
+
+Caught by the Codex stop review, on the fix for S0-16. The unreadable-callee
+branch guarded on `len(node.args) + len(node.keywords) >= 2`, so a splat walked
+past it:
+
+| call | arity read as | refused before |
+|---|---|---|
+| `getattr(w, n)(*pair)` | 1 | no |
+| `getattr(w, n)(**d)` | 1 | no |
+| `t["append"](*pair)` | 1 | no |
+| `getattr(w, n)(k, p)` | 2 | yes |
+
+S0-14 is the same finding. It was fixed there by adding a splat check inside
+`_maybe_event`, on the `.append` path - and S0-16 then wrote a NEW arity test in
+a NEW branch, from scratch, without it. The defect was not that I forgot the
+lesson; it is that the lesson was applied to one copy of a rule that now had two.
+
+So the fix is not a third splat check. Arity now lives in two functions,
+`_hides_arity` and `_passes_two`, used by both branches and by nothing else -
+verified by grep, three call sites, no other place computing an argument count
+for this purpose. `_passes_two` treats a splat as passing two, because `f(*pair)`
+may well be. Two copies of a rule are two rules, and only one of them gets fixed.
+
+Six mutations, assertion firing, no crash - the four splat evasions above, plus
+`w.append(*pair)` and a literal marker as regressions on the paths S0-14 and
+S0-12 covered, to show the shared predicate did not loosen them. Baseline passes.
+
+`getattr(*a)` parked in a local remains outside the static scan. That is the
+residue documented in S0-16, not a new hole: the boundary named there is "a
+method resolved dynamically and parked in a local", and this is an instance of
+it, covered by the behavioural test rather than by this one.
+
+**Twelve rounds.** The finding here is about repair, not detection: I fixed
+S0-14 at the site that failed instead of at the rule, so the rule stayed
+single-copy in my head and double-copy in the file. A fix that leaves the
+duplication intact schedules its own recurrence, and the recurrence arrives
+wearing the next feature's clothes.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:

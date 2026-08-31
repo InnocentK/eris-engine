@@ -1910,6 +1910,26 @@ def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
 _INDIRECT_LOOKUP = frozenset({"__getattribute__", "__getattr__"})
 
 
+def _hides_arity(node: ast.Call) -> bool:
+    """A splat: how many arguments this passes cannot be read."""
+    return any(isinstance(a, ast.Starred) for a in node.args) or any(
+        k.arg is None for k in node.keywords
+    )
+
+
+def _passes_two(node: ast.Call) -> bool:
+    """Called the way `RunWriter.append(kind, payload)` is called.
+
+    A splat counts, because `f(*pair)` may well be passing two. Both callers
+    below use THIS function rather than their own arity test: the splat check
+    lived inside the `.append` branch and the unreadable-callee branch was
+    written later with a fresh `len(args) + len(keywords) >= 2`, so
+    `getattr(w, n)(*pair)` walked past it (stop review, 2026-08-31). Two copies
+    of a rule are two rules, and only one of them gets fixed.
+    """
+    return _hides_arity(node) or len(node.args) + len(node.keywords) >= 2
+
+
 def _event_append_sites(
     roots: tuple[Path, ...],
 ) -> tuple[dict[str, set[str]], list[tuple[str, str, str | None]]]:
@@ -1972,7 +1992,7 @@ def _event_append_sites(
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
-            passes_two = len(node.args) + len(node.keywords) >= 2
+            passes_two = _passes_two(node)
             if isinstance(node.func, ast.Attribute):
                 if node.func.attr == "append":
                     self._maybe_event(node, self._where)
@@ -2018,9 +2038,7 @@ def _event_append_sites(
             append from `list.append` is that it passes TWO things, however
             they are spelled.
             """
-            if any(isinstance(a, ast.Starred) for a in node.args) or any(
-                k.arg is None for k in node.keywords
-            ):
+            if _hides_arity(node):
                 # A splat hides the kind. BOTH forms are checked here, before
                 # the arity gate below, because neither passes it: `append(*p)`
                 # presents one argument and `append(**d)` one keyword with no
@@ -2030,8 +2048,7 @@ def _event_append_sites(
                 dynamic.append((f"{where}:{node.lineno}", ast.unparse(node), None))
                 return
             kwargs = {k.arg for k in node.keywords}
-            two_things = len(node.args) + len(node.keywords) >= 2
-            if not (two_things or "kind" in kwargs):
+            if not (_passes_two(node) or "kind" in kwargs):
                 return  # list.append(x)
             arg: ast.expr | None = node.args[0] if node.args else None
             if arg is None:
