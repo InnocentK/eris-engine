@@ -1935,19 +1935,46 @@ def _event_append_sites(
         visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
         def visit_Call(self, node: ast.Call) -> None:
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "append"
-                and len(node.args) >= 2
-            ):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "append":
                 where = f"{self.module}.{self.stack[-1] if self.stack else '<module>'}"
-                arg = node.args[0]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    if arg.value in markers:
-                        literal.setdefault(arg.value, set()).add(where)
-                else:
-                    dynamic.append((f"{where}:{node.lineno}", ast.unparse(arg)))
+                self._maybe_event(node, where)
             self.generic_visit(node)
+
+        def _maybe_event(self, node: ast.Call, where: str) -> None:
+            """Is this `RunWriter.append(kind, payload)`, and what kind?
+
+            `append(self, kind, payload)` takes BOTH parameters positionally OR
+            by keyword (`src/eris/writer.py:344`), so arity alone cannot find
+            these calls: `w.append("campaign.started", payload={})` has one
+            positional argument and `w.append(kind=...)` has none. An earlier
+            version required two positionals, which a `list.append` never has -
+            true, but it also excluded every keyword form of the call it was
+            looking for (stop review, 2026-08-31). What separates an event
+            append from `list.append` is that it passes TWO things, however
+            they are spelled.
+            """
+            if any(k.arg is None for k in node.keywords):
+                # `append(**d)` - the kind is not visible at all, and this is
+                # checked BEFORE the arity gate below, which a splat call does
+                # not pass (one keyword, no `kind=`) and which would therefore
+                # have skipped it silently.
+                dynamic.append((f"{where}:{node.lineno}", ast.unparse(node)))
+                return
+            kwargs = {k.arg for k in node.keywords}
+            two_things = len(node.args) + len(node.keywords) >= 2
+            if not (two_things or "kind" in kwargs):
+                return  # list.append(x)
+            arg: ast.expr | None = node.args[0] if node.args else None
+            if arg is None:
+                arg = next((k.value for k in node.keywords if k.arg == "kind"), None)
+            if arg is None:
+                dynamic.append((f"{where}:{node.lineno}", ast.unparse(node)))
+                return
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if arg.value in markers:
+                    literal.setdefault(arg.value, set()).add(where)
+            else:
+                dynamic.append((f"{where}:{node.lineno}", ast.unparse(arg)))
 
     for root in roots:
         for f in sorted(root.rglob("*.py")):

@@ -721,6 +721,55 @@ thing?" but "what is this blind to, and would the claim survive there?" Where
 the answer is "I cannot see", the only honest output is a refusal, in a test
 exactly as in a gate.
 
+### S0-13. The scan matched a calling convention, not the call
+
+Caught by the Codex stop review, on the fix for S0-12. That scan found event
+appends by requiring **two positional arguments** - chosen because a
+`list.append` takes one, so arity separated them cleanly. It does, and it also
+excludes most of the ways the call it is hunting for can legally be written.
+
+`RunWriter.append(self, kind, payload)` (`src/eris/writer.py:344`) takes both
+parameters positionally or by keyword. So
+
+```python
+w.append("campaign.started", payload={...})   # one positional -> missed
+w.append(kind="campaign.started", ...)        # no positional  -> missed
+w.append(**{"kind": "campaign.started", ...}) # invisible      -> missed
+```
+
+were each a legal way to break the invariant that the test enforcing it could
+not see. None exists today - the survey found 0 keyword-form and 0 splat appends
+against 86 positional ones - which is exactly why it survived: the scan matched
+the codebase's current habit rather than the callable's signature.
+
+What separates an event append from a `list.append` is that it passes TWO
+things, however they are spelled. The scan now takes the kind from `args[0]` or
+from a `kind=` keyword, and refuses any call whose keywords include a `**`
+splat, since the kind is then not visible at all. That splat check runs BEFORE
+the arity gate, because a splat call presents one keyword and no `kind=` and
+would otherwise be skipped by the very gate meant to catch it - a bug written
+and then found in the same round, by running case C instead of reasoning about
+it.
+
+Mutation-checked, all three shapes:
+
+| mutation in `src/eris/arms.py` | structural |
+|---|---|
+| `append("campaign.started", payload={...})` | FAILS - site map changed |
+| `append(kind="campaign.started", ...)` | FAILS - site map changed |
+| `append(**{"kind": "campaign.started", ...})` | FAILS - "cannot rule out" |
+
+All reverted, `git diff` clean. The baseline map is unchanged, so positional
+detection is intact and the new rule is strictly wider than the old one.
+
+**Eight rounds.** S0-12 named the question as "what is this blind to?" and this
+round answers it for the previous answer: it was blind to the calling
+convention, because I derived the detector from the code in front of me instead
+of from the signature being called. Reading the definition of what you are
+looking for costs one line - `src/eris/writer.py:344` - and it is the difference
+between a scan that finds every such call and one that finds every such call
+*written the way the current authors happen to write them*.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
