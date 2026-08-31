@@ -179,10 +179,27 @@ paired design requires.
 
 Two consequences worth stating rather than discovering later:
 
-* **Every dollar becomes observable.** No codex or agy call means no
-  missing-cost call, so nothing is booked as a $2 placeholder. `spent_known_usd`
-  is the whole cost for the first time in this plan, and P8 finally reads what
-  it claims to.
+* **Every COMPLETED call reports its cost - and the interrupt is the
+  exception, deliberately.** Neither missing-cost worker is on the panel, so no
+  finished call is booked as a $2 placeholder. But this section also instructs
+  the operator to SIGINT the campaign, and a killed call never returns a cost,
+  so `BudgetLedger` books `per_call_usd` for it with `cost_known: false` -
+  whatever worker it was. Verified on `runs/b-s0`: the interrupted invocation is
+  **claude**, `status: failed`, `error: "interrupted"`, `cost_known: false`,
+  `$2.00`.
+
+  So S3 should carry **exactly one** unobservable call, plus one more for each
+  timeout retry (S1 had one, on agy). An earlier draft of this section claimed
+  "every dollar becomes observable" and told the operator to interrupt the run
+  four paragraphs later; the two were written in the same edit and neither was
+  read against the other, which is the defect class this document keeps
+  recording.
+
+  `spent_known_usd` is unaffected either way - it sums only `cost_known: true`
+  records, so P8 does read what it claims - but it is NOT the whole cost while
+  an interrupt is folded in, and the report must not present it as such. The
+  interrupted invocation is identifiable by `error: "interrupted"`, so it can be
+  named and excluded rather than quietly averaged in.
 * **This is not a retreat from multi-family review.** The panel is two families
   for a MEASUREMENT whose subject is the arm, not the panel. Eris's standing
   rule - never review with one family, never let a family review itself - is
@@ -222,8 +239,9 @@ exit code is checked before the file is treated as results.
 of 2. Cached after the first arm per task, so the executed calls per task are 2
 proposals, 2 critique calls and up to 5 judge calls (1 + up to `MAX_ITERATIONS`
 + 1). At S1's observed rates - claude propose $0.56, grok propose $0.077, judge
-$0.80 - that is about **$5.3 per task, ~$21 for S3**, all of it real and none of
-it reserved. The `$50` committed-cost stop condition therefore stands unchanged
+$0.80 - that is about **$5.3 per task, ~$21 for S3** of real spend, plus the
+**$2 placeholder the deliberate interrupt books** (and $2 more per timeout
+retry). Committed lands near $23, well under the $50 stop condition. The `$50` committed-cost stop condition therefore stands unchanged
 and is no longer in contradiction with the sizing.
 
 **Cross-campaign comparison is forbidden.** `eval/score.py` takes ONE
