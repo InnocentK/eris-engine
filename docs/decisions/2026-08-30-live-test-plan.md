@@ -770,6 +770,56 @@ looking for costs one line - `src/eris/writer.py:344` - and it is the difference
 between a scan that finds every such call and one that finds every such call
 *written the way the current authors happen to write them*.
 
+### S0-14. A positional splat walked past the widened scan, and two neighbours with it
+
+Caught by the Codex stop review, on the fix for S0-13. That round widened the
+scan to keyword forms and added a refusal for `append(**d)`, checked before the
+arity gate. It did not add the same refusal for `append(*pair)`: one positional
+argument, no `kind=`, so the arity gate returned early and the call was never
+looked at. The `**` twin was handled in the same function, three lines above.
+
+Fixing only the reported shape would have left the next two, so the question was
+asked properly this time - what else can reach `RunWriter.append` without
+presenting an `ast.Attribute` named `append` with a readable first argument?
+Three things, all currently zero in `src/` and `eval/`, all now refused:
+
+* `w.append(*pair)` and `w.append(*a, payload=b)` - splatted positionals;
+* `getattr(w, "append")(kind, payload)` - no Attribute node to match;
+* `emit = w.append` then `emit(...)` - the call site is detached from the name.
+
+A `list.append(*x)` would now fail this test too. That is the intended trade: it
+is zero-occurrence today, and the failure message says to make the call explicit.
+
+**The fix contained its own defect, and running case F is what found it.**
+`visit_Assign` recorded `ast.unparse(node)` for an alias, and the prefix check
+re-parsed every dynamic entry with `ast.parse(expr, mode="eval")`. An assignment
+unparses to a STATEMENT, so the test raised `SyntaxError` from inside itself
+rather than failing with its message - and the mutation table I had already
+written down said "FAILS", because a crash exits non-zero and I had matched on
+exit code. Two bugs, one masking the other, both invisible to the check I was
+running. `dynamic` entries now carry a prefix resolved while the node is in
+hand; nothing is re-parsed.
+
+Mutation table, six shapes, all with the assertion actually firing and no crash:
+
+| mutation in `src/eris/arms.py` | result |
+|---|---|
+| `append(*pair)` | FAILS - cannot rule out |
+| `append(*a, payload={})` | FAILS - cannot rule out |
+| `getattr(w, "append")(...)` | FAILS - cannot rule out |
+| `emit = w.append` | FAILS - cannot rule out |
+| `append(f"{spec.arm.value}.started", ...)` | FAILS - cannot rule out |
+| `append("campaign.started", {})` | FAILS - site map changed |
+
+Baseline passes. All reverted, `git diff` clean.
+
+**Nine rounds.** The lesson S0-13 drew - read the signature, not the habit - was
+right and insufficient, because I applied it to the parameter list and not to
+the call syntax. The durable form is narrower and duller: **when a check works
+by recognising a shape, enumerate the shapes that reach the same behaviour, and
+refuse the ones you cannot read.** And check the checker's own failure mode: an
+exit code cannot distinguish a test that failed from a test that broke.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:

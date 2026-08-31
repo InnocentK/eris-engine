@@ -1920,7 +1920,22 @@ def _event_append_sites(
     """
     markers = {"run.started", "campaign.started"}
     literal: dict[str, set[str]] = {}
-    dynamic: list[tuple[str, str]] = []
+    # (where, rendered, provable_prefix). `provable_prefix` is None when the
+    # kind cannot be read at all - a splat, a `getattr`, a detached bound
+    # method - and those can never be proven safe. It is computed HERE,
+    # while the node is in hand, because an earlier version stored
+    # `ast.unparse(node)` and re-parsed it in `mode="eval"`; an alias
+    # assignment unparses to a STATEMENT, so that raised SyntaxError inside
+    # the test instead of failing it (found by running case F).
+    dynamic: list[tuple[str, str, str | None]] = []
+
+    def literal_prefix(node: ast.expr) -> str | None:
+        """The literal text a computed kind must start with, if any."""
+        if isinstance(node, ast.JoinedStr) and node.values:
+            first = node.values[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                return first.value
+        return None
 
     class V(ast.NodeVisitor):
         def __init__(self, module: str) -> None:
@@ -1934,10 +1949,31 @@ def _event_append_sites(
 
         visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
+        @property
+        def _where(self) -> str:
+            return f"{self.module}.{self.stack[-1] if self.stack else '<module>'}"
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            # `emit = writer.append` detaches the call from the name this scan
+            # matches on, so every later `emit(...)` is invisible. None exists;
+            # if one appears it must be seen, not silently skipped.
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "append":
+                dynamic.append((f"{self._where}:{node.lineno}", ast.unparse(node), None))
+            self.generic_visit(node)
+
         def visit_Call(self, node: ast.Call) -> None:
             if isinstance(node.func, ast.Attribute) and node.func.attr == "append":
-                where = f"{self.module}.{self.stack[-1] if self.stack else '<module>'}"
-                self._maybe_event(node, where)
+                self._maybe_event(node, self._where)
+            elif (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "append"
+            ):
+                # `getattr(w, "append")(kind, payload)` reaches the same method
+                # without an Attribute node for this scan to match.
+                dynamic.append((f"{self._where}:{node.lineno}", ast.unparse(node), None))
             self.generic_visit(node)
 
         def _maybe_event(self, node: ast.Call, where: str) -> None:
@@ -1953,12 +1989,16 @@ def _event_append_sites(
             append from `list.append` is that it passes TWO things, however
             they are spelled.
             """
-            if any(k.arg is None for k in node.keywords):
-                # `append(**d)` - the kind is not visible at all, and this is
-                # checked BEFORE the arity gate below, which a splat call does
-                # not pass (one keyword, no `kind=`) and which would therefore
-                # have skipped it silently.
-                dynamic.append((f"{where}:{node.lineno}", ast.unparse(node)))
+            if any(isinstance(a, ast.Starred) for a in node.args) or any(
+                k.arg is None for k in node.keywords
+            ):
+                # A splat hides the kind. BOTH forms are checked here, before
+                # the arity gate below, because neither passes it: `append(*p)`
+                # presents one argument and `append(**d)` one keyword with no
+                # `kind=`, so the gate meant to catch them would skip them.
+                # `**d` was handled first and `*p` was not, which is the same
+                # oversight one shape over (stop review, 2026-08-31).
+                dynamic.append((f"{where}:{node.lineno}", ast.unparse(node), None))
                 return
             kwargs = {k.arg for k in node.keywords}
             two_things = len(node.args) + len(node.keywords) >= 2
@@ -1968,13 +2008,13 @@ def _event_append_sites(
             if arg is None:
                 arg = next((k.value for k in node.keywords if k.arg == "kind"), None)
             if arg is None:
-                dynamic.append((f"{where}:{node.lineno}", ast.unparse(node)))
+                dynamic.append((f"{where}:{node.lineno}", ast.unparse(node), None))
                 return
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 if arg.value in markers:
                     literal.setdefault(arg.value, set()).add(where)
             else:
-                dynamic.append((f"{where}:{node.lineno}", ast.unparse(arg)))
+                dynamic.append((f"{where}:{node.lineno}", ast.unparse(arg), literal_prefix(arg)))
 
     for root in roots:
         for f in sorted(root.rglob("*.py")):
@@ -2017,16 +2057,11 @@ def test_no_module_writes_the_other_kinds_start_marker() -> None:
         "kind's marker, the gate prints the wrong --resume form for a real run."
     )
 
-    unprovable = []
-    for where, expr in dynamic:
-        node = ast.parse(expr, mode="eval").body
-        prefix = ""
-        if isinstance(node, ast.JoinedStr) and node.values:
-            first = node.values[0]
-            if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                prefix = first.value
-        if not prefix or any(m.startswith(prefix) for m in ("run.started", "campaign.started")):
-            unprovable.append((where, expr))
+    unprovable = [
+        (where, rendered)
+        for where, rendered, prefix in dynamic
+        if not prefix or any(m.startswith(prefix) for m in ("run.started", "campaign.started"))
+    ]
     assert not unprovable, (
         f"event kind(s) built from an expression this test cannot rule out: {unprovable}. "
         "A computed kind is only safe here if it begins with a literal prefix that "
