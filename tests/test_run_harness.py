@@ -2232,6 +2232,23 @@ def test_campaign_status_reports_committed_cost_and_names_what_it_cannot_read(
     assert cost["spent_known_usd"] == pytest.approx(known_before + 1.25)
     assert cost["reserved_usd"] == pytest.approx(2.0)
     assert cost["committed_usd"] == pytest.approx(known_before + 1.25 + 2.0)
+    assert cost["committed_is_complete"] is True
+    assert cost["unknown_cost_records"] == 0
+
+    # A cost record with NO cost at all - `cost_usd: None`, which a cache replay
+    # can produce - is counted by `cost_totals` and added to neither bucket. It
+    # is spend that exists and cannot be valued, so it breaks completeness the
+    # same way an unreadable ledger does. The flag consulted only `unreadable`
+    # and reported true while these were present.
+    valueless = w["runs"] / "c3" / "t_01-r0-single-valueless"
+    with RunWriter(valueless, Redactor(), run_id="t_01-r0-single-valueless") as vw:
+        vw.append("run.started", {"eris_version": "0.0.0"})
+        vw.append("cost", {"invocation_id": "inv-none-1", "attempt": 1, "cost_usd": None})
+    valued = status()["cost"]
+    assert valued["unknown_cost_records"] == 1
+    assert valued["committed_is_complete"] is False
+    assert valued["unreadable_ledgers"] == []  # readable, just unvaluable
+    assert valued["committed_usd"] == pytest.approx(cost["committed_usd"])
 
     # A cell whose ledger will not parse is NAMED rather than skipped: dropping
     # it silently would lower the committed figure the operator is watching.

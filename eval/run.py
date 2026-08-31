@@ -1927,6 +1927,7 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
     # whose value is NOT known - a missing-cost worker's call, or one killed
     # before it could report - so committed is the two together.
     known = reserved = 0.0
+    unknown_records = 0
     unreadable: list[str] = []
     for cell_dir in sorted(p for p in campaign_dir.iterdir() if p.is_dir()):
         events = cell_dir / "events.jsonl"
@@ -1934,7 +1935,7 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
             continue
         try:
             totals = cost_totals(LedgerView.from_path(events))
-        except LedgerCorrupt:
+        except (LedgerCorrupt, OSError):
             # Its spend is UNREADABLE, so it contributes nothing and the totals
             # below are a FLOOR, not the commitment. `campaign_spend` meets the
             # same case by reserving `planned_calls x worst_case_call`, which
@@ -1946,6 +1947,12 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
             # into a number that reads as complete.
             unreadable.append(cell_dir.name)
             continue
+        # A cost record with no cost AT ALL - `cost_usd: None`, which a cache
+        # replay can produce - is counted by `cost_totals` and added to NEITHER
+        # bucket, so it is spend that exists and cannot be valued.
+        # `committed_is_complete` consulted only `unreadable`, and therefore
+        # reported true while these were present.
+        unknown_records += totals.unknown_count
         known += totals.known_usd
         reserved += totals.reserved_usd
     print(
@@ -1962,7 +1969,8 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
                     # ledgers could not be read and their spend is missing from
                     # it. A stop condition on committed cost must treat that as
                     # over budget until the ledger is explained.
-                    "committed_is_complete": not unreadable,
+                    "committed_is_complete": not unreadable and unknown_records == 0,
+                    "unknown_cost_records": unknown_records,
                     "unreadable_ledgers": unreadable,
                 },
             },

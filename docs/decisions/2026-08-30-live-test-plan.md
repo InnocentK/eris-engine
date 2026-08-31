@@ -322,7 +322,8 @@ hand and still see only the KNOWN half, missing every estimated call: in S1 that
 is $5.80 of a $39.80 commitment, so the condition would have read 15% of the
 spend it exists to bound. `campaign status` now reports
 `cost: {spent_known_usd, reserved_usd, committed_usd, committed_is_complete,
-unreadable_ledgers}`, summed from the same `cost_totals` the scorer uses.
+unknown_cost_records, unreadable_ledgers}`, summed from the same `cost_totals`
+the scorer uses.
 
 A cell whose ledger will not parse is named - and its spend is still **missing
 from the total**, because it cannot be read. `campaign_spend` meets that case by
@@ -332,7 +333,16 @@ cannot compute that bound. It therefore reports `committed_is_complete: false`
 and the total is a FLOOR. An earlier version called the corrupt cell "never
 silently dropped from the total", which was half true: it was named, and it was
 dropped. Understating is the dangerous direction for a condition whose whole
-question is "am I under $50", so an incomplete total is a stop in its own right. Checked against S1:
+question is "am I under $50", so an incomplete total is a stop in its own right.
+
+**A second way the total can be short.** `cost_totals` counts a record whose
+`cost_usd` is `None` - which a cache replay can produce - in `unknown_count`
+and adds it to NEITHER bucket: spend that exists and cannot be valued. The
+completeness flag consulted only `unreadable_ledgers`, so it reported **true**
+while such records were present. It now requires `unknown_cost_records == 0` as
+well, and that count is reported beside it. An unreadable ledger and an
+unvaluable record are different failures with the same consequence - a floor
+presented as a total - and the flag has to answer for both. Checked against S1:
 $5.800906 known + $34.00 reserved = $39.800906 committed, which reproduces the
 figure previously derived by hand from the summary JSON.
 
