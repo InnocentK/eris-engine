@@ -571,7 +571,8 @@ def _candidates(text: str) -> set[str]:
 
 
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
-_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_FENCE_SHUT = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _INLINE_CODE = re.compile(r"`[^`]*`")
 
 
@@ -599,21 +600,31 @@ def _strip_code(text: str, doc: str, unreadable: list[str]) -> str:
       silent miss.
     """
     out: list[str] = []
-    in_fence = False
+    fence = ""  # the OPENING run, "" when not inside a block
     opened_at = 0
     for lineno, line in enumerate(text.splitlines(), 1):
-        if _FENCE.match(line):
-            in_fence = not in_fence
-            opened_at = lineno if in_fence else opened_at
+        if fence:
+            shut = _FENCE_SHUT.match(line)
+            # CommonMark: a fence closes only on a run of the SAME character,
+            # at least as long as the opener, with nothing after it. Toggling
+            # on any fence-looking line instead makes a document that SHOWS a
+            # fence inside a block mispair, and when the mispairing happens to
+            # come out even there is no leftover to report - the links in
+            # between are dropped in silence (demonstrated 2026-08-31).
+            if shut and shut.group(1)[0] == fence[0] and len(shut.group(1)) >= len(fence):
+                fence = ""
             out.append("")
             continue
-        if in_fence:
+        opened = _FENCE_OPEN.match(line)
+        if opened:
+            fence = opened.group(1)
+            opened_at = lineno
             out.append("")
         elif line.count("`") % 2:
             out.append(line)
         else:
             out.append(_INLINE_CODE.sub(" ", line))
-    if in_fence:
+    if fence:
         unreadable.append(f"{doc}: code fence opened at line {opened_at} is never closed")
     return "\n".join(out)
 
