@@ -678,6 +678,49 @@ paths it runs; when the claim quantifies over all paths, something has to check
 all paths, and "I exercised the important ones" is the same guess in a new
 costume.
 
+### S0-12. The structural test could not see the kinds it claimed to rule out
+
+Caught by the Codex stop review, on the fix for S0-11. That fix pinned the
+marker site map and closed the `cmd_invoke` gap, but the scan behind it was
+narrower than the sentence above it in two ways:
+
+* **It parsed `eval/run.py` only.** `src/eris/arms.py` and `src/eris/stages.py`
+  both hold a writer and append events. A marker written from either was
+  invisible to a test asserting a property of the whole system.
+* **It matched only literal kinds.** `stages.py:1137` appends
+  ``f"cache.{res.outcome}"``, so computed kinds are not hypothetical here. A
+  marker built from an expression was invisible by construction.
+
+The scan now covers every `.py` under `src/` and `eval/`, keys sites by
+`path.function` using the INNERMOST enclosing function, and separates an event
+append from a `list.append` by arity - an event append takes `(kind, payload)`.
+
+For computed kinds it does the thing the gate does with a ledger it cannot
+read: **it refuses.** A dynamic kind passes only when it starts with a literal
+prefix that neither marker starts with, which is a proof it cannot produce one.
+``f"cache.{outcome}"`` passes on that reasoning rather than by being named in an
+exception list, so a future `cache.*` kind needs no edit here - and a kind with
+no literal prefix fails, whatever it happens to evaluate to today.
+
+Mutation-checked; the second row is the finding:
+
+| mutation | behavioural | structural |
+|---|---|---|
+| `campaign.started` appended in `src/eris/arms.py` | FAILS | FAILS (names `src/eris/arms.py.run_arm`) |
+| **computed kind `f"{spec.arm.value}.started"` in `arms.py`** | **PASSES** | **FAILS** ("cannot rule out") |
+
+Both reverted, `git diff` clean.
+
+**Seven rounds, and the shape is now explicit enough to state as a rule.** Every
+round I produced an artifact that answered more than it had checked, and every
+fix moved the unchecked part one level outward: branch, then rationale, then
+test, then the test's own field of view. A test does not enforce a universal
+claim by being about the right subject - it enforces it by being unable to pass
+while the claim is false. The operative question is not "does this check the
+thing?" but "what is this blind to, and would the claim survive there?" Where
+the answer is "I cannot see", the only honest output is a refusal, in a test
+exactly as in a gate.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:

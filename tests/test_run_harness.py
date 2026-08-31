@@ -142,7 +142,10 @@ class InterruptingProcess(FakeProcess):
         return super().wait(timeout)
 
 
-RUN_PY = Path(__file__).resolve().parent.parent / "eval" / "run.py"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUN_PY = REPO_ROOT / "eval" / "run.py"
+SRC_DIR = REPO_ROOT / "src"
+EVAL_DIR = REPO_ROOT / "eval"
 
 
 def world(
@@ -1904,47 +1907,102 @@ def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
         )
 
 
-def test_only_cmd_campaign_writes_campaign_started_anywhere_in_the_harness() -> None:
-    """No command may write the other kind's start marker.
+def _event_append_sites(
+    roots: tuple[Path, ...],
+) -> tuple[dict[str, set[str]], list[tuple[str, str]]]:
+    """Every ``<writer>.append(kind, payload)`` under ``roots``.
 
-    The behavioural test above can only speak for the code paths it runs -
-    `campaign` and `run`. The claim the live-run gate depends on is universal
-    over paths: for ANY directory in `runs_dir`, exactly one start marker is
-    present, so the gate can tell a campaign from a standalone run and print the
-    matching `--resume` form.
-
-    `cmd_invoke` also builds a `RunWriter` in `runs_dir` (`eval/run.py:347`) and
-    is NOT exercised there, so adding `campaign.started` to it would misclassify
-    an invoke directory as a campaign while every behavioural test passed
-    (stop review, 2026-08-31). This pins the site map instead: every literal
-    `.append("run.started"|"campaign.started", ...)` in `eval/run.py`, by the
-    function enclosing it.
-
-    Adding, moving, or removing a site fails this test. Renaming a function
-    fails it too, which is the point - the gate's rationale names these
-    functions, and a rename must be seen rather than silently drift.
+    Returns (literal kinds -> {"module.function"}, dynamic sites). An event
+    append takes two arguments; ``list.append`` takes one, which is what
+    separates them. The enclosing function is the INNERMOST one, so a helper
+    nested inside a command is reported under its own name rather than the
+    command's.
     """
-    tree = ast.parse(Path(RUN_PY).read_text(encoding="utf-8"))
     markers = {"run.started", "campaign.started"}
-    sites: dict[str, set[str]] = {}
-    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
-        for node in ast.walk(fn):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "append"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value in markers
-            ):
-                sites.setdefault(node.args[0].value, set()).add(fn.name)
+    literal: dict[str, set[str]] = {}
+    dynamic: list[tuple[str, str]] = []
 
-    assert sites == {
-        "campaign.started": {"cmd_campaign"},
-        "run.started": {"cmd_invoke", "run_cell"},
+    class V(ast.NodeVisitor):
+        def __init__(self, module: str) -> None:
+            self.module = module
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append"
+                and len(node.args) >= 2
+            ):
+                where = f"{self.module}.{self.stack[-1] if self.stack else '<module>'}"
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if arg.value in markers:
+                        literal.setdefault(arg.value, set()).add(where)
+                else:
+                    dynamic.append((f"{where}:{node.lineno}", ast.unparse(arg)))
+            self.generic_visit(node)
+
+    for root in roots:
+        for f in sorted(root.rglob("*.py")):
+            rel = f.relative_to(REPO_ROOT).as_posix()
+            V(rel).visit(ast.parse(f.read_text(encoding="utf-8")))
+    return literal, dynamic
+
+
+def test_no_module_writes_the_other_kinds_start_marker() -> None:
+    """The start markers are mutually exclusive across the WHOLE codebase.
+
+    `eval/live_preconditions.sh` classifies a collided run id by these markers:
+    `campaign.started` means campaign (bare `--resume`), `run.started` means
+    standalone (`--resume <RUN_ID>`), and zero or two means it refuses to
+    advise. That is a claim about every directory in `runs_dir`, so it is a
+    claim about every place an event can be appended - not about the two
+    commands a behavioural test happens to drive.
+
+    Two earlier versions were narrower than the claim. The first asserted only
+    over directories a campaign and a run produced, so `campaign.started` added
+    to `cmd_invoke` passed. The second scanned `eval/run.py` alone and matched
+    only literal kinds, so a marker written from another module, or from a
+    computed string, was invisible to it (stop review, 2026-08-31).
+
+    Dynamic kinds are real here - `stages.py` appends ``f"cache.{outcome}"`` -
+    so this cannot simply ignore them. A computed kind is accepted only when it
+    starts with a literal prefix that NO marker starts with, which is a proof
+    that it cannot produce one. Anything else fails: the test cannot see the
+    kind, so it refuses, exactly as the gate refuses a ledger it cannot read.
+    """
+    literal, dynamic = _event_append_sites((SRC_DIR, EVAL_DIR))
+
+    assert literal == {
+        "campaign.started": {"eval/run.py.cmd_campaign"},
+        "run.started": {"eval/run.py.cmd_invoke", "eval/run.py.run_cell"},
     }, (
         "the start-marker site map changed. `eval/live_preconditions.sh` "
         "classifies a collided run id by these markers being mutually exclusive "
         "per directory; if one command now writes both, or writes the other "
         "kind's marker, the gate prints the wrong --resume form for a real run."
+    )
+
+    unprovable = []
+    for where, expr in dynamic:
+        node = ast.parse(expr, mode="eval").body
+        prefix = ""
+        if isinstance(node, ast.JoinedStr) and node.values:
+            first = node.values[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                prefix = first.value
+        if not prefix or any(m.startswith(prefix) for m in ("run.started", "campaign.started")):
+            unprovable.append((where, expr))
+    assert not unprovable, (
+        f"event kind(s) built from an expression this test cannot rule out: {unprovable}. "
+        "A computed kind is only safe here if it begins with a literal prefix that "
+        "neither `run.started` nor `campaign.started` begins with. Give it such a "
+        "prefix, or make the kind literal."
     )
