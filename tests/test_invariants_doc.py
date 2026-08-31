@@ -571,6 +571,14 @@ def _candidates(text: str) -> set[str]:
 
 
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
+# A fenced block or an inline code span renders literally, so a `](...)`
+# inside one is not a link and must not be link-checked. Python makes this
+# concrete: `t["append"](*pair)` - a subscript followed by a call - is
+# textually a markdown link, and the checker reported `*pair` as a broken
+# one (2026-08-31). Stripping code before matching removes that false
+# positive and nothing else: measured at the time, 12 targets became 11,
+# the one lost being `*pair` itself.
+_CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 
 
 # Documents whose LINKS are not checked either. Narrower than the mention
@@ -675,7 +683,7 @@ def test_no_document_contains_a_broken_link() -> None:
     for doc in _all_docs():
         if any(fnmatch(str(doc.relative_to(REPO)), pat) for pat in LINK_UNCHECKED):
             continue
-        for m in _LINK.finditer(doc.read_text()):
+        for m in _LINK.finditer(_CODE.sub(" ", doc.read_text())):
             ref = m.group(1)
             if ref.startswith(("http://", "https://", "#", "mailto:")):
                 continue
