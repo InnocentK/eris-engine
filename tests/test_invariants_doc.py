@@ -752,3 +752,66 @@ def test_no_document_contains_a_broken_link() -> None:
         "fully checked:\n  " + "\n  ".join(unreadable)
     )
     assert not broken, "broken links:\n  " + "\n  ".join(broken)
+
+
+# Each case is (markdown, links the checker must still find, is the structure
+# reportable-as-unreadable). `L` is a link to a file that does not exist, so
+# "found" means the checker would have reported it broken.
+_L = "nowhere-at-all.md"
+_LINK_LINE = f"See [the plan]({_L}).\n"
+_STRIP_CASES: list[tuple[str, str, list[str], bool]] = [
+    # A link inside code is not a link and must be dropped.
+    ("link inside a backtick fence", "```\n[x](%s)\n```\n" % _L, [], False),
+    ("link inside a tilde fence", "~~~\n[x](%s)\n~~~\n" % _L, [], False),
+    ("link inside an inline span", "`[x](%s)`\n" % _L, [], False),
+    # A link in prose is a link.
+    ("link in prose", _LINK_LINE, [_L], False),
+    ("link after a plain fence", "```python\ncode\n```\n\n" + _LINK_LINE, [_L], False),
+    # Delimiters that a naive tracker mispairs. Each of these dropped the link
+    # silently at some point in this file's history; see the commit log.
+    ("~~~ shown inside a ``` block", "```\n~~~\n```\n\n" + _LINK_LINE, [_L], False),
+    ("```` fence containing a ``` line", "````\n```\n````\n\n" + _LINK_LINE, [_L], False),
+    ("backtick info string holding a backtick", "```json `x`\n\n" + _LINK_LINE, [_L], False),
+    ("triple-backtick span at line start", "```a `b` c```\n\n" + _LINK_LINE, [_L], False),
+    # A tilde fence MAY carry backticks in its info string, so it is a fence.
+    ("tilde fence with backticks in info", "~~~ `x`\n[x](%s)\n~~~\n" % _L, [], False),
+    # A line with an info string opens; it never closes.
+    ("closer carrying an info string", "```\n[x](%s)\n``` python\n```\n" % _L, [], False),
+    # Ambiguity is surfaced, never guessed.
+    ("unclosed fence", "```\ncode\n\n[x](%s)\n" % _L, [], True),
+    # An ODD number of backticks means an unterminated span, and the line is
+    # left alone: the link is still checked. Deliberate - stripping on a guess
+    # loses a link in silence, keeping it can at worst re-check something that
+    # renders as code, which is a visible false alarm. The input needs THREE
+    # backticks with the link between the first two; the first version of this
+    # case used one backtick, where the naive path finds nothing to strip
+    # either, so it constrained nothing and the mutation went uncaught.
+    ("unterminated inline span keeps the line", "` [x](%s) ` and `\n" % _L, [_L], False),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "markdown", "expected", "unreadable_expected"),
+    _STRIP_CASES,
+    ids=[c[0] for c in _STRIP_CASES],
+)
+def test_code_stripping_never_silently_drops_a_link(
+    name: str, markdown: str, expected: list[str], unreadable_expected: bool
+) -> None:
+    """`_strip_code` must not lose a link it cannot prove is code.
+
+    The link checker blanks code before matching, because a `](...)` inside a
+    code span renders literally. Every way of getting that wrong hides a broken
+    link and reports nothing, so the failure is invisible in a green run - which
+    is how four separate versions of this shipped (see the commits from
+    2026-08-31). Those fixes were each verified by hand and left NOTHING behind:
+    reverting the fence logic to a naive toggle broke no test in this
+    repository. This is that missing regression.
+    """
+    unreadable: list[str] = []
+    found = [m.group(1) for m in _LINK.finditer(_strip_code(markdown, "case.md", unreadable))]
+    assert found == expected, (
+        f"{name}: link checker saw {found}, expected {expected}. A link that "
+        "disappears here is a broken link that will never be reported."
+    )
+    assert bool(unreadable) is unreadable_expected, f"{name}: unreadable={unreadable}"
