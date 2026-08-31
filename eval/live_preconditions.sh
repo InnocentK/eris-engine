@@ -190,9 +190,21 @@ for rid in sys.argv[4:]:
         # only flipped on seeing `campaign.started`, so an EMPTY ledger - and
         # one torn or corrupt before that event was written - got confident
         # standalone advice from no evidence at all.
-        if "campaign.started" in kinds:
+        is_camp = "campaign.started" in kinds
+        is_run = "run.started" in kinds
+        if is_camp and is_run:
+            # CONFLICTING evidence is not a tie to be broken by precedence. No
+            # code path writes both: `cmd_campaign` appends `campaign.started`
+            # to the campaign dir and never `run.started`; `run_cell` and
+            # `cmd_invoke` append `run.started` to their own dirs. Both present
+            # means the directory is not what either command would have made,
+            # so nothing here knows which resume form applies. An earlier
+            # version silently preferred `campaign` - the same error as
+            # defaulting to `standalone` on no evidence, one branch over.
+            why = "ledger carries BOTH `run.started` and `campaign.started`"
+        elif is_camp:
             kind = "campaign"
-        elif "run.started" in kinds:
+        elif is_run:
             kind = "standalone"
         elif not why:
             why = (

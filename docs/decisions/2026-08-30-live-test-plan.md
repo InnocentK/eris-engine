@@ -557,6 +557,36 @@ been read as a pass, this section would claim a chain check that had never once
 been exercised. A negative result from a fixture is worth nothing until the
 fixture is shown to bite.
 
+### S0-9. Conflicting markers were resolved by precedence, which is a guess
+
+Caught by the Codex stop review, on the fix for S0-8. That fix required positive
+evidence and reported `unknown` when there was none - but when there was
+evidence for BOTH kinds it silently preferred `campaign`, because
+`campaign.started` was tested first. A precedence rule is not a finding; it is
+the same error as defaulting to `standalone` on no evidence, moved one branch
+over.
+
+No code path writes both. `cmd_campaign` appends `campaign.started` to the
+campaign dir and never `run.started` (verified by extracting the function body
+and searching it); `run_cell` and `cmd_invoke` append `run.started` to their own
+dirs. A directory carrying both is not what either command would have made, so
+nothing in this gate knows which resume form applies, and it now says so.
+
+Three cases exercised with real `RunWriter` fixtures: both markers -> `unknown`
+with the reason named; `campaign.started` alone -> campaign; `run.started` alone
+-> standalone. Fixtures removed afterwards.
+
+**Four review rounds on one block, each finding a real defect in the fix for the
+previous one.** The defects were not variations - they were the same defect
+migrating: pick an answer where the evidence does not determine one. First from
+the list I had just written, then from the list again, then from absence, then
+from precedence. Each fix closed the instance in front of me and left the
+disposition intact. What finally covers it is a rule about the code rather than
+about the cases: **the classifier may only speak when the evidence is
+unambiguous, and every other input - missing, empty, corrupt, contradictory -
+takes the same silent branch.** That is now one `unknown` path with five
+reasons, not five branches with four answers.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
