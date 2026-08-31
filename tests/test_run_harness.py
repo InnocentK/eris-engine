@@ -1907,6 +1907,9 @@ def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
         )
 
 
+_INDIRECT_LOOKUP = frozenset({"__getattribute__", "__getattr__"})
+
+
 def _event_append_sites(
     roots: tuple[Path, ...],
 ) -> tuple[dict[str, set[str]], list[tuple[str, str, str | None]]]:
@@ -1969,17 +1972,36 @@ def _event_append_sites(
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "append":
-                self._maybe_event(node, self._where)
-            elif (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "getattr"
-                and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value == "append"
-            ):
-                # `getattr(w, "append")(kind, payload)` reaches the same method
-                # without an Attribute node for this scan to match.
+            passes_two = len(node.args) + len(node.keywords) >= 2
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr == "append":
+                    self._maybe_event(node, self._where)
+                elif node.func.attr in _INDIRECT_LOOKUP and passes_two:
+                    # `w.__getattribute__("append")(kind, payload)`.
+                    dynamic.append((f"{self._where}:{node.lineno}", ast.unparse(node), None))
+            elif isinstance(node.func, ast.Name):
+                # Only a LITERAL name can be read. `getattr(w, "append")` is the
+                # method; `getattr(w, name)` might be, and the difference is not
+                # visible here - so the readable one is judged on its name and
+                # the unreadable one is refused if it is called like an event
+                # append. Refusing every dynamic `getattr` outright would fail
+                # the four that exist (`score.py`, `validate.py`), none of which
+                # touches a writer; a check that cries wolf gets ignored, which
+                # is the reasoning already applied to the openai-api WARN.
+                if node.func.id == "getattr":
+                    name = node.args[1] if len(node.args) >= 2 else None
+                    if isinstance(name, ast.Constant) and name.value == "append":
+                        dynamic.append((f"{self._where}:{node.lineno}", ast.unparse(node), None))
+                # Any other plain name is a readable local or imported callable,
+                # not an indirect lookup. Letting these fall through to the
+                # refusal below flagged every ordinary two-argument call in the
+                # repository - `note(...)`, `_abandoned_payload(...)` - which is
+                # how this branch was found to be miswritten, by running it.
+            elif passes_two:
+                # The callee is neither a name nor an attribute - `getattr(w,
+                # n)(k, p)`, `table["append"](k, p)`, `(lambda ...)(k, p)`. The
+                # scan cannot tell what method it reaches, and it is called the
+                # way an event append is called, so it is refused.
                 dynamic.append((f"{self._where}:{node.lineno}", ast.unparse(node), None))
             self.generic_visit(node)
 
@@ -2057,6 +2079,25 @@ def test_no_module_writes_the_other_kinds_start_marker() -> None:
     starts with a literal prefix that NO marker starts with, which is a proof
     that it cannot produce one. Anything else fails: the test cannot see the
     kind, so it refuses, exactly as the gate refuses a ledger it cannot read.
+
+    WHAT THIS DOES NOT COVER, measured rather than assumed. The scan reads
+    static call structure. A method resolved dynamically and parked in a local
+    escapes it::
+
+        _f = getattr(w, name)   # name is not a literal
+        _f("campaign.started", {})   # callee is a plain Name
+
+    Refusing every non-literal `getattr` would close that, and would also fail
+    the four in `score.py` and `validate.py` that touch no writer - a check that
+    cries wolf gets ignored, which is the reasoning already applied to the
+    openai-api WARN in `eval/live_preconditions.sh`. So the boundary is drawn
+    here and stated instead of papered over: that mutation was run, this test
+    PASSED, and
+    `test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker`
+    FAILED on it, because a marker written by any means at all lands in a ledger
+    it walks. The two tests are complementary and neither is sufficient: static
+    structure for every call site that can be read, real ledgers for the paths
+    actually exercised.
     """
     literal, dynamic = _event_append_sites((SRC_DIR, EVAL_DIR))
 

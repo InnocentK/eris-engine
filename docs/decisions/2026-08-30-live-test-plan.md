@@ -862,6 +862,55 @@ the future written in the syntax of the present. The two rules that have
 actually held are structural and dull: **refuse what you cannot read**, and
 **ask what makes something an instance rather than which instances exist.**
 
+### S0-16. Indirect lookup, and the first boundary drawn on purpose
+
+Caught by the Codex stop review, on the fix for S0-15. The `getattr` branch
+required a LITERAL `"append"`, so `getattr(w, name)` reached the same method
+unread. Neighbouring shapes were unread for the same reason: a subscript
+dispatch table, `__getattribute__`, a lambda callee.
+
+The rule added is the structural one again - **a call passing two things whose
+callee cannot be read as a plain name or attribute is refused** - plus the
+dunder lookups. Zero such calls exist in `src/` and `eval/`, so it costs nothing
+today. Six shapes mutation-checked, assertion firing, no crash: non-literal
+`getattr`, subscript table, `__getattribute__`, lambda callee, literal `getattr`,
+and a literal marker for the site-map half. Baseline passes.
+
+**The first draft of that rule failed loudly and correctly.** Written as a
+fall-through, it refused every ordinary two-argument call to a plain name -
+`note(...)`, `_abandoned_payload(...)` - because a `Name` callee that was not
+`getattr` fell into the refusal branch. A `Name` IS readable. Found by running
+it, in the first second, which is the only reason it is not in this document as
+next round's finding.
+
+**And this round drew a boundary instead of extending the fix.** One shape is
+still invisible to the static scan:
+
+```python
+_f = getattr(w, name)        # name not a literal
+_f("campaign.started", {})   # callee is a plain Name
+```
+
+Refusing every non-literal `getattr` would close it, and would also fail the
+four in `score.py` and `validate.py` that touch no writer. A check that cries
+wolf gets ignored - the reasoning already written into this gate for the
+openai-api WARN - so closing it that way would trade a real hole for a worse
+one.
+
+The boundary is therefore stated in the test, with the measurement that
+establishes it: **that mutation was run.** The structural test PASSED (exit 0)
+and the behavioural test FAILED (exit 1), because a marker written by any means
+lands in a ledger it walks. The two tests are complementary and neither is
+sufficient - static structure for every call site that can be read, real ledgers
+for the paths actually exercised.
+
+**Eleven rounds.** S0-10's lesson was "do not assert an invariant the code does
+not enforce". Ten rounds later the thing needing that treatment was my own claim
+of completeness. A scan cannot promise to see everything; it can promise to
+refuse what it cannot see, and to say where its sight ends. Writing the limit
+down is what stops the next reader - me - from trusting a green test further
+than it reaches.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
