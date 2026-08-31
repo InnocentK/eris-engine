@@ -241,7 +241,8 @@ proposals, 2 critique calls and up to 5 judge calls (1 + up to `MAX_ITERATIONS`
 + 1). At S1's observed rates - claude propose $0.56, grok propose $0.077, judge
 $0.80 - that is about **$5.3 per task, ~$21 for S3** of real spend, plus the
 **$2 placeholder the deliberate interrupt books** (and $2 more per timeout
-retry). Committed lands near $23, well under the $50 stop condition. The `$50` committed-cost stop condition therefore stands unchanged
+retry). Committed lands near $23 - read it as `cost.committed_usd` from `campaign
+status` - well under the $50 stop condition. The `$50` committed-cost stop condition therefore stands unchanged
 and is no longer in contradiction with the sizing.
 
 **Cross-campaign comparison is forbidden.** `eval/score.py` takes ONE
@@ -310,8 +311,21 @@ operator has to be watching. Each is listed with how it is actually seen:
 | a cell refuses (`LaunchRefused`) | non-zero campaign exit code; `status` shows the cell `refused` | stop, do not re-run: a gate fired on real data and that is the finding |
 | a cell is `contaminated` | exit 6, or `contaminated: true` in the summary | stop; the key may have been read and every quality number is suspect |
 | the ceiling trips | a cell `stopped` for budget; `missing_cells` with a `budget` reason | stop; the sizing above was wrong, re-derive before re-running |
-| committed cost over $50 | `spent_known_usd + reserved` from `campaign status` | stop |
+| committed cost over $50 | `cost.committed_usd` from `campaign status` | stop |
 
+
+**The reading this stop condition asks for did not exist.** It said
+`spent_known_usd + reserved` "from `campaign status`", and that command reported
+neither a reserved figure nor any campaign-level total - only a per-cell
+`spent_known_usd`. An operator following it could sum 20 per-cell numbers by
+hand and still see only the KNOWN half, missing every estimated call: in S1 that
+is $5.80 of a $39.80 commitment, so the condition would have read 15% of the
+spend it exists to bound. `campaign status` now reports
+`cost: {spent_known_usd, reserved_usd, committed_usd, unreadable_ledgers}`,
+summed from the same `cost_totals` the scorer uses, and a cell whose ledger will
+not parse is NAMED rather than dropped from the total. Checked against S1:
+$5.800906 known + $34.00 reserved = $39.800906 committed, which reproduces the
+figure previously derived by hand from the summary JSON.
 
 **The $50 stop condition once contradicted the S3 sizing; the panel decision
 resolved it.** As first written, the table planned S3 at **$64 reserved** on

@@ -37,8 +37,10 @@ from eval.score import key_path_for
 from eris.launch import LaunchRefused, resolve_user
 from eris.ledger import LedgerView
 from eris.policy import load_policy
+from eris.redact import Redactor
 from eris.scan import fold
 from eris.schemas import Stage
+from eris.writer import RunWriter
 from tests.conftest import FakeProcess
 from tests.test_stages import GOOD_PROPOSAL
 
@@ -2139,3 +2141,110 @@ def test_no_module_writes_the_other_kinds_start_marker() -> None:
         "neither `run.started` nor `campaign.started` begins with. Give it such a "
         "prefix, or make the kind literal."
     )
+
+
+def test_campaign_status_reports_committed_cost_and_names_what_it_cannot_read(
+    tmp_path: Path,
+) -> None:
+    """`campaign status` must report the figure the stop condition reads.
+
+    The operator stop condition is "committed cost over $X", and it named
+    `spent_known_usd + reserved` "from campaign status". That command reported
+    no reserved figure and no campaign-level total at all, so the reading it
+    asked for could not be taken from the command it named (stop review,
+    2026-08-31). Committed is known PLUS reserved, because `reserved_usd` holds
+    counted costs whose value is unknown - a missing-cost worker's call, or one
+    killed before it could report - and leaving it out understates the spend by
+    exactly the part nobody can see.
+    """
+    w = world(tmp_path)
+    rc = main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "c3",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+        ],
+        out=io.StringIO(),
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen(outputs()),
+        killpg=lambda *_: None,
+    )
+    assert rc == EXIT_OK
+
+    def status() -> dict[str, Any]:
+        out = io.StringIO()
+        assert (
+            main(
+                ["campaign", "status", "--runs-dir", str(w["runs"]), "--campaign-id", "c3"],
+                out=out,
+            )
+            == EXIT_OK
+        )
+        return json.loads(out.getvalue())
+
+    first = status()
+    known_before = first["cost"]["spent_known_usd"]
+    assert first["cost"]["committed_usd"] == pytest.approx(
+        known_before + first["cost"]["reserved_usd"]
+    )
+    assert first["cost"]["unreadable_ledgers"] == []
+    # The per-cell figures the command already reported add up to the campaign
+    # total it now reports, or the two disagree in front of the operator. Only
+    # finalized cells carry a per-cell figure (it comes from the manifest, while
+    # the campaign total comes from the ledgers), so this holds while every cell
+    # is finalized - which it is, the campaign having completed.
+    assert known_before == pytest.approx(
+        sum(c["spent_known_usd"] for c in first["cells"] if c.get("spent_known_usd"))
+    )
+
+    # A RESERVED cost - a call whose value is not known, which is what a
+    # missing-cost worker or an interrupted call produces - must land in
+    # `committed_usd` and NOT in `spent_known_usd`. Written directly, because
+    # every worker in this hermetic world reports its cost, so a campaign run
+    # here leaves `reserved_usd` at zero and an assertion about it cannot fail
+    # (found by mutating `committed_usd` and watching the test pass).
+    extra = w["runs"] / "c3" / "t_01-r0-single-reserved"
+    with RunWriter(extra, Redactor(), run_id="t_01-r0-single-reserved") as ew:
+        ew.append("run.started", {"eris_version": "0.0.0"})
+        ew.append(
+            "cost",
+            {"invocation_id": "inv-known-1", "attempt": 1, "cost_usd": 1.25, "cost_known": True},
+        )
+        ew.append(
+            "cost",
+            {
+                "invocation_id": "inv-unknown-1",
+                "attempt": 1,
+                "cost_usd": 2.0,
+                "cost_known": False,
+                "estimated": True,
+            },
+        )
+    cost = status()["cost"]
+    assert cost["spent_known_usd"] == pytest.approx(known_before + 1.25)
+    assert cost["reserved_usd"] == pytest.approx(2.0)
+    assert cost["committed_usd"] == pytest.approx(known_before + 1.25 + 2.0)
+
+    # A cell whose ledger will not parse is NAMED rather than skipped: dropping
+    # it silently would lower the committed figure the operator is watching.
+    lines = (extra / "events.jsonl").read_bytes().splitlines(keepends=True)
+    d = json.loads(lines[1])
+    d["prev_sha256"] = ("b" if d["prev_sha256"][0] == "a" else "a") + d["prev_sha256"][1:]
+    (extra / "events.jsonl").write_bytes(
+        b"".join(
+            lines[:1]
+            + [json.dumps(d, separators=(",", ":"), sort_keys=True).encode() + b"\n"]
+            + lines[2:]
+        )
+    )
+    after = status()["cost"]
+    assert after["unreadable_ledgers"] == [extra.name]
+    assert after["committed_usd"] == pytest.approx(known_before)

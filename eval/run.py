@@ -1919,9 +1919,39 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
                 entry["error"] = str(exc)[:200]
         cells.append(entry)
     campaign_state = _cell_state(campaign_dir)
+    # The operator stop condition is "committed cost over $X", and it named
+    # `spent_known_usd + reserved` "from campaign status" - which reported
+    # neither a reserved figure nor any campaign-level total, so the reading it
+    # asked for could not be taken from the command it named. Summed here, from
+    # the same `cost_totals` the scorer uses. `reserved_usd` holds counted costs
+    # whose value is NOT known - a missing-cost worker's call, or one killed
+    # before it could report - so committed is the two together.
+    known = reserved = 0.0
+    unreadable: list[str] = []
+    for cell_dir in sorted(p for p in campaign_dir.iterdir() if p.is_dir()):
+        events = cell_dir / "events.jsonl"
+        if not events.is_file():
+            continue
+        try:
+            totals = cost_totals(LedgerView.from_path(events))
+        except LedgerCorrupt:
+            unreadable.append(cell_dir.name)  # never silently dropped from the total
+            continue
+        known += totals.known_usd
+        reserved += totals.reserved_usd
     print(
         json.dumps(
-            {"campaign_id": campaign_dir.name, "state": campaign_state, "cells": cells},
+            {
+                "campaign_id": campaign_dir.name,
+                "state": campaign_state,
+                "cells": cells,
+                "cost": {
+                    "spent_known_usd": round(known, 6),
+                    "reserved_usd": round(reserved, 6),
+                    "committed_usd": round(known + reserved, 6),
+                    "unreadable_ledgers": unreadable,
+                },
+            },
             indent=2,
             sort_keys=True,
         ),
