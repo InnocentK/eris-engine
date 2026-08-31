@@ -522,6 +522,41 @@ stable across both. I reached for the fact that was cheap to hand - first the
 list I had just written, then the list again - instead of the fact that was
 authoritative, which was on disk the whole time and cost one file read.
 
+### S0-8. Absence is not evidence: empty and chain-corrupt ledgers got advice anyway
+
+Caught by the Codex stop review, on the fix for S0-7. Reading the kind from disk
+was right; the reading was not. It set `kind = "standalone"` and flipped to
+`campaign` only on seeing `campaign.started`, so **standalone was the answer
+whenever no marker was found** - an empty `events.jsonl`, a ledger torn or
+corrupt before that event, a directory that is not a run at all. Confident
+advice from no evidence, which is the failure this whole document is about.
+
+Both kinds leave POSITIVE evidence, so absence never has to be interpreted:
+`cmd_campaign` appends `campaign.started` to the campaign dir and never
+`run.started`; a standalone `run` appends `run.started` and never
+`campaign.started` (`eval/run.py:351`, `:1060`, `:1751`). The classifier now
+requires one of them and reports `unknown` otherwise.
+
+Reading is done by **the engine's own `LedgerView.from_path`**, so a ledger
+whose hash chain does not validate is refused here exactly as `eval/score.py`
+refuses it, rather than being parsed line by line and believed. A torn
+unterminated tail is tolerated as everywhere else in Eris, and cannot affect the
+answer because both markers are written at the head of the file.
+
+Seven cases exercised against fixtures built with the real `RunWriter`, so their
+chains are genuine: campaign, standalone, valid-chain-with-neither-marker, empty
+ledger, **chain-corrupt**, no ledger at all, and the real finalized `b-s0`. The
+chain-corrupt fixture carries an intact `run.started` on line 1 and is still
+reported `unknown` - corruption outranks the marker. Fixtures removed afterwards.
+
+**The first chain-corrupt fixture was itself broken** and silently proved
+nothing: it replaced `"prev_sha256":"` in a one-event ledger, where that field
+is `null`, so the mutation never landed and the "corrupt" file was byte-identical
+to the good one. The gate called it standalone and that was CORRECT. Had that
+been read as a pass, this section would claim a chain check that had never once
+been exercised. A negative result from a fixture is worth nothing until the
+fixture is shown to bite.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:

@@ -149,9 +149,12 @@ done
 chk $? "run ids free${collided:+ (COLLIDES:$collided)}"
 if [ -n "$collided" ]; then
     "$PY" - "$RUNS" "$CAMPAIGN_IDS" "$SINGLE_RUN_IDS" $collided <<'PY'
-import json
 import sys
+
+sys.path.insert(0, "src")
 from pathlib import Path
+
+from eris.ledger import LedgerCorrupt, LedgerView
 
 runs = Path(sys.argv[1])
 requested = {}
@@ -169,15 +172,33 @@ for rid in sys.argv[4:]:
         why = "no events.jsonl - not a run directory this gate recognises"
     else:
         try:
-            kind = "standalone"
-            for raw in events.read_bytes().splitlines():
-                if not raw.strip():
-                    continue
-                if json.loads(raw).get("kind") == "campaign.started":
-                    kind = "campaign"
-                    break
+            # The engine's own reader, so a ledger whose hash chain does not
+            # validate is REFUSED here exactly as `eval/score.py` refuses it,
+            # instead of being parsed line by line and believed. A torn
+            # (unterminated) tail is tolerated, as everywhere else in Eris; it
+            # cannot affect the answer, because both markers below are written
+            # at the head of the file.
+            kinds = set(LedgerView.from_path(events).kinds())
+        except LedgerCorrupt:
+            kinds, why = set(), "ledger hash chain does not validate"
         except (OSError, ValueError) as exc:
-            kind, why = "unknown", f"ledger unreadable ({type(exc).__name__})"
+            kinds, why = set(), f"ledger unreadable ({type(exc).__name__})"
+        # POSITIVE evidence for each kind, never inference from absence.
+        # `cmd_campaign` appends `campaign.started` to the campaign dir and no
+        # `run.started`; a standalone `run` appends `run.started` and no
+        # `campaign.started`. An earlier version defaulted to "standalone" and
+        # only flipped on seeing `campaign.started`, so an EMPTY ledger - and
+        # one torn or corrupt before that event was written - got confident
+        # standalone advice from no evidence at all.
+        if "campaign.started" in kinds:
+            kind = "campaign"
+        elif "run.started" in kinds:
+            kind = "standalone"
+        elif not why:
+            why = (
+                "ledger has neither `run.started` nor `campaign.started`"
+                f" ({len(kinds)} event kind(s) present)"
+            )
     final = (d / "manifest.json").exists()
     state = "FINALIZED" if final else "unfinalized"
     print(f"        {rid} ({kind}, {state}):")
