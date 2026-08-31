@@ -571,7 +571,15 @@ def _candidates(text: str) -> set[str]:
 
 
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
-_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# A BACKTICK fence's info string may not contain a backtick (CommonMark,
+# fenced code blocks); such a line is not a fence at all, it is a paragraph
+# holding an inline code span. Matching it as an opener swallowed the rest
+# of the document until the next closer, silently - demonstrated on
+# 2026-08-31 with "```json `x`" and with a "```a `b` c```" span at line
+# start. A TILDE fence has no such restriction, so the two are separate
+# patterns rather than one alternation.
+_FENCE_OPEN_TICK = re.compile(r"^ {0,3}(`{3,})[^`]*$")
+_FENCE_OPEN_TILDE = re.compile(r"^ {0,3}(~{3,})")
 _FENCE_SHUT = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _INLINE_CODE = re.compile(r"`[^`]*`")
 
@@ -615,7 +623,7 @@ def _strip_code(text: str, doc: str, unreadable: list[str]) -> str:
                 fence = ""
             out.append("")
             continue
-        opened = _FENCE_OPEN.match(line)
+        opened = _FENCE_OPEN_TICK.match(line) or _FENCE_OPEN_TILDE.match(line)
         if opened:
             fence = opened.group(1)
             opened_at = lineno
