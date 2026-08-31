@@ -164,16 +164,67 @@ the interrupt happens DURING S1 and the resume finishes it.
 .venv/bin/python eval/score.py --campaign-dir runs/b-s1 --corpus eval/corpus > runs/b-s1/summary.json
 ```
 
-**S3 — the judged arms, only if S1 is clean.** A separate campaign so its
-ceiling is its own ($64 reserved). `indep_verify` is included as the BASELINE,
-so the 3b-3 and 4-3 paired deltas are computed WITHIN one campaign.
+**S3 — the judged arms, on a claude+grok panel.** Decided by the user
+2026-08-31, after S1; supersedes the four-family panel this section first
+carried. A separate campaign so its ceiling is its own.
+
+S3 exists to compute the 3b-3 and 4-3 **paired** deltas within one campaign, and
+S1 showed that pairing was broken for half the panel: `cache.refused: entry has
+no model_executed` means codex and agy re-execute in every cell, so their
+proposals differ between arms. An arm delta would then carry codex/agy proposal
+variance, which 4 tasks at 1 repeat cannot separate from the arm. claude and
+grok cache cleanly - reused in all four S1 `indep_verify` cells - so a panel of
+those two holds the proposals CONSTANT across the three arms, which is what a
+paired design requires.
+
+Two consequences worth stating rather than discovering later:
+
+* **Every dollar becomes observable.** No codex or agy call means no
+  missing-cost call, so nothing is booked as a $2 placeholder. `spent_known_usd`
+  is the whole cost for the first time in this plan, and P8 finally reads what
+  it claims to.
+* **This is not a retreat from multi-family review.** The panel is two families
+  for a MEASUREMENT whose subject is the arm, not the panel. Eris's standing
+  rule - never review with one family, never let a family review itself - is
+  about producing a review. Holding the proposal fixed is how you measure what
+  the adjudication step adds. A four-family panel is what the engine runs in
+  use; it is the wrong instrument for this particular difference.
+
+`--critics` defaults to the panel (`eval/run.py:895`, verified by parsing the
+argv), so `--panel claude,grok` carries the critics with it and
+`indep_verify_critique` will not reach for codex or agy.
+
+**The interrupt lives here now.** S1 ran to completion before one was sent, so
+live campaign resume is still untested (S0 covered run-level resume; cell
+skipping is covered hermetically only). Interrupt S3 once a few cells have
+finished and resume it - the same lifecycle S1 was supposed to exercise.
 
 ```
+# start it; send SIGINT (Ctrl-C) ONCE after a few cell.finished events
 .venv/bin/python eval/run.py campaign --corpus eval/corpus --campaign-id b-s3 \
-    --arms indep_verify,indep_verify_iter,indep_verify_critique --repeats 1
+    --arms indep_verify,indep_verify_iter,indep_verify_critique --repeats 1 \
+    --panel claude,grok
 .venv/bin/python eval/run.py campaign status --campaign-id b-s3
-.venv/bin/python eval/score.py --campaign-dir runs/b-s3 --corpus eval/corpus > runs/b-s3/summary.json
+
+# resume: SAME --arms, --repeats and --panel again. `--resume` takes no value.
+.venv/bin/python eval/run.py campaign --corpus eval/corpus --campaign-id b-s3 \
+    --arms indep_verify,indep_verify_iter,indep_verify_critique --repeats 1 \
+    --panel claude,grok --resume
+.venv/bin/python eval/run.py campaign status --campaign-id b-s3
+.venv/bin/python eval/score.py --campaign-dir runs/b-s3 --corpus eval/corpus \
+    > /tmp/b-s3-summary.json
 ```
+
+`score.py` prints its REFUSAL to stdout as well, so it writes to `/tmp` and the
+exit code is checked before the file is treated as results.
+
+**Sized from S1's measurements, not from the per-call table.** 12 cells, panel
+of 2. Cached after the first arm per task, so the executed calls per task are 2
+proposals, 2 critique calls and up to 5 judge calls (1 + up to `MAX_ITERATIONS`
++ 1). At S1's observed rates - claude propose $0.56, grok propose $0.077, judge
+$0.80 - that is about **$5.3 per task, ~$21 for S3**, all of it real and none of
+it reserved. The `$50` committed-cost stop condition therefore stands unchanged
+and is no longer in contradiction with the sizing.
 
 **Cross-campaign comparison is forbidden.** `eval/score.py` takes ONE
 `--campaign-dir`, and putting two campaigns' cells in one directory raises
@@ -244,24 +295,23 @@ operator has to be watching. Each is listed with how it is actually seen:
 | committed cost over $50 | `spent_known_usd + reserved` from `campaign status` | stop |
 
 
-**Unresolved before S3: the $50 stop condition contradicts the S3 sizing.** The
-table above plans S3 at **$64 reserved** on reservations alone, and the stop
-condition above says halt when committed cost passes **$50**. S3 therefore
-trips its own stop condition by construction, at roughly 25 of its 32 reserving
-calls - near the end, after most of the money is spent, leaving an incomplete
-matrix and no usable paired deltas. Whichever of the two figures is wrong, they
-cannot both stand.
+**The $50 stop condition once contradicted the S3 sizing; the panel decision
+resolved it.** As first written, the table planned S3 at **$64 reserved** on
+reservations alone while the stop condition said halt at **$50** committed. S3
+would have tripped its own stop condition by construction, at roughly 25 of its
+32 reserving calls - near the end, after most of the money was spent, leaving an
+incomplete matrix and no usable paired deltas.
 
-This is recorded, not silently patched. The threshold exists to catch "the
-sizing was wrong", so a coherent version sets it RELATIVE to the planned
-commitment (e.g. planned reservation + 50%: $48 for S1, $96 for S3) rather than
-at an absolute figure the plan already exceeds. That raises the money at risk
-and is the operator's decision, not the author's.
+It is recorded rather than quietly deleted because the resolution was not a
+number. Raising the threshold to fit the sizing was the obvious move and the
+wrong one: it would have bought a campaign whose paired deltas were already
+known to be half-confounded. Dropping the two uncacheable workers made S3 both
+valid and cheap (~$21, all real), and the $50 threshold then needed no change at
+all. A contradiction between a budget and a plan is sometimes telling you the
+plan is wrong, not the budget.
 
-S1 is unaffected and may proceed: $32 reserved, and S0's one measured claude
-call ($0.406317) puts 20 known-cost calls near $8, for roughly $40 committed -
-under $50, though not by much. If `campaign status` shows S1 committed passing
-$50, the stop condition applies as written.
+S1 ran at $39.80 committed and stayed under it.
+
 To halt a campaign mid-flight, write the CAMPAIGN-SCOPED stop file:
 
 The precondition script PRINTS one ready-to-run command per campaign id, with
