@@ -492,6 +492,36 @@ matches the run kind, including the `--arms`/`--repeats` trap on a campaign
 resume. All four branches (campaign/standalone x finalized/unfinalized) were
 exercised against fixture directories before this was written down.
 
+### S0-7. The kind was inferred from the request, not from the run that collided
+
+Caught by the Codex stop review, on the fix for S0-6. Splitting the ids into two
+lists fixed the syntax but classified each collided id by **which variable it
+was requested in**, which is not evidence about anything on disk. Scoping an id
+into the other variable - `CAMPAIGN_IDS='b-s0'` - produced confident campaign
+remediation for a standalone run. The id that collided is whatever exists in
+`runs/`, so that is what has to be classified.
+
+The discriminator is the directory's own ledger: `cmd_campaign` appends
+`campaign.started` to the campaign dir's `events.jsonl` (its cells live in
+subdirectories); a standalone `run` never does. The block now reads that, and
+when the id was requested as one kind but is the other it says so and states
+that the advice follows the disk.
+
+**It fails closed.** A directory with no `events.jsonl`, or one whose ledger
+does not parse, is reported `unknown` and **no resume form is printed at all** -
+a gate that cannot tell which command applies must say so rather than guess one,
+because a guessed command is what the last two findings were.
+
+Six cases were exercised against fixture directories before this was written:
+campaign/standalone x finalized/unfinalized, a dir with no ledger, and a dir
+with an unparseable one. The fixtures were removed afterwards.
+
+Two review rounds on one twenty-line block, each finding a real defect in the
+fix for the previous one. Worth stating plainly: the shape of my error here was
+stable across both. I reached for the fact that was cheap to hand - first the
+list I had just written, then the list again - instead of the fact that was
+authoritative, which was on disk the whole time and cost one file read.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:

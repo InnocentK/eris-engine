@@ -120,44 +120,85 @@ chk $? "every corpus snapshot is built and matches its files/"
 # once a run in the default list COMPLETES, this check can never pass again,
 # and an operator who must ignore a FAIL every time has been trained to ignore
 # the gate - the same failure the openai-api scoping above exists to avoid. So
-# a collision reports WHY (finalized vs resumable) and prints the exact scoped
-# re-check for the ids actually about to start.
-# The RESUME SYNTAX DIFFERS BY RUN KIND, so the collided ids are tracked in two
-# lists rather than one. `run` takes `--resume <RUN_ID>` (a value); `campaign`
-# declares `--resume` as store_true, so `campaign ... --resume b-s1` puts the
-# bare id where the `campaign_command` positional is expected and argparse
-# exits 2 with "invalid choice: 'b-s1' (choose from 'status')". An earlier
-# version of this block printed the run form for EVERY collided id - the same
-# defect the B3 panel raised as finding 2, reintroduced here ten lines after
-# the STOP commands were split by exactly this distinction.
-coll_camp="" ; coll_single="" ; free_camp="" ; free_single=""
+# a collision reports WHY and prints the exact scoped re-check for the ids
+# actually about to start.
+#
+# The RESUME SYNTAX DIFFERS BY RUN KIND: `run` takes `--resume <RUN_ID>` (a
+# value); `campaign` declares `--resume` as store_true, so `campaign ...
+# --resume b-s1` puts the bare id where the `campaign_command` positional is
+# expected and argparse exits 2 with "invalid choice: 'b-s1' (choose from
+# 'status')".
+#
+# The kind is read FROM THE RUN ON DISK, never from the list the id was
+# requested in. A previous version inferred it from the list, so scoping an id
+# into the other variable - `CAMPAIGN_IDS='b-s0'` - printed confident
+# remediation for a run of the opposite kind. What collided is whatever is on
+# disk, so that is what has to be classified. The discriminator is the dir's
+# own ledger: `cmd_campaign` appends `campaign.started` to the campaign dir's
+# events.jsonl (cells live in subdirectories), a standalone `run` never does.
+# Unreadable or unrecognisable ledgers are reported as such and NO resume form
+# is printed - a gate that cannot tell must say so, not guess a command.
+free_camp="" ; free_single="" ; collided=""
 for id in $CAMPAIGN_IDS; do
-    if [ -e "$RUNS/$id" ]; then coll_camp="$coll_camp $id"; else free_camp="$free_camp $id"; fi
+    if [ -e "$RUNS/$id" ]; then collided="$collided $id"; else free_camp="$free_camp $id"; fi
 done
 for id in $SINGLE_RUN_IDS; do
-    if [ -e "$RUNS/$id" ]; then coll_single="$coll_single $id"; else free_single="$free_single $id"; fi
+    if [ -e "$RUNS/$id" ]; then collided="$collided $id"; else free_single="$free_single $id"; fi
 done
-collided="$coll_camp$coll_single"
 [ -z "$collided" ]
 chk $? "run ids free${collided:+ (COLLIDES:$collided)}"
 if [ -n "$collided" ]; then
-    for id in $coll_camp; do
-        if [ -e "$RUNS/$id/manifest.json" ]; then
-            echo "        $id (campaign): FINALIZED. Its id cannot be reused; nothing to do."
-        else
-            echo "        $id (campaign): unfinalized - finish it by re-running the SAME command"
-            echo "            with a bare --resume (it takes no value), repeating --arms and"
-            echo "            --repeats, which otherwise default to all five arms at 2 repeats."
-        fi
-    done
-    for id in $coll_single; do
-        if [ -e "$RUNS/$id/manifest.json" ]; then
-            echo "        $id (standalone): FINALIZED. Its id cannot be reused; nothing to do."
-        else
-            echo "        $id (standalone): unfinalized - finish it with \`--resume $id\`, which"
-            echo "            takes the run id as its value and supplies it (drop --run-id)."
-        fi
-    done
+    "$PY" - "$RUNS" "$CAMPAIGN_IDS" "$SINGLE_RUN_IDS" $collided <<'PY'
+import json
+import sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+requested = {}
+for name in sys.argv[2].split():
+    requested[name] = "campaign"
+for name in sys.argv[3].split():
+    requested[name] = "standalone"
+
+for rid in sys.argv[4:]:
+    d = runs / rid
+    events = d / "events.jsonl"
+    kind = "unknown"
+    why = ""
+    if not events.is_file():
+        why = "no events.jsonl - not a run directory this gate recognises"
+    else:
+        try:
+            kind = "standalone"
+            for raw in events.read_bytes().splitlines():
+                if not raw.strip():
+                    continue
+                if json.loads(raw).get("kind") == "campaign.started":
+                    kind = "campaign"
+                    break
+        except (OSError, ValueError) as exc:
+            kind, why = "unknown", f"ledger unreadable ({type(exc).__name__})"
+    final = (d / "manifest.json").exists()
+    state = "FINALIZED" if final else "unfinalized"
+    print(f"        {rid} ({kind}, {state}):")
+    if kind == "unknown":
+        print(f"            {why}.")
+        print("            No resume form printed: this gate cannot tell which one applies,")
+        print("            and a guessed command is worse than none.")
+    elif final:
+        print("            Its id cannot be reused; nothing to do.")
+    elif kind == "campaign":
+        print("            Finish it by re-running the SAME command with a bare --resume")
+        print("            (it takes NO value), repeating --arms and --repeats, which")
+        print("            otherwise default to all five arms at 2 repeats.")
+    else:
+        print(f"            Finish it with `--resume {rid}`, which takes the run id as its")
+        print("            value and supplies it (drop --run-id).")
+    want = requested.get(rid)
+    if want and kind != "unknown" and want != kind:
+        print(f"            NOTE: requested as a {want} id, but the run on disk is {kind}.")
+        print("            The advice above follows the DISK, which is what collided.")
+PY
     echo "        Re-check only what you are about to start:"
     echo "        CAMPAIGN_IDS='$(echo $free_camp)' SINGLE_RUN_IDS='$(echo $free_single)' bash eval/live_preconditions.sh"
 fi
