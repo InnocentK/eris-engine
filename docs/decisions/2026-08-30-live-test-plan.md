@@ -195,9 +195,38 @@ fails is the point of writing them down.
 | P3 | Both controls draw zero false positives: `control.flagged_cells == 0` of 2 | either control flagged. Reported as the raw count, never as a rate: with 2 controls an FPR can only be 0, 0.5 or 1, so "fpr <= 0.5" survived one control being wholly invented |
 | P4 | S3's best arm covers >= 3 of the 5 planted findings | fewer. Reported as `covered/5` per arm, never as a rate: there are 5 findings in the whole corpus, so a micro recall is one of {0, .2, .4, .6, .8, 1} and "> 0" survived on a single match |
 | P5 | *(deleted)* — `eval/score.py` takes one campaign directory, so "S1+S3 compared together" is not a thing that can be computed. Cross-campaign comparison is forbidden above rather than predicted about |
-| P6 | Codex/agy execution records carry `cost_known == false`, grouped by worker | none do — which would contradict the premise of the sizing above. NOT `unknown_cost_records`, which counts records with no cost at all: an executed missing-cost call is recorded at $2 with `cost_known=false` and never reaches that counter, while a cache replay can raise it |
+| P6 | Codex/agy execution records carry `cost_known == false`, grouped by worker. **A claude/grok record carrying it is NOT a falsification** — see the interrupt note below | none of codex/agy do — which would contradict the premise of the sizing above. NOT `unknown_cost_records`, which counts records with no cost at all: an executed missing-cost call is recorded at $2 with `cost_known=false` and never reaches that counter, while a cache replay can raise it |
 | P7 | No cell is `contaminated` | any hit — the canary or a builtin marker fired, and every quality number is then suspect |
 | P8 | `spent_known_usd` (claude+grok, actual) is under $10 across S1+S3 | more. Stated on `spent_known_usd` because ACTUAL total spend is not observable here: a missing-cost call is recorded as a $2 estimate with `cost_known=false` and summed into `cost_spent_usd`, so that field is known-plus-estimate, not spend. Real codex/agy spend is UNKNOWN and no number in this report may claim otherwise |
+
+### An interrupted call books the full $2 estimate, whatever worker it was
+
+Observed on the first S0 attempt (2026-08-31, `runs/b-s0`, SIGINT at 26 s).
+The killed invocation records `status: failed`, `error: "interrupted"`,
+`cost_usd: null` — the CLI never returned, so it never reported a cost — and
+`BudgetLedger` then books the conservative `per_call_usd` **$2.00** with
+`cost_known: false, estimated: true, counted: true`. The worker was `claude`,
+which normally reports its actual cost.
+
+Three consequences, all of which bear on S1 because S1 interrupts on purpose:
+
+* **The reservation arithmetic above counts no interrupts.** Every in-flight
+  call killed by the S1 SIGINT books $2 estimated on top of the $32. One
+  interrupt is noise against a $200 ceiling; it is written down because the
+  table claims to be what the campaign commits, and it is not, once a signal
+  arrives.
+* **P6 must not be read as "only codex/agy carry `cost_known == false`."** A
+  claude or grok record carries it too, after an interrupt. The report groups
+  by worker AND by `status`, or a reader concludes claude does not report cost.
+* **`spent_known_usd` is unaffected** — an estimate is not known spend — so P8
+  still reads what it claims to read. That is the field behaving correctly.
+
+The attempt is CLOSED at interrupt (`invocation.finished` + `cost` +
+`retry.attempt` with `decision: stop`), and `load_prior` reads
+`stage.interrupted` and does not synthesize an abandoned attempt on resume, so
+the $2 is carried forward once, not twice. A resumed run therefore shows the
+phantom estimate in its ledger and the report should name it rather than
+explain it away.
 
 ## Stop conditions — and who enforces them
 
