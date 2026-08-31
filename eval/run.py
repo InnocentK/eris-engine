@@ -1934,7 +1934,8 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
         if not events.is_file():
             continue
         try:
-            totals = cost_totals(LedgerView.from_path(events))
+            view = LedgerView.from_path(events)
+            totals = cost_totals(view)
         except (LedgerCorrupt, OSError):
             # Its spend is UNREADABLE, so it contributes nothing and the totals
             # below are a FLOOR, not the commitment. `campaign_spend` meets the
@@ -1947,12 +1948,20 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
             # into a number that reads as complete.
             unreadable.append(cell_dir.name)
             continue
-        # A cost record with no cost AT ALL - `cost_usd: None`, which a cache
-        # replay can produce - is counted by `cost_totals` and added to NEITHER
-        # bucket, so it is spend that exists and cannot be valued.
-        # `committed_is_complete` consulted only `unreadable`, and therefore
-        # reported true while these were present.
-        unknown_records += totals.unknown_count
+        # Spend that exists and cannot be valued: a cost record that COUNTS
+        # but carries no figure. `cost_totals.unknown_count` is the wrong
+        # signal for this - it counts every valueless record, and the common
+        # one is a cache REPLAY, which `cache.py` writes as
+        # `cost_usd=origin.cost_usd, counted=False`. Replaying a missing-cost
+        # worker's result therefore yields a valueless record that cost
+        # NOTHING; the origin's estimate was already booked in the cell that
+        # ran it. Keying completeness on `unknown_count` made every such replay
+        # look like unaccounted spend and would have told the operator to stop
+        # for a campaign that was fine. `counted` is the field that separates
+        # them.
+        unknown_records += sum(
+            1 for c in view.records("cost", CostRecord) if c.counted and c.cost_usd is None
+        )
         known += totals.known_usd
         reserved += totals.reserved_usd
     print(
@@ -1970,7 +1979,7 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
                     # it. A stop condition on committed cost must treat that as
                     # over budget until the ledger is explained.
                     "committed_is_complete": not unreadable and unknown_records == 0,
-                    "unknown_cost_records": unknown_records,
+                    "counted_records_without_cost": unknown_records,
                     "unreadable_ledgers": unreadable,
                 },
             },

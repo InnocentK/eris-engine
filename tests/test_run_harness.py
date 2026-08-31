@@ -2233,7 +2233,31 @@ def test_campaign_status_reports_committed_cost_and_names_what_it_cannot_read(
     assert cost["reserved_usd"] == pytest.approx(2.0)
     assert cost["committed_usd"] == pytest.approx(known_before + 1.25 + 2.0)
     assert cost["committed_is_complete"] is True
-    assert cost["unknown_cost_records"] == 0
+    assert cost["counted_records_without_cost"] == 0
+
+    # A cache REPLAY writes `cost_usd=origin.cost_usd, counted=False`
+    # (`cache.py`), so replaying a missing-cost worker's result leaves a
+    # valueless record that cost NOTHING - the origin's estimate was booked in
+    # the cell that ran it. It must NOT break completeness. Keying the flag on
+    # `cost_totals.unknown_count`, which counts every valueless record, made
+    # exactly this look like unaccounted spend.
+    replay = w["runs"] / "c3" / "t_01-r0-single-replay"
+    with RunWriter(replay, Redactor(), run_id="t_01-r0-single-replay") as rw:
+        rw.append("run.started", {"eris_version": "0.0.0"})
+        rw.append(
+            "cost",
+            {
+                "invocation_id": "inv-replay-1",
+                "attempt": 1,
+                "cost_usd": None,
+                "counted": False,
+                "cost_known": False,
+            },
+        )
+    after_replay = status()["cost"]
+    assert after_replay["counted_records_without_cost"] == 0
+    assert after_replay["committed_is_complete"] is True
+    assert after_replay["committed_usd"] == pytest.approx(cost["committed_usd"])
 
     # A cost record with NO cost at all - `cost_usd: None`, which a cache replay
     # can produce - is counted by `cost_totals` and added to neither bucket. It
@@ -2245,7 +2269,7 @@ def test_campaign_status_reports_committed_cost_and_names_what_it_cannot_read(
         vw.append("run.started", {"eris_version": "0.0.0"})
         vw.append("cost", {"invocation_id": "inv-none-1", "attempt": 1, "cost_usd": None})
     valued = status()["cost"]
-    assert valued["unknown_cost_records"] == 1
+    assert valued["counted_records_without_cost"] == 1
     assert valued["committed_is_complete"] is False
     assert valued["unreadable_ledgers"] == []  # readable, just unvaluable
     assert valued["committed_usd"] == pytest.approx(cost["committed_usd"])

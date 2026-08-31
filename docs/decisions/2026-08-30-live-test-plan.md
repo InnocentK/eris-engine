@@ -322,7 +322,7 @@ hand and still see only the KNOWN half, missing every estimated call: in S1 that
 is $5.80 of a $39.80 commitment, so the condition would have read 15% of the
 spend it exists to bound. `campaign status` now reports
 `cost: {spent_known_usd, reserved_usd, committed_usd, committed_is_complete,
-unknown_cost_records, unreadable_ledgers}`, summed from the same `cost_totals`
+counted_records_without_cost, unreadable_ledgers}`, summed from the same `cost_totals`
 the scorer uses.
 
 A cell whose ledger will not parse is named - and its spend is still **missing
@@ -335,14 +335,26 @@ silently dropped from the total", which was half true: it was named, and it was
 dropped. Understating is the dangerous direction for a condition whose whole
 question is "am I under $50", so an incomplete total is a stop in its own right.
 
-**A second way the total can be short.** `cost_totals` counts a record whose
-`cost_usd` is `None` - which a cache replay can produce - in `unknown_count`
-and adds it to NEITHER bucket: spend that exists and cannot be valued. The
-completeness flag consulted only `unreadable_ledgers`, so it reported **true**
-while such records were present. It now requires `unknown_cost_records == 0` as
-well, and that count is reported beside it. An unreadable ledger and an
-unvaluable record are different failures with the same consequence - a floor
-presented as a total - and the flag has to answer for both. Checked against S1:
+**A second way the total can be short.** A cost record that COUNTS but carries
+no figure is spend that exists and cannot be valued, and `cost_totals` adds it
+to neither bucket. The completeness flag consulted only `unreadable_ledgers`, so
+it reported **true** while such records were present. It now requires
+`counted_records_without_cost == 0` as well.
+
+**And a way that reads short when nothing is wrong.** The obvious signal for the
+above is `cost_totals.unknown_count`, and it is the wrong one: it counts EVERY
+valueless record, and the common valueless record is a cache **replay**.
+`cache.py` writes a replay as `cost_usd=origin.cost_usd, counted=False`, so
+replaying a missing-cost worker's result leaves a record with no figure that
+cost nothing - the origin's estimate was already booked in the cell that ran it.
+Keying completeness on `unknown_count` would flag every such replay as
+unaccounted spend and tell the operator to stop a campaign that was fine, which
+is the cry-wolf failure this gate is built to avoid. `counted` is the field that
+separates a replay from unvaluable spend, and both cases are pinned by tests.
+
+An unreadable ledger and an unvaluable record are different failures with the
+same consequence - a floor presented as a total - and the flag answers for both
+without answering for replays. Checked against S1:
 $5.800906 known + $34.00 reserved = $39.800906 committed, which reproduces the
 figure previously derived by hand from the summary JSON.
 
