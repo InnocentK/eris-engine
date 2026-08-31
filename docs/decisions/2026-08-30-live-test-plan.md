@@ -243,6 +243,25 @@ operator has to be watching. Each is listed with how it is actually seen:
 | the ceiling trips | a cell `stopped` for budget; `missing_cells` with a `budget` reason | stop; the sizing above was wrong, re-derive before re-running |
 | committed cost over $50 | `spent_known_usd + reserved` from `campaign status` | stop |
 
+
+**Unresolved before S3: the $50 stop condition contradicts the S3 sizing.** The
+table above plans S3 at **$64 reserved** on reservations alone, and the stop
+condition above says halt when committed cost passes **$50**. S3 therefore
+trips its own stop condition by construction, at roughly 25 of its 32 reserving
+calls - near the end, after most of the money is spent, leaving an incomplete
+matrix and no usable paired deltas. Whichever of the two figures is wrong, they
+cannot both stand.
+
+This is recorded, not silently patched. The threshold exists to catch "the
+sizing was wrong", so a coherent version sets it RELATIVE to the planned
+commitment (e.g. planned reservation + 50%: $48 for S1, $96 for S3) rather than
+at an absolute figure the plan already exceeds. That raises the money at risk
+and is the operator's decision, not the author's.
+
+S1 is unaffected and may proceed: $32 reserved, and S0's one measured claude
+call ($0.406317) puts 20 known-cost calls near $8, for roughly $40 committed -
+under $50, though not by much. If `campaign status` shows S1 committed passing
+$50, the stop condition applies as written.
 To halt a campaign mid-flight, write the CAMPAIGN-SCOPED stop file:
 
 The precondition script PRINTS one ready-to-run command per campaign id, with
