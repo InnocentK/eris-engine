@@ -571,14 +571,51 @@ def _candidates(text: str) -> set[str]:
 
 
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
-# A fenced block or an inline code span renders literally, so a `](...)`
-# inside one is not a link and must not be link-checked. Python makes this
-# concrete: `t["append"](*pair)` - a subscript followed by a call - is
-# textually a markdown link, and the checker reported `*pair` as a broken
-# one (2026-08-31). Stripping code before matching removes that false
-# positive and nothing else: measured at the time, 12 targets became 11,
-# the one lost being `*pair` itself.
-_CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+_INLINE_CODE = re.compile(r"`[^`]*`")
+
+
+def _strip_code(text: str, doc: str, unreadable: list[str]) -> str:
+    """Blank out code, and REPORT anything whose structure cannot be read.
+
+    A `](...)` inside code renders literally and is not a link, so it must not
+    be link-checked. The first version did that with one regex over the whole
+    document - ```` ```.*?``` ```` under `re.S` - which fails OPEN: a document
+    that merely MENTIONS ``` in prose pairs that occurrence with the next real
+    fence and swallows everything between, so real broken links in that region
+    stop being reported and nothing says so. Demonstrated on 2026-08-31: a
+    broken link between an inline mention and a following fence disappeared
+    from the results.
+
+    Fences are therefore tracked line by line, and the two ambiguous cases are
+    surfaced instead of guessed:
+
+    * a fence still open at end of file is REPORTED - the rest of the document
+      was treated as code, and that is exactly when links go unchecked;
+    * a line with an odd number of backticks has an unterminated inline span,
+      so the line is left ALONE and its links are still checked. Stripping on a
+      guess is what loses a link; keeping it can at worst re-check something
+      that renders as code, which is a visible false alarm rather than a
+      silent miss.
+    """
+    out: list[str] = []
+    in_fence = False
+    opened_at = 0
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            opened_at = lineno if in_fence else opened_at
+            out.append("")
+            continue
+        if in_fence:
+            out.append("")
+        elif line.count("`") % 2:
+            out.append(line)
+        else:
+            out.append(_INLINE_CODE.sub(" ", line))
+    if in_fence:
+        unreadable.append(f"{doc}: code fence opened at line {opened_at} is never closed")
+    return "\n".join(out)
 
 
 # Documents whose LINKS are not checked either. Narrower than the mention
@@ -680,13 +717,19 @@ def test_no_document_contains_a_broken_link() -> None:
     banner whose links do not resolve is worse than no banner.
     """
     broken: list[str] = []
+    unreadable: list[str] = []
     for doc in _all_docs():
         if any(fnmatch(str(doc.relative_to(REPO)), pat) for pat in LINK_UNCHECKED):
             continue
-        for m in _LINK.finditer(_CODE.sub(" ", doc.read_text())):
+        rel = str(doc.relative_to(REPO))
+        for m in _LINK.finditer(_strip_code(doc.read_text(), rel, unreadable)):
             ref = m.group(1)
             if ref.startswith(("http://", "https://", "#", "mailto:")):
                 continue
             if not (doc.parent / ref.split("#")[0]).exists():
                 broken.append(f"{doc.relative_to(REPO)} -> {ref}")
+    assert not unreadable, (
+        "code structure could not be read, so links in these documents were not "
+        "fully checked:\n  " + "\n  ".join(unreadable)
+    )
     assert not broken, "broken links:\n  " + "\n  ".join(broken)
