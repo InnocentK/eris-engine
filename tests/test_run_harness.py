@@ -4,6 +4,7 @@ SIGINT handler, exit codes and the stderr event stream - all hermetic
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
@@ -139,6 +140,9 @@ class InterruptingProcess(FakeProcess):
         if not self.signals:
             signal.raise_signal(signal.SIGINT)  # the installed handler raises KeyboardInterrupt
         return super().wait(timeout)
+
+
+RUN_PY = Path(__file__).resolve().parent.parent / "eval" / "run.py"
 
 
 def world(
@@ -1867,10 +1871,6 @@ def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
 
     cell_dirs = [p for p in (w["runs"] / "c2").iterdir() if p.is_dir() and p.name != "blobs"]
     assert cell_dirs, "campaign wrote no cell directories"
-    for cell in cell_dirs:
-        cell_kinds = set(events_of(cell).kinds())
-        assert "run.started" in cell_kinds
-        assert "campaign.started" not in cell_kinds, f"{cell.name} gained `campaign.started`"
 
     out = io.StringIO()
     rc = main(
@@ -1882,9 +1882,69 @@ def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
         killpg=lambda *_: None,
     )
     assert rc == EXIT_OK, out.getvalue()
-    solo_kinds = set(events_of(Path(json.loads(out.getvalue())["run_dir"])).kinds())
-    assert "run.started" in solo_kinds
-    assert "campaign.started" not in solo_kinds, (
-        "a standalone run's ledger gained `campaign.started`: the live-run gate "
-        "would now print the campaign resume flag for a standalone run"
+    solo_dir = Path(json.loads(out.getvalue())["run_dir"])
+
+    # Every directory the gate could classify, found the way the gate finds
+    # them - by walking for a ledger - rather than by listing the ones this
+    # test remembered to create.
+    ledgers = sorted(p.parent for p in w["runs"].rglob("events.jsonl"))
+    assert {w["runs"] / "c2", solo_dir} <= set(ledgers)
+    assert set(cell_dirs) <= set(ledgers)
+    for d in ledgers:
+        kinds = set(events_of(d).kinds())
+        markers = kinds & {"run.started", "campaign.started"}
+        assert len(markers) == 1, (
+            f"{d.relative_to(w['runs'])} carries {sorted(markers) or 'no'} start marker(s); "
+            "the live-run gate classifies a collided id by exactly one of them "
+            "and refuses to advise on zero or two"
+        )
+        expected = "campaign.started" if d == w["runs"] / "c2" else "run.started"
+        assert markers == {expected}, (
+            f"{d.relative_to(w['runs'])} carries {markers}, want {expected}"
+        )
+
+
+def test_only_cmd_campaign_writes_campaign_started_anywhere_in_the_harness() -> None:
+    """No command may write the other kind's start marker.
+
+    The behavioural test above can only speak for the code paths it runs -
+    `campaign` and `run`. The claim the live-run gate depends on is universal
+    over paths: for ANY directory in `runs_dir`, exactly one start marker is
+    present, so the gate can tell a campaign from a standalone run and print the
+    matching `--resume` form.
+
+    `cmd_invoke` also builds a `RunWriter` in `runs_dir` (`eval/run.py:347`) and
+    is NOT exercised there, so adding `campaign.started` to it would misclassify
+    an invoke directory as a campaign while every behavioural test passed
+    (stop review, 2026-08-31). This pins the site map instead: every literal
+    `.append("run.started"|"campaign.started", ...)` in `eval/run.py`, by the
+    function enclosing it.
+
+    Adding, moving, or removing a site fails this test. Renaming a function
+    fails it too, which is the point - the gate's rationale names these
+    functions, and a rename must be seen rather than silently drift.
+    """
+    tree = ast.parse(Path(RUN_PY).read_text(encoding="utf-8"))
+    markers = {"run.started", "campaign.started"}
+    sites: dict[str, set[str]] = {}
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in markers
+            ):
+                sites.setdefault(node.args[0].value, set()).add(fn.name)
+
+    assert sites == {
+        "campaign.started": {"cmd_campaign"},
+        "run.started": {"cmd_invoke", "run_cell"},
+    }, (
+        "the start-marker site map changed. `eval/live_preconditions.sh` "
+        "classifies a collided run id by these markers being mutually exclusive "
+        "per directory; if one command now writes both, or writes the other "
+        "kind's marker, the gate prints the wrong --resume form for a real run."
     )

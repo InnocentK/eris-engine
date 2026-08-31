@@ -635,6 +635,49 @@ safe using a fact I had checked once by hand and then described as a property of
 the system. The check that closes it is the same one that closes the others -
 make the claim fail before believing it.
 
+### S0-11. The test enforced the invariant only where it happened to look
+
+Caught by the Codex stop review, on the fix for S0-10. The test added there ran
+a campaign and a standalone run and asserted mutual exclusion on the directories
+those produced. The claim it was written to enforce is universal over paths:
+**for any directory in `runs_dir`, exactly one start marker is present.**
+
+`eval/run.py` builds a `RunWriter` at three sites - `cmd_invoke` (:347),
+`run_cell` (:974) and `cmd_campaign` (:1739). The test exercised the last two.
+Adding `campaign.started` to `cmd_invoke` therefore misclassifies an invoke
+directory as a campaign, and the gate prints a bare `--resume` for a run that
+needs `--resume <RUN_ID>` - **with every behavioural test still green**. That was
+verified, not argued: the mutation was applied and the behavioural test passed.
+
+Two changes, because the two failure modes are different:
+
+1. The behavioural test now finds directories the way the gate does - walking
+   `runs_dir` for `events.jsonl` - instead of asserting over the ones the test
+   remembered to create. It asserts exactly one marker per ledger, and which.
+2. A structural test pins the site map itself: every literal
+   `.append("run.started"|"campaign.started", ...)` in `eval/run.py`, by
+   enclosing function, compared for exact equality against
+   `{"campaign.started": {"cmd_campaign"}, "run.started": {"cmd_invoke",
+   "run_cell"}}`. Adding, moving or removing a site fails it; so does renaming
+   one of those functions, which is intended - the gate's rationale names them.
+
+Mutation-checked, and this is the result that matters:
+
+| mutation | behavioural | structural |
+|---|---|---|
+| `run.started` into `cmd_campaign` | FAILS | FAILS |
+| `campaign.started` into `run_cell` | FAILS | FAILS |
+| **`campaign.started` into `cmd_invoke`** | **PASSES** | **FAILS** |
+
+The third row is the finding. All mutations reverted, `git diff` clean.
+
+**Six rounds.** The through-line has not changed once: an answer that outruns its
+evidence. It has only moved further out - from the branch, to the reason for the
+branch, to the test for the reason. A behavioural test can only speak for the
+paths it runs; when the claim quantifies over all paths, something has to check
+all paths, and "I exercised the important ones" is the same guess in a new
+costume.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
