@@ -1935,7 +1935,16 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
         try:
             totals = cost_totals(LedgerView.from_path(events))
         except LedgerCorrupt:
-            unreadable.append(cell_dir.name)  # never silently dropped from the total
+            # Its spend is UNREADABLE, so it contributes nothing and the totals
+            # below are a FLOOR, not the commitment. `campaign_spend` meets the
+            # same case by reserving `planned_calls x worst_case_call`, which
+            # needs the cell specs and `per_call_usd`; `campaign status` takes
+            # neither a policy nor a corpus, so it cannot compute that bound and
+            # must not pretend the gap is zero. Understating is the dangerous
+            # direction for a budget stop - the operator is asking "am I under
+            # $50" - so the shortfall is reported as a flag rather than folded
+            # into a number that reads as complete.
+            unreadable.append(cell_dir.name)
             continue
         known += totals.known_usd
         reserved += totals.reserved_usd
@@ -1949,6 +1958,11 @@ def cmd_campaign_status(args: argparse.Namespace, out: IO[str]) -> int:
                     "spent_known_usd": round(known, 6),
                     "reserved_usd": round(reserved, 6),
                     "committed_usd": round(known + reserved, 6),
+                    # False -> `committed_usd` is a LOWER BOUND: one or more
+                    # ledgers could not be read and their spend is missing from
+                    # it. A stop condition on committed cost must treat that as
+                    # over budget until the ledger is explained.
+                    "committed_is_complete": not unreadable,
                     "unreadable_ledgers": unreadable,
                 },
             },

@@ -2247,4 +2247,11 @@ def test_campaign_status_reports_committed_cost_and_names_what_it_cannot_read(
     )
     after = status()["cost"]
     assert after["unreadable_ledgers"] == [extra.name]
+    # Its $3.25 is gone from the total, so the total is a FLOOR. The flag is
+    # what makes that legible: without it an operator reads $0.01 committed and
+    # concludes the campaign is nowhere near the ceiling, when the truth is
+    # unknown and strictly larger. Understating is the dangerous direction for
+    # a budget stop.
     assert after["committed_usd"] == pytest.approx(known_before)
+    assert after["committed_is_complete"] is False
+    assert first["cost"]["committed_is_complete"] is True

@@ -311,7 +311,7 @@ operator has to be watching. Each is listed with how it is actually seen:
 | a cell refuses (`LaunchRefused`) | non-zero campaign exit code; `status` shows the cell `refused` | stop, do not re-run: a gate fired on real data and that is the finding |
 | a cell is `contaminated` | exit 6, or `contaminated: true` in the summary | stop; the key may have been read and every quality number is suspect |
 | the ceiling trips | a cell `stopped` for budget; `missing_cells` with a `budget` reason | stop; the sizing above was wrong, re-derive before re-running |
-| committed cost over $50 | `cost.committed_usd` from `campaign status` | stop |
+| committed cost over $50, **or `cost.committed_is_complete` false** | `campaign status` | stop |
 
 
 **The reading this stop condition asks for did not exist.** It said
@@ -321,9 +321,18 @@ neither a reserved figure nor any campaign-level total - only a per-cell
 hand and still see only the KNOWN half, missing every estimated call: in S1 that
 is $5.80 of a $39.80 commitment, so the condition would have read 15% of the
 spend it exists to bound. `campaign status` now reports
-`cost: {spent_known_usd, reserved_usd, committed_usd, unreadable_ledgers}`,
-summed from the same `cost_totals` the scorer uses, and a cell whose ledger will
-not parse is NAMED rather than dropped from the total. Checked against S1:
+`cost: {spent_known_usd, reserved_usd, committed_usd, committed_is_complete,
+unreadable_ledgers}`, summed from the same `cost_totals` the scorer uses.
+
+A cell whose ledger will not parse is named - and its spend is still **missing
+from the total**, because it cannot be read. `campaign_spend` meets that case by
+reserving `planned_calls x worst_case_call`, which needs the cell specs and
+`per_call_usd`; `campaign status` takes neither a policy nor a corpus, so it
+cannot compute that bound. It therefore reports `committed_is_complete: false`
+and the total is a FLOOR. An earlier version called the corrupt cell "never
+silently dropped from the total", which was half true: it was named, and it was
+dropped. Understating is the dangerous direction for a condition whose whole
+question is "am I under $50", so an incomplete total is a stop in its own right. Checked against S1:
 $5.800906 known + $34.00 reserved = $39.800906 committed, which reproduces the
 figure previously derived by hand from the summary JSON.
 
