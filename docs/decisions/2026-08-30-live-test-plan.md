@@ -51,6 +51,52 @@ nobody can predict in advance, and if it trips it truncates in fixed arm order -
 arm 4 first, the arm the experiment exists to judge. **So the full matrix will
 not be run.** The runs below leave real headroom on reservations alone.
 
+## Preconditions — none of the runs below may start until these pass
+
+The plan as first written went straight to spending. It named no preflight, no
+pin check, no `.env`, and no dry run, while this session's ORIGINAL blocker was
+exactly that: `claude` and `agy` auto-updated, their pinned hashes stopped
+matching, and every launch refused. A runbook that spends money without
+checking its preconditions is not a runbook (stop review, 2026-08-30).
+
+```
+# 1. the doctor: names only, never values
+python eval/run.py preflight --policy policies/default.yaml --env-file .env
+
+# 2. the pins still describe the binaries on THIS machine. A CLI that
+#    auto-updated since the last pin refuses at launch, mid-campaign, after
+#    money has been spent on earlier cells
+python - <<'PY'
+import hashlib, sys; sys.path.insert(0, "src")
+from pathlib import Path
+from eris.policy import load_policy
+for name, w in sorted(load_policy(Path("policies/default.yaml")).policy.workers.items()):
+    exe, pin = getattr(w, "executable", None), getattr(w, "executable_sha256", None)
+    if not exe or pin in (None, "UNPINNED"):
+        continue
+    got = hashlib.sha256(Path(exe).read_bytes()).hexdigest()
+    print(f"{name:10} {'ok' if got == pin else 'STALE PIN — re-pin before running'}")
+PY
+
+# 3. `.env` exists and carries XAI_API_KEY. Without it grok is REFUSED at
+#    launch, and that refusal would be misread as a finding under the stop
+#    conditions below
+test -f .env && grep -q XAI_API_KEY .env && echo "env ok"
+
+# 4. the run ids are free. `RunExists` refuses a colliding id (exit 2), so
+#    check before rather than discovering it after S0 has run
+ls runs/ | grep -E '^b-s(0|1|3)$' && echo "COLLISION - choose new ids" || echo "ids free"
+
+# 5. the matrix is the one intended. Costs nothing, and is the only thing that
+#    would have caught the --arms defaulting trap before it declared 64 cells
+python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
+    --arms single,indep_verify --repeats 1 --dry-run
+```
+
+If any of 1-4 fails, fix it and re-run all of them. Do not start S0 with a
+failing precondition on the theory that one cell is cheap: the point of S0 is to
+learn something about the corpus, and a launch refusal teaches nothing about it.
+
 ## The runs
 
 **S0 — one cell, live.** Prove the corpus runs at all before spending on a
@@ -59,7 +105,24 @@ matrix.
 ```
 python eval/run.py run --task-file eval/corpus/control-clean-io/task.json \
     --arm single --panel claude --run-id b-s0
+
+# what S0 is FOR - read these before spending on a matrix:
+#   exit 0 = ok, 6 = CONTAMINATED (stop the whole plan), 3 = incomplete
+echo "exit=$?"
+python - <<'PY'
+import json
+from pathlib import Path
+ev = [json.loads(l) for l in (Path("runs/b-s0/events.jsonl")).read_bytes().splitlines()]
+scan = [e["payload"] for e in ev if e["kind"] == "scan.result"]
+print("scan:", scan[-1] if scan else "NO SCAN RESULT - the run did not finish")
+print("errors:", [e["payload"] for e in ev if e["kind"] == "run.error"] or "none")
+PY
 ```
+
+A contaminated S0 stops the plan: the worker reached something outside its
+snapshot, and no quality number from any later run would mean anything. An
+`ok` S0 does NOT prove the reverse - the canary detects a verbatim emission
+only - it just means the one thing we can detect did not happen.
 
 **S1 — operability matrix, with the interrupt inside it.** The widest
 configuration that leaves real headroom ($32 reserved of $200). The resume test
@@ -131,9 +194,15 @@ operator has to be watching. Each is listed with how it is actually seen:
 | the ceiling trips | a cell `stopped` for budget; `missing_cells` with a `budget` reason | stop; the sizing above was wrong, re-derive before re-running |
 | committed cost over $50 | `spent_known_usd + reserved` from `campaign status` | stop |
 
-To make the first two enforceable rather than hoped for, S1 and S3 are run with
-`runs/STOP` available: on any of the above, write the stop file rather than
-waiting for the campaign to finish.
+To halt a campaign mid-flight, write the CAMPAIGN-SCOPED stop file:
+
+```
+touch runs/b-s1/STOP      # halts this campaign only
+```
+
+**Not `runs/STOP`.** That path is the global stop file (`arms.stop_file_paths`
+returns both) and it halts every run using this runs directory, including
+anything else in flight. An earlier draft of this plan named the global one.
 
 ## What will be recorded
 
