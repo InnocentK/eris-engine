@@ -69,7 +69,14 @@ failed, the id-collision check reported "ids free" when the runs directory did
 not exist, and every command said `python` where this repo needs
 `.venv/bin/python`. It checks:
 
-1. **preflight** - the doctor (names, never values).
+1. **preflight, parsed - not just its exit code.** `preflight` EXITS 0 while
+   reporting problems: a missing env-file and a grok worker with no
+   `XAI_API_KEY` come back as `WARN` with status 0. Checking the exit code alone
+   passed a doctor that was saying the run would fail. The gate fails on any
+   `FAIL`/`ERROR`, and on a `WARN` for any worker THIS run spawns - scoped that
+   way because `openai-api` has no key configured and warns every time, and
+   failing on a worker that is never called trains an operator to ignore the
+   gate.
 2. **no CLI worker is UNPINNED.** A stale pin does NOT raise: `load_policy`
    downgrades that worker to `UNPINNED`, and `launch.py` refuses it at spawn -
    mid-campaign, after money has been spent on earlier cells. An earlier version
@@ -82,6 +89,11 @@ not exist, and every command said `python` where this repo needs
 4. **the run ids are free** - `RunExists` refuses a collision (exit 2).
 5. **`runs_dir` resolved FROM THE POLICY**, and echoed, because the STOP path
    below depends on it and `--runs-dir` can override it.
+6. **every corpus snapshot is built and matches its `files/`.** Snapshots are
+   generated and gitignored, so a clean checkout has NONE and every run refuses
+   with "snapshot ... is not a directory" - after the campaign has started.
+   Build them first:
+   `.venv/bin/python eval/make_control_snapshot.py eval/corpus --all`
 
 Then, costing nothing, confirm the matrix is the intended one - the only step
 that catches the `--arms` defaulting trap before it declares 64 cells:
@@ -194,15 +206,21 @@ operator has to be watching. Each is listed with how it is actually seen:
 
 To halt a campaign mid-flight, write the CAMPAIGN-SCOPED stop file:
 
+The precondition script PRINTS the exact command when it passes, with the
+resolved runs directory already substituted:
+
 ```
-touch "$RUNS_DIR/$CAMPAIGN_ID/STOP"    # halts THAT campaign only
+To halt a campaign mid-flight, run EXACTLY this, with the campaign id in flight:
+    touch runs/<campaign-id>/STOP
+e.g. touch runs/b-s1/STOP
+NOT runs/STOP - that is the global stop file and halts every run here.
 ```
 
-`$RUNS_DIR` is the value the precondition script echoed, not a hardcoded
-`runs/` - `--runs-dir` can override the policy. `$CAMPAIGN_ID` is the campaign
-actually in flight: an earlier draft showed only the `b-s1` path, which an
-operator running S3 could have copied, stopping nothing while S3 kept
-spending.
+An earlier draft wrote it as `touch "$RUNS_DIR/$CAMPAIGN_ID/STOP"` and told the
+reader those came from the script. They did not: the script printed prose and
+set no variables, so the command expanded to `touch /STOP` in the operator's
+shell - it could not halt anything. It also showed only the `b-s1` path, which
+an operator running S3 could copy, stopping nothing while S3 kept spending.
 
 **Not `runs/STOP`.** That path is the global stop file (`arms.stop_file_paths`
 returns both) and it halts every run using this runs directory, including
