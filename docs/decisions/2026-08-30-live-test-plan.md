@@ -60,40 +60,38 @@ matching, and every launch refused. A runbook that spends money without
 checking its preconditions is not a runbook (stop review, 2026-08-30).
 
 ```
-# 1. the doctor: names only, never values
-python eval/run.py preflight --policy policies/default.yaml --env-file .env
+bash eval/live_preconditions.sh        # exits non-zero if ANY check fails
+```
 
-# 2. the pins still describe the binaries on THIS machine. A CLI that
-#    auto-updated since the last pin refuses at launch, mid-campaign, after
-#    money has been spent on earlier cells
-python - <<'PY'
-import hashlib, sys; sys.path.insert(0, "src")
-from pathlib import Path
-from eris.policy import load_policy
-for name, w in sorted(load_policy(Path("policies/default.yaml")).policy.workers.items()):
-    exe, pin = getattr(w, "executable", None), getattr(w, "executable_sha256", None)
-    if not exe or pin in (None, "UNPINNED"):
-        continue
-    got = hashlib.sha256(Path(exe).read_bytes()).hexdigest()
-    print(f"{name:10} {'ok' if got == pin else 'STALE PIN — re-pin before running'}")
-PY
+It is a script, not a list of snippets to eyeball, because the snippets this
+plan first carried failed silently: the `.env` check printed nothing when it
+failed, the id-collision check reported "ids free" when the runs directory did
+not exist, and every command said `python` where this repo needs
+`.venv/bin/python`. It checks:
 
-# 3. `.env` exists and carries XAI_API_KEY. Without it grok is REFUSED at
-#    launch, and that refusal would be misread as a finding under the stop
-#    conditions below
-test -f .env && grep -q XAI_API_KEY .env && echo "env ok"
+1. **preflight** - the doctor (names, never values).
+2. **no CLI worker is UNPINNED.** A stale pin does NOT raise: `load_policy`
+   downgrades that worker to `UNPINNED`, and `launch.py` refuses it at spawn -
+   mid-campaign, after money has been spent on earlier cells. An earlier version
+   of this check compared the hashes in `policies/pins.yaml` against the
+   binaries and passed a deliberately corrupted pin, because the loader had
+   already discarded the mismatched value.
+3. **`.env` carries `XAI_API_KEY`** - without it grok is refused at launch by
+   policy, and under the stop conditions below that refusal would be recorded as
+   a finding about the engine.
+4. **the run ids are free** - `RunExists` refuses a collision (exit 2).
+5. **`runs_dir` resolved FROM THE POLICY**, and echoed, because the STOP path
+   below depends on it and `--runs-dir` can override it.
 
-# 4. the run ids are free. `RunExists` refuses a colliding id (exit 2), so
-#    check before rather than discovering it after S0 has run
-ls runs/ | grep -E '^b-s(0|1|3)$' && echo "COLLISION - choose new ids" || echo "ids free"
+Then, costing nothing, confirm the matrix is the intended one - the only step
+that catches the `--arms` defaulting trap before it declares 64 cells:
 
-# 5. the matrix is the one intended. Costs nothing, and is the only thing that
-#    would have caught the --arms defaulting trap before it declared 64 cells
-python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
+```
+.venv/bin/python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
     --arms single,indep_verify --repeats 1 --dry-run
 ```
 
-If any of 1-4 fails, fix it and re-run all of them. Do not start S0 with a
+If the script exits non-zero, fix what it names and run it again. Do not start S0 with a
 failing precondition on the theory that one cell is cheap: the point of S0 is to
 learn something about the corpus, and a launch refusal teaches nothing about it.
 
@@ -197,8 +195,14 @@ operator has to be watching. Each is listed with how it is actually seen:
 To halt a campaign mid-flight, write the CAMPAIGN-SCOPED stop file:
 
 ```
-touch runs/b-s1/STOP      # halts this campaign only
+touch "$RUNS_DIR/$CAMPAIGN_ID/STOP"    # halts THAT campaign only
 ```
+
+`$RUNS_DIR` is the value the precondition script echoed, not a hardcoded
+`runs/` - `--runs-dir` can override the policy. `$CAMPAIGN_ID` is the campaign
+actually in flight: an earlier draft showed only the `b-s1` path, which an
+operator running S3 could have copied, stopping nothing while S3 kept
+spending.
 
 **Not `runs/STOP`.** That path is the global stop file (`arms.stop_file_paths`
 returns both) and it halts every run using this runs directory, including
