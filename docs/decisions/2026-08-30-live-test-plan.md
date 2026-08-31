@@ -323,6 +323,89 @@ records `eris_version` ("0.4.3"), not a commit —
    trivially correct, producing no discrimination. That is a real possible
    outcome and the report will say so rather than dressing it up.
 
+## S0 result — 2026-08-31, `runs/b-s0`
+
+Exit **0**, `contaminated: false`, `scan_incomplete: false`, **0 hits** over 9
+blobs and 43 events, 7 canary patterns (1 dropped as non-distinctive: it
+occurred in a known text). The worker's `cwd` was the snapshot directory and
+`cache.refused: missing` — a real call, no replay. Engine at `677c1e8`,
+`claude` binary `625869b0…` (2.1.251).
+
+The first attempt was SIGINT'd at 26 s; the resume re-ran `propose` as attempt
+2 and `stage.resumed` reused the pack. Cost: **$2.406317** total =
+**$2.00** interrupt estimate (`cost_known: false`) + **$0.406317** actual
+(`cost_known: true`, 54.4 s, 82 input / 17 117 cached / 5 312 output / 2 025
+reasoning tokens). The phantom carried forward exactly once, as the code says.
+
+S0 did what it was for: the corpus runs, containment held, and three things
+came back that no amount of reading the code would have produced.
+
+### S0-1. `control.fpr` measures whether the arm SPOKE, not whether it invented
+
+The proposal returned **3 findings on a clean control**: `low` (no tests exist
+in the repo, no location), `low` (`textblock.py:17` — bare `str.split()`
+collapses newlines and paragraph breaks), `info` (`textblock.py:38` — `if line`
+is a truthiness test, so a whitespace-only line gets padded).
+
+**All three are true.** Line 17 is `for word in text.split():`; line 38 is
+`return [pad + line if line else line for line in lines]`; `git ls-files`
+returns exactly `README.md` and `textblock.py`. The summary's verdict was
+"defensible as it stands" and labelled all three non-blocking.
+
+`control-clean-io.json` has 0 key findings (enforced by
+`Key._control_has_nothing_to_find`), `predicted_findings` applies **no severity
+floor**, and `_control_block` counts `flagged = len([s for s in ctl if s.fp >
+0])`. So this cell scores **fp = 3, flagged**. Any accurate, self-labelled
+non-blocking remark is a false positive by construction, and every competent
+reviewer has something true to say about any file.
+
+**P3 is therefore expected to fail, and the metric is NOT being changed.**
+Rewriting a pre-registered metric after one result disfavours it is option 4 of
+`docs/decisions/2026-08-30-confident-wrong-split.md`, rejected there for this
+exact reason. P3 stands as written and will be reported falsified with this
+cell as the cause. What the report must NOT do is call the number an invention
+rate: on this corpus `control.fpr` is a **flag rate**, and a high one is
+consistent with an arm that invented nothing at all. Whether a severity floor,
+an adjudicated definition, or `wrong_accept` is the right invention signal is a
+question for after the campaign, on the evidence, not a patch applied now.
+
+### S0-2. The binary is pinned; the MODEL is not
+
+`invocation.finished` records `model_requested: null`, `model_executed:
+**claude-fable-5**`. `policies/default.yaml` sets `model: null` for both
+`claude` (line 46) and `judge` (line 60) — "null = CLI default; set to pin a
+model". So the arm ran whatever the CLI defaults to, and a CLI update can change
+the model under a binary whose hash still matches its pin. That is the same
+drift class that failed the gate this morning, in a place the pin check cannot
+see.
+
+The asymmetry is explicit in the source: `policy.py` enforces a lineage guard on
+`agy` ("an unpinned default would break the Google lineage", line 112-114) and
+none on the Anthropic workers, whose comment at line 57 names the identical
+failure — "could silently collapse into another vendor's".
+
+Mitigation that already exists: every invocation records `model_executed`, so
+the campaign is auditable after the fact. What is missing is control, not
+observability. Setting `model: claude-fable-5` would pass `--model
+claude-fable-5` (`launch.py:152`) and change nothing about today's behaviour
+while stopping the drift — but the flag has never been executed here, and an
+untested flag that refuses every claude cell would do so mid-campaign, after
+money is spent. **It must be verified by one real spawn before S1, not assumed.**
+
+### S0-3. `evidence_refs` is not an exhaustive account of what informed a claim
+
+Assumption 1 of the proposal: "README.md content is not in the DATA evidence
+set; **I read it directly (read-only)** and it matches the docstrings". The
+worker was spawned with `--tools Read,Grep,Glob` and `cwd` = the snapshot, and
+`README.md` is one of the snapshot's two tracked files — so this is E1
+containment working as designed, **not** contamination, and the scan agrees.
+
+It is still worth stating plainly: a claim can rest on a file the worker opened
+itself, outside the evidence pack. Here the model said so, marked the claim
+assumption-backed, and filed an `evidence_request` to bring README into the
+record — the honest path, and evidence the prompt's rules land. The report must
+not describe `evidence_refs` as a complete provenance record.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
