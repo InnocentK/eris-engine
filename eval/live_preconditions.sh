@@ -61,10 +61,17 @@ chk $? "no CLI worker is UNPINNED (a stale pin refuses at launch, mid-campaign)"
 [ -f "$ENVFILE" ] && grep -q '^XAI_API_KEY=' "$ENVFILE"
 chk $? "$ENVFILE exists and carries XAI_API_KEY (grok refuses at launch without it)"
 
+# Resolved ABSOLUTE and shell-QUOTED. A runs_dir containing a space is valid
+# (`runs_dir: "my runs"`), and an unquoted relative path turned the stop command
+# into `touch my runs/<id>/STOP` - which creates a file called `my`, fails on
+# the rest, and leaves the campaign running while the operator believes it is
+# halted. A relative path also only works from the repo root.
 RUNS=$("$PY" -c "import sys; sys.path.insert(0,'src')
 from pathlib import Path
 from eris.policy import load_policy
 print(load_policy(Path('$POLICY')).policy.runs_dir)")
+RUNS_Q=$("$PY" -c "import shlex, sys; from pathlib import Path
+print(shlex.quote(str(Path(sys.argv[1]).resolve())))" "$RUNS" 2>/dev/null)
 [ -n "$RUNS" ]
 chk $? "runs_dir resolved from the policy: ${RUNS:-<unresolved>}"
 
@@ -100,7 +107,14 @@ echo
 if [ "$fail" -ne 0 ]; then echo "PRECONDITIONS FAILED - do not start any run"; exit 1; fi
 echo "preconditions passed."
 echo
-echo "To halt a campaign mid-flight, run EXACTLY this, with the campaign id in flight:"
-echo "    touch $RUNS/<campaign-id>/STOP"
-echo "e.g. touch $RUNS/b-s1/STOP"
-echo "NOT $RUNS/STOP - that is the global stop file and halts every run here."
+echo "To halt a campaign mid-flight, run EXACTLY one of these. The path is"
+echo "absolute and quoted, so it works from any directory and survives a"
+echo "runs_dir containing spaces:"
+for id in $IDS; do
+  echo "    touch $("$PY" -c "import shlex, sys; from pathlib import Path
+print(shlex.quote(str(Path(sys.argv[1]).resolve() / sys.argv[2] / 'STOP')))" "$RUNS" "$id")"
+done
+echo
+echo "NOT $("$PY" -c "import shlex, sys; from pathlib import Path
+print(shlex.quote(str(Path(sys.argv[1]).resolve() / 'STOP')))" "$RUNS") - that is the GLOBAL stop"
+echo "file and halts every run using this runs directory, not just your campaign."

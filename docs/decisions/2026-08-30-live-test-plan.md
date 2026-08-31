@@ -206,25 +206,29 @@ operator has to be watching. Each is listed with how it is actually seen:
 
 To halt a campaign mid-flight, write the CAMPAIGN-SCOPED stop file:
 
-The precondition script PRINTS the exact command when it passes, with the
-resolved runs directory already substituted:
+The precondition script PRINTS one ready-to-run command per campaign id, with
+the path resolved ABSOLUTE and shell-QUOTED:
 
 ```
-To halt a campaign mid-flight, run EXACTLY this, with the campaign id in flight:
-    touch runs/<campaign-id>/STOP
-e.g. touch runs/b-s1/STOP
-NOT runs/STOP - that is the global stop file and halts every run here.
+    touch '/…/eris-engine/runs/b-s1/STOP'
 ```
 
-An earlier draft wrote it as `touch "$RUNS_DIR/$CAMPAIGN_ID/STOP"` and told the
-reader those came from the script. They did not: the script printed prose and
-set no variables, so the command expanded to `touch /STOP` in the operator's
-shell - it could not halt anything. It also showed only the `b-s1` path, which
-an operator running S3 could copy, stopping nothing while S3 kept spending.
+Absolute, so it works from any directory. Quoted, because a `runs_dir`
+containing a space is perfectly valid - and with `runs_dir: "my runs"` the
+earlier unquoted, relative form printed
 
-**Not `runs/STOP`.** That path is the global stop file (`arms.stop_file_paths`
-returns both) and it halts every run using this runs directory, including
-anything else in flight. An earlier draft of this plan named the global one.
+```
+    touch my runs/b-s1/STOP
+```
+
+which creates a file called `my` in the current directory, fails on the rest,
+and **leaves the campaign running while the operator believes it is halted**.
+That is the worst failure available to a stop mechanism, so the script now emits
+the exact string to paste and it was tested against a spaced `runs_dir`: the
+STOP file lands in the campaign directory and no stray file is created.
+
+The global `<runs_dir>/STOP` is printed too, labelled as the one NOT to use: it
+halts every run using that runs directory, not just this campaign.
 
 ## What will be recorded
 
