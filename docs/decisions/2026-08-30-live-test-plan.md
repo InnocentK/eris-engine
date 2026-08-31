@@ -77,12 +77,22 @@ not exist, and every command said `python` where this repo needs
    way because `openai-api` has no key configured and warns every time, and
    failing on a worker that is never called trains an operator to ignore the
    gate.
-2. **no CLI worker is UNPINNED.** A stale pin does NOT raise: `load_policy`
-   downgrades that worker to `UNPINNED`, and `launch.py` refuses it at spawn -
-   mid-campaign, after money has been spent on earlier cells. An earlier version
-   of this check compared the hashes in `policies/pins.yaml` against the
-   binaries and passed a deliberately corrupted pin, because the loader had
-   already discarded the mismatched value.
+2. **every CLI worker passes the LAUNCH-TIME pin check.** The gate calls
+   `launch.preflight_executable` itself, once per CLI worker: resolve the pinned
+   path, hash the realpath, compare with the pin. That is the code that refuses
+   a cell at spawn - mid-campaign, after money has been spent on earlier cells -
+   so calling it is the only way to know in advance. Two earlier versions of
+   this check were wrong in opposite directions, and the second was wrong on
+   this machine while claiming to be right: it asserted that a stale pin makes
+   `load_policy` downgrade the worker to `UNPINNED` and tested only for that.
+   It does not. `policy._merge_pins` copies `pins.yaml`'s `sha256` verbatim into
+   `executable_sha256` and nothing hashes the binary at load time, so a stale
+   pin loads as `pinned=True`. On 2026-08-31 that check printed **PASS - no CLI
+   worker is UNPINNED** while `claude`, `judge` and `grok` had all auto-updated
+   out from under their pins and would each have been refused at spawn; five
+   deliberately corrupted pins also loaded as `pinned=True`. Only `preflight`
+   (check 1) caught it, and a gate whose checks disagree is a gate with one
+   check.
 3. **`.env` carries `XAI_API_KEY`** - without it grok is refused at launch by
    policy, and under the stop conditions below that refusal would be recorded as
    a finding about the engine.
@@ -113,13 +123,13 @@ learn something about the corpus, and a launch refusal teaches nothing about it.
 matrix.
 
 ```
-python eval/run.py run --task-file eval/corpus/control-clean-io/task.json \
+.venv/bin/python eval/run.py run --task-file eval/corpus/control-clean-io/task.json \
     --arm single --panel claude --run-id b-s0
 
 # what S0 is FOR - read these before spending on a matrix:
 #   exit 0 = ok, 6 = CONTAMINATED (stop the whole plan), 3 = incomplete
 echo "exit=$?"
-python - <<'PY'
+.venv/bin/python - <<'PY'
 import json
 from pathlib import Path
 ev = [json.loads(l) for l in (Path("runs/b-s0/events.jsonl")).read_bytes().splitlines()]
@@ -141,17 +151,17 @@ the interrupt happens DURING S1 and the resume finishes it.
 
 ```
 # start it; send SIGINT (Ctrl-C) once some cells have finished
-python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
+.venv/bin/python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
     --arms single,indep_verify --repeats 1
-python eval/run.py campaign status --campaign-id b-s1
+.venv/bin/python eval/run.py campaign status --campaign-id b-s1
 
 # resume: the SAME --arms and --repeats must be given again. `--arms` defaults
 # to ALL FIVE and `--repeats` to 2, so omitting them redeclares a 64-cell
 # matrix into this campaign. `--resume` is a bare flag and takes no value.
-python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
+.venv/bin/python eval/run.py campaign --corpus eval/corpus --campaign-id b-s1 \
     --arms single,indep_verify --repeats 1 --resume
-python eval/run.py campaign status --campaign-id b-s1
-python eval/score.py --campaign-dir runs/b-s1 --corpus eval/corpus > runs/b-s1/summary.json
+.venv/bin/python eval/run.py campaign status --campaign-id b-s1
+.venv/bin/python eval/score.py --campaign-dir runs/b-s1 --corpus eval/corpus > runs/b-s1/summary.json
 ```
 
 **S3 — the judged arms, only if S1 is clean.** A separate campaign so its
@@ -159,10 +169,10 @@ ceiling is its own ($64 reserved). `indep_verify` is included as the BASELINE,
 so the 3b-3 and 4-3 paired deltas are computed WITHIN one campaign.
 
 ```
-python eval/run.py campaign --corpus eval/corpus --campaign-id b-s3 \
+.venv/bin/python eval/run.py campaign --corpus eval/corpus --campaign-id b-s3 \
     --arms indep_verify,indep_verify_iter,indep_verify_critique --repeats 1
-python eval/run.py campaign status --campaign-id b-s3
-python eval/score.py --campaign-dir runs/b-s3 --corpus eval/corpus > runs/b-s3/summary.json
+.venv/bin/python eval/run.py campaign status --campaign-id b-s3
+.venv/bin/python eval/score.py --campaign-dir runs/b-s3 --corpus eval/corpus > runs/b-s3/summary.json
 ```
 
 **Cross-campaign comparison is forbidden.** `eval/score.py` takes ONE

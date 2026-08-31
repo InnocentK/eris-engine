@@ -38,31 +38,39 @@ print('|'.join(n for n, w in p.workers.items() if w.transport is Transport.CLI))
     && ! grep -qE "^WARN worker\.($USED)\b" /tmp/pf.out
 chk $? "preflight: exit 0, no FAIL/ERROR, no WARN for a worker this run uses ($USED)"
 
+# Calls the REAL launch-time gate, `launch.preflight_executable`, once per CLI
+# worker - it resolves the pinned path, hashes the realpath and compares with
+# the pin, which is exactly what refuses a cell mid-campaign after money has
+# been spent on earlier ones. It is called rather than re-implemented because
+# the version this replaced re-implemented it WRONG: it asserted that a stale
+# pin makes `load_policy` downgrade the worker to UNPINNED, so it only tested
+# `executable_sha256 == UNPINNED`. `_merge_pins` copies pins.yaml's sha256
+# verbatim and NOTHING hashes the binary at load time, so a stale pin loads as
+# pinned=True. Five deliberately corrupted pins all passed that check
+# (2026-08-31), while the binaries had genuinely changed under it.
 "$PY" - "$POLICY" <<'PY' >/tmp/pins.out 2>&1
 import sys
 sys.path.insert(0, "src")
 from pathlib import Path
-from eris.policy import UNPINNED, load_policy
+from eris.launch import LaunchRefused, preflight_executable
+from eris.policy import load_policy
 from eris.schemas import Transport
 
-# A STALE pin does not raise: `load_policy` downgrades that worker to UNPINNED,
-# and `launch.py` then refuses it - mid-campaign, after money has been spent on
-# earlier cells. So the check is "is any CLI worker UNPINNED after loading",
-# which catches never-pinned and gone-stale alike. Comparing the file's own
-# hashes would MISS the stale case entirely, because the loader has already
-# thrown the mismatched value away.
 bad = []
 for name, w in sorted(load_policy(Path(sys.argv[1])).policy.workers.items()):
     if w.transport is not Transport.CLI:
-        print(f"{name}: {w.transport.value} transport, no executable to pin"); continue
-    if getattr(w, "executable_sha256", UNPINNED) == UNPINNED:
-        print(f"{name}: UNPINNED - never pinned, or the binary changed since. "
-              f"Run `eris policy pin` and re-check"); bad.append(name)
-    else:
-        print(f"{name}: pinned")
+        print(f"{name}: {w.transport.value} transport, no executable to pin")
+        continue
+    try:
+        digest, real = preflight_executable(w)
+    except (LaunchRefused, FileNotFoundError) as exc:
+        print(f"{name}: WOULD BE REFUSED AT LAUNCH - {type(exc).__name__}: {exc}")
+        bad.append(name)
+        continue
+    print(f"{name}: launchable, {real} sha256 {digest[:12]}...")
 sys.exit(1 if bad else 0)
 PY
-chk $? "no CLI worker is UNPINNED (a stale pin refuses at launch, mid-campaign)"
+chk $? "every CLI worker passes the launch-time pin check (stale pin = refusal mid-campaign)"
 
 [ -f "$ENVFILE" ] && grep -q '^XAI_API_KEY=' "$ENVFILE"
 chk $? "$ENVFILE exists and carries XAI_API_KEY (grok refuses at launch without it)"
@@ -93,7 +101,7 @@ bad = []
 for d in corpus_task_dirs(Path("eval/corpus")):
     state = snapshot_matches_files(d)
     if state is None:
-        print(f"{d.name}: NO SNAPSHOT - run `python eval/make_control_snapshot.py eval/corpus --all`")
+        print(f"{d.name}: NO SNAPSHOT - run `.venv/bin/python eval/make_control_snapshot.py eval/corpus --all`")
         bad.append(d.name)
     elif state is False:
         print(f"{d.name}: STALE - snapshot does not match files/; rebuild")
