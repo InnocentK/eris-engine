@@ -227,8 +227,16 @@ That is the worst failure available to a stop mechanism, so the script now emits
 the exact string to paste and it was tested against a spaced `runs_dir`: the
 STOP file lands in the campaign directory and no stray file is created.
 
-The global `<runs_dir>/STOP` is printed too, labelled as the one NOT to use: it
-halts every run using that runs directory, not just this campaign.
+**S0 is stopped differently, and the script says so.** A standalone `run`
+passes `campaign_id=None`, so `arms.stop_file_paths` gives it ONLY the global
+`<runs_dir>/STOP`; a per-run `<runs_dir>/b-s0/STOP` is never read. An earlier
+version printed exactly that command as the way to halt S0 - a file nothing
+looks at, while the only thing that would have worked was the global file the
+same script labelled "do not use". S0 is now documented as: Ctrl-C (it is one
+cell, and the in-flight call finishes first), or the global stop file.
+
+The global `<runs_dir>/STOP` is printed for that purpose and labelled as the one
+NOT to use for a campaign: it halts every run using that runs directory.
 
 ## What will be recorded
 

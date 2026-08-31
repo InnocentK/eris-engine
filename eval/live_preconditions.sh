@@ -5,7 +5,13 @@ set -uo pipefail
 PY=${PY:-.venv/bin/python}
 POLICY=${POLICY:-policies/default.yaml}
 ENVFILE=${ENVFILE:-.env}
-IDS=${IDS:-"b-s0 b-s1 b-s3"}
+# Split, because they are stopped by DIFFERENT mechanisms. A standalone `run`
+# passes campaign_id=None, so `stop_file_paths` gives it ONLY the global
+# `<runs_dir>/STOP`; a per-run STOP file is never read for it. Printing
+# `touch <runs>/b-s0/STOP` as a way to halt S0 named a file nothing looks at.
+CAMPAIGN_IDS=${CAMPAIGN_IDS:-"b-s1 b-s3"}
+SINGLE_RUN_IDS=${SINGLE_RUN_IDS:-"b-s0"}
+IDS="$CAMPAIGN_IDS $SINGLE_RUN_IDS"
 fail=0
 chk() { if [ "$1" -eq 0 ]; then echo "  PASS  $2"; else echo "  FAIL  $2"; fail=1; fi; }
 
@@ -107,14 +113,19 @@ echo
 if [ "$fail" -ne 0 ]; then echo "PRECONDITIONS FAILED - do not start any run"; exit 1; fi
 echo "preconditions passed."
 echo
-echo "To halt a campaign mid-flight, run EXACTLY one of these. The path is"
+echo "To halt a CAMPAIGN mid-flight, run EXACTLY one of these. The path is"
 echo "absolute and quoted, so it works from any directory and survives a"
 echo "runs_dir containing spaces:"
-for id in $IDS; do
+for id in $CAMPAIGN_IDS; do
   echo "    touch $("$PY" -c "import shlex, sys; from pathlib import Path
 print(shlex.quote(str(Path(sys.argv[1]).resolve() / sys.argv[2] / 'STOP')))" "$RUNS" "$id")"
 done
 echo
-echo "NOT $("$PY" -c "import shlex, sys; from pathlib import Path
-print(shlex.quote(str(Path(sys.argv[1]).resolve() / 'STOP')))" "$RUNS") - that is the GLOBAL stop"
-echo "file and halts every run using this runs directory, not just your campaign."
+GLOBAL=$("$PY" -c "import shlex, sys; from pathlib import Path
+print(shlex.quote(str(Path(sys.argv[1]).resolve() / 'STOP')))" "$RUNS")
+echo "A STANDALONE run ($SINGLE_RUN_IDS) is NOT stopped that way: it passes"
+echo "campaign_id=None, so it reads only the global stop file. To halt one:"
+echo "    Ctrl-C  (it is a single cell; the in-flight call finishes first)"
+echo "    or  touch $GLOBAL   <- GLOBAL: halts every run using this runs dir"
+echo
+echo "Do not use $GLOBAL to stop a campaign - it stops everything else too."
