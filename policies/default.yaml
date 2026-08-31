@@ -43,7 +43,11 @@ workers:
     transport: cli
     cli: claude
     provider: anthropic
-    model: null                   # null = CLI default; set to pin a model
+    model: claude-fable-5         # PINNED 2026-08-31. Was `null` (= CLI default), which ran
+                                  # claude-fable-5 anyway: a CLI update could have changed the
+                                  # model under a binary whose hash still matched its pin, the
+                                  # one drift the pin check cannot see. `--model claude-fable-5`
+                                  # was executed against this CLI before pinning (S0-2).
     executable_sha256: UNPINNED
     timeout_s: 600
     max_stdout_bytes: 10000000
@@ -57,7 +61,7 @@ workers:
     transport: cli
     cli: claude
     provider: anthropic
-    model: null
+    model: claude-fable-5         # PINNED 2026-08-31, same reason as `claude` above (S0-2)
     executable_sha256: UNPINNED
     timeout_s: 300                # a judge TIMEOUT is terminal (E8 hang is deterministic)
     max_stdout_bytes: 10000000

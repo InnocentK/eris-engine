@@ -9,8 +9,12 @@ ENVFILE=${ENVFILE:-.env}
 # passes campaign_id=None, so `stop_file_paths` gives it ONLY the global
 # `<runs_dir>/STOP`; a per-run STOP file is never read for it. Printing
 # `touch <runs>/b-s0/STOP` as a way to halt S0 named a file nothing looks at.
-CAMPAIGN_IDS=${CAMPAIGN_IDS:-"b-s1 b-s3"}
-SINGLE_RUN_IDS=${SINGLE_RUN_IDS:-"b-s0"}
+# `${VAR-default}`, NOT `${VAR:-default}`: the colon form substitutes the default
+# for an EMPTY value too, so `SINGLE_RUN_IDS=''` silently became "b-s0" again and
+# the scoped re-check this script PRINTS could not do what it said. Found by
+# running the printed command instead of trusting it (2026-08-31).
+CAMPAIGN_IDS=${CAMPAIGN_IDS-"b-s1 b-s3"}
+SINGLE_RUN_IDS=${SINGLE_RUN_IDS-"b-s0"}
 IDS="$CAMPAIGN_IDS $SINGLE_RUN_IDS"
 fail=0
 chk() { if [ "$1" -eq 0 ]; then echo "  PASS  $2"; else echo "  FAIL  $2"; fail=1; fi; }
@@ -112,10 +116,32 @@ sys.exit(1 if bad else 0)
 PY
 chk $? "every corpus snapshot is built and matches its files/"
 
-collided=""
-for id in $IDS; do [ -e "$RUNS/$id" ] && collided="$collided $id"; done
+# A collision is a real refusal (`RunExists`, exit 2), so it stays a FAIL. But
+# once a run in the default list COMPLETES, this check can never pass again,
+# and an operator who must ignore a FAIL every time has been trained to ignore
+# the gate - the same failure the openai-api scoping above exists to avoid. So
+# a collision reports WHY (finalized vs resumable) and prints the exact scoped
+# re-check for the ids actually about to start.
+collided="" ; free_camp="" ; free_single=""
+for id in $CAMPAIGN_IDS; do
+    if [ -e "$RUNS/$id" ]; then collided="$collided $id"; else free_camp="$free_camp $id"; fi
+done
+for id in $SINGLE_RUN_IDS; do
+    if [ -e "$RUNS/$id" ]; then collided="$collided $id"; else free_single="$free_single $id"; fi
+done
 [ -z "$collided" ]
 chk $? "run ids free${collided:+ (COLLIDES:$collided)}"
+if [ -n "$collided" ]; then
+    for id in $collided; do
+        if [ -e "$RUNS/$id/manifest.json" ]; then
+            echo "        $id: FINALIZED (complete). Its id cannot be reused; nothing to do."
+        else
+            echo "        $id: unfinalized - resume it with \`--resume $id\`, or delete the dir to re-run."
+        fi
+    done
+    echo "        Re-check only what you are about to start:"
+    echo "        CAMPAIGN_IDS='$(echo $free_camp)' SINGLE_RUN_IDS='$(echo $free_single)' bash eval/live_preconditions.sh"
+fi
 
 echo
 if [ "$fail" -ne 0 ]; then echo "PRECONDITIONS FAILED - do not start any run"; exit 1; fi

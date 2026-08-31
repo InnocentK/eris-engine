@@ -406,6 +406,47 @@ assumption-backed, and filed an `evidence_request` to bring README into the
 record — the honest path, and evidence the prompt's rules land. The report must
 not describe `evidence_refs` as a complete provenance record.
 
+### S0-4. Pinning the model, and the two things verifying it exposed
+
+`model: claude-fable-5` is now set for `claude` and `judge` (S0-2). It was
+**executed before being pinned**, not assumed: `build_argv_claude` produced the
+argv, and the real CLI ran it — `modelUsage` names `claude-fable-5`. All four
+families now carry an explicit model, so the panel's lineage is declared rather
+than inherited from whatever each CLI defaults to.
+
+The verification call cost **$0.098324** and returned two facts worth keeping:
+
+* **A pinned model is not the only model in the call.** `modelUsage` listed
+  `claude-fable-5` AND `claude-haiku-4-5-20251001` (899 input / 9 output
+  tokens). The CLI does some of its own work on a second model. Eris records a
+  single `model_executed`, so the ledger names the pinned model and is silent
+  about the auxiliary one. The report may say the arm's *reviewer* model was
+  pinned; it may not say the arm ran one model.
+* **`max_budget_usd` is not a pre-spend cap.** The call was given
+  `--max-budget-usd 0.05` and finished at `total_cost_usd: 0.098324` with
+  `terminal_reason: "budget_exhausted"` — nearly double the cap, because the
+  cap is observed after the fact and cache creation ($0.097 of it) lands in one
+  go. The policy's `max_budget_usd: 1.0` therefore bounds a claude call at
+  roughly-a-dollar, not at a dollar, and the S1 sizing should be read that way.
+
+### S0-5. The gate printed a scoped re-check that could not work
+
+With `b-s0` finalized, the id check FAILs forever, which trains an operator to
+ignore the gate - the failure the openai-api scoping exists to prevent. The
+check now reports whether a collided id is FINALIZED or resumable and prints
+the scoped re-check for the ids actually about to start.
+
+The first version of that printed
+`CAMPAIGN_IDS='b-s1 b-s3' SINGLE_RUN_IDS='' bash eval/live_preconditions.sh`
+and it **did not work**: the script read `${SINGLE_RUN_IDS:-"b-s0"}`, and the
+colon form substitutes the default for an EMPTY value too, so the override was
+discarded and `b-s0` was checked anyway. Fixed to `${SINGLE_RUN_IDS-"b-s0"}`.
+
+Found by running the printed command instead of trusting it. That is the same
+defect class as every stop-command failure in this document - an instruction
+whose EFFECT was never executed - and it survived being written by someone who
+had just written that lesson down two sections earlier.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
