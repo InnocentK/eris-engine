@@ -122,21 +122,40 @@ chk $? "every corpus snapshot is built and matches its files/"
 # the gate - the same failure the openai-api scoping above exists to avoid. So
 # a collision reports WHY (finalized vs resumable) and prints the exact scoped
 # re-check for the ids actually about to start.
-collided="" ; free_camp="" ; free_single=""
+# The RESUME SYNTAX DIFFERS BY RUN KIND, so the collided ids are tracked in two
+# lists rather than one. `run` takes `--resume <RUN_ID>` (a value); `campaign`
+# declares `--resume` as store_true, so `campaign ... --resume b-s1` puts the
+# bare id where the `campaign_command` positional is expected and argparse
+# exits 2 with "invalid choice: 'b-s1' (choose from 'status')". An earlier
+# version of this block printed the run form for EVERY collided id - the same
+# defect the B3 panel raised as finding 2, reintroduced here ten lines after
+# the STOP commands were split by exactly this distinction.
+coll_camp="" ; coll_single="" ; free_camp="" ; free_single=""
 for id in $CAMPAIGN_IDS; do
-    if [ -e "$RUNS/$id" ]; then collided="$collided $id"; else free_camp="$free_camp $id"; fi
+    if [ -e "$RUNS/$id" ]; then coll_camp="$coll_camp $id"; else free_camp="$free_camp $id"; fi
 done
 for id in $SINGLE_RUN_IDS; do
-    if [ -e "$RUNS/$id" ]; then collided="$collided $id"; else free_single="$free_single $id"; fi
+    if [ -e "$RUNS/$id" ]; then coll_single="$coll_single $id"; else free_single="$free_single $id"; fi
 done
+collided="$coll_camp$coll_single"
 [ -z "$collided" ]
 chk $? "run ids free${collided:+ (COLLIDES:$collided)}"
 if [ -n "$collided" ]; then
-    for id in $collided; do
+    for id in $coll_camp; do
         if [ -e "$RUNS/$id/manifest.json" ]; then
-            echo "        $id: FINALIZED (complete). Its id cannot be reused; nothing to do."
+            echo "        $id (campaign): FINALIZED. Its id cannot be reused; nothing to do."
         else
-            echo "        $id: unfinalized - resume it with \`--resume $id\`, or delete the dir to re-run."
+            echo "        $id (campaign): unfinalized - finish it by re-running the SAME command"
+            echo "            with a bare --resume (it takes no value), repeating --arms and"
+            echo "            --repeats, which otherwise default to all five arms at 2 repeats."
+        fi
+    done
+    for id in $coll_single; do
+        if [ -e "$RUNS/$id/manifest.json" ]; then
+            echo "        $id (standalone): FINALIZED. Its id cannot be reused; nothing to do."
+        else
+            echo "        $id (standalone): unfinalized - finish it with \`--resume $id\`, which"
+            echo "            takes the run id as its value and supplies it (drop --run-id)."
         fi
     done
     echo "        Re-check only what you are about to start:"

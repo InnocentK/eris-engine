@@ -466,6 +466,32 @@ defect class as every stop-command failure in this document - an instruction
 whose EFFECT was never executed - and it survived being written by someone who
 had just written that lesson down two sections earlier.
 
+### S0-6. The collision remediation printed the wrong resume syntax for a campaign
+
+Caught by the Codex stop review, not by me. The block added in S0-5 told the
+operator to resume ANY collided id with `--resume <id>`. That is the
+**standalone** form. For a campaign, `--resume` is declared `store_true`, so the
+bare id lands where the `campaign_command` positional is expected:
+
+```
+campaign --campaign-id b-s1 --arms single,indep_verify --repeats 1 --resume b-s1
+  -> exit 2: argument campaign_command: invalid choice: 'b-s1' (choose from 'status')
+```
+
+Verified at the parser, not guessed: `parse_args` refuses that form, accepts a
+bare `--resume` for `campaign`, and accepts `--resume b-s0` for `run`.
+
+This is **B3 panel finding 2 reintroduced** - the finding that the S2 resume
+command "was literally unrunnable (`--resume ...`)" - and it was written ten
+lines after the STOP commands in the same script were split by exactly the
+distinction it ignores. Knowing a distinction and applying it are different
+things, and the only reliable difference is executing the output.
+
+The remediation now tracks collided ids in two lists and prints the form that
+matches the run kind, including the `--arms`/`--repeats` trap on a campaign
+resume. All four branches (campaign/standalone x finalized/unfinalized) were
+exercised against fixture directories before this was written down.
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
