@@ -157,9 +157,15 @@ done
 echo
 GLOBAL=$("$PY" -c "import shlex, sys; from pathlib import Path
 print(shlex.quote(str(Path(sys.argv[1]).resolve() / 'STOP')))" "$RUNS")
-echo "A STANDALONE run ($SINGLE_RUN_IDS) is NOT stopped that way: it passes"
-echo "campaign_id=None, so it reads only the global stop file. To halt one:"
-echo "    Ctrl-C  (it is a single cell; the in-flight call finishes first)"
-echo "    or  touch $GLOBAL   <- GLOBAL: halts every run using this runs dir"
-echo
+# Only printed when there IS a standalone run to stop: with SINGLE_RUN_IDS
+# empty the block rendered "A STANDALONE run () is NOT stopped that way",
+# which is operational text that says nothing, and text that says nothing in a
+# stop procedure is text an operator learns to skip.
+if [ -n "$SINGLE_RUN_IDS" ]; then
+    echo "A STANDALONE run ($SINGLE_RUN_IDS) is NOT stopped that way: it passes"
+    echo "campaign_id=None, so it reads only the global stop file. To halt one:"
+    echo "    Ctrl-C  (it is a single cell; the in-flight call finishes first)"
+    echo "    or  touch $GLOBAL   <- GLOBAL: halts every run using this runs dir"
+    echo
+fi
 echo "Do not use $GLOBAL to stop a campaign - it stops everything else too."
