@@ -1909,7 +1909,7 @@ def test_campaign_and_run_ledgers_are_distinguishable_by_their_start_marker(
 
 def _event_append_sites(
     roots: tuple[Path, ...],
-) -> tuple[dict[str, set[str]], list[tuple[str, str]]]:
+) -> tuple[dict[str, set[str]], list[tuple[str, str, str | None]]]:
     """Every ``<writer>.append(kind, payload)`` under ``roots``.
 
     Returns (literal kinds -> {"module.function"}, dynamic sites). An event
@@ -1938,8 +1938,9 @@ def _event_append_sites(
         return None
 
     class V(ast.NodeVisitor):
-        def __init__(self, module: str) -> None:
+        def __init__(self, module: str, called: set[int]) -> None:
             self.module = module
+            self.called = called  # id() of every Attribute that IS a call target
             self.stack: list[str] = []
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -1953,11 +1954,17 @@ def _event_append_sites(
         def _where(self) -> str:
             return f"{self.module}.{self.stack[-1] if self.stack else '<module>'}"
 
-        def visit_Assign(self, node: ast.Assign) -> None:
-            # `emit = writer.append` detaches the call from the name this scan
-            # matches on, so every later `emit(...)` is invisible. None exists;
-            # if one appears it must be seen, not silently skipped.
-            if isinstance(node.value, ast.Attribute) and node.value.attr == "append":
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            # A REFERENCE to `.append` that is not immediately called detaches
+            # the method from every later call site, which this scan then
+            # cannot see. Enumerating the ways to write one is what failed
+            # before: the previous version matched `emit = w.append`
+            # (`ast.Assign`) alone, so an annotated assignment, a tuple target,
+            # a walrus, a default argument, a `return`, a dict literal and
+            # `partial(w.append, ...)` all walked past it (stop review,
+            # 2026-08-31). The structural question - is this reference called
+            # right here? - has no shapes to enumerate, so it has none to miss.
+            if node.attr == "append" and id(node) not in self.called:
                 dynamic.append((f"{self._where}:{node.lineno}", ast.unparse(node), None))
             self.generic_visit(node)
 
@@ -2019,7 +2026,13 @@ def _event_append_sites(
     for root in roots:
         for f in sorted(root.rglob("*.py")):
             rel = f.relative_to(REPO_ROOT).as_posix()
-            V(rel).visit(ast.parse(f.read_text(encoding="utf-8")))
+            tree = ast.parse(f.read_text(encoding="utf-8"))
+            called = {
+                id(n.func)
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            }
+            V(rel, called).visit(tree)
     return literal, dynamic
 
 

@@ -820,6 +820,48 @@ by recognising a shape, enumerate the shapes that reach the same behaviour, and
 refuse the ones you cannot read.** And check the checker's own failure mode: an
 exit code cannot distinguish a test that failed from a test that broke.
 
+### S0-15. Enumerating detachment shapes, instead of asking whether the reference is called
+
+Caught by the Codex stop review, on the fix for S0-14. That round added a
+refusal for a detached bound method and implemented it as `ast.Assign` whose
+value is an `Attribute` named `append` - which catches `emit = w.append` and
+nothing else. Measured against the old predicate, five other ways to write the
+same detachment walked straight past it:
+
+| shape | old rule | now |
+|---|---|---|
+| `_e: object = w.append` (annotated) | MISSED | CAUGHT |
+| `_e, _z = w.append, 1` (tuple target) | MISSED | CAUGHT |
+| `_z = (_e := w.append)` (walrus) | MISSED | CAUGHT |
+| `_h = {"x": w.append}` (dict literal) | MISSED | CAUGHT |
+| `map(w.append, [])` (passed as argument) | MISSED | CAUGHT |
+| `_e = w.append` (plain assign) | CAUGHT | CAUGHT |
+
+S0-14 said the rule was "enumerate the shapes that reach the same behaviour",
+and that is what produced this: an enumeration is a list, and a list of syntax
+has no reason to be complete. The replacement asks a structural question with no
+shapes in it - **is this reference to `.append` called right here?** Every way of
+detaching a method, including ones nobody has written yet, is a reference that is
+not a call. There is nothing left to enumerate, so there is nothing left to miss.
+
+It also subsumes what it replaced: the `ast.Assign` special case is gone, not
+supplemented. Zero uncalled `.append` references exist in `src/` and `eval/`
+today, so the rule costs nothing and any future one - including a plain
+`list.append` passed to `map` - fails with a message saying to call it
+explicitly.
+
+Nine shapes mutation-checked with the assertion actually firing and no crash
+(the five above, plus plain assign, `getattr`, positional splat, and a literal
+marker for the site-map half). Baseline passes; all reverted, `git diff` clean.
+
+**Ten rounds.** The through-line finally has a name: I keep answering "which
+cases?" when the question is "what makes a case?". Every round I produced a
+correct list and the next round found the item that was not on it - shapes of
+argument, shapes of call, shapes of reference. A list of cases is a guess about
+the future written in the syntax of the present. The two rules that have
+actually held are structural and dull: **refuse what you cannot read**, and
+**ask what makes something an instance rather than which instances exist.**
+
 ## Panel review (B3) — done, 2026-08-30
 
 Three families, each a different lens, each given this plan and the repository:
