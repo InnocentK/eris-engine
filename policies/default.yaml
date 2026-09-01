@@ -52,21 +52,31 @@ workers:
     timeout_s: 600
     max_stdout_bytes: 10000000
     max_stderr_bytes: 1000000
-    # RAISED from 1.0 on 2026-08-31, sized from COMPLETED calls over b-s1 and
-    # b-s3 (60 of them): claude/propose mean $0.573 max $0.770, claude/critique
-    # mean $0.803 max $0.931, judge/adjudicate mean $0.722 max $0.920, grok
-    # ~$0.08. The largest completed call anywhere is $0.931.
-    # (An earlier version of this note quoted $1.038 and $1.132 as call costs.
-    # Those are the two ABORTED calls' partial spend, not what a call costs.)
-    # At 1.0 a critic call and an adjudicator call on plan-sized
-    # documents were ABORTED mid-flight - `error_max_budget_usd` /
-    # `budget_exhausted` - which cost arm 4 both of its plan cells and left
-    # b-s3's paired comparison uncomputable. Note the cap is observed AFTER a
-    # call, not before it: calls at $1.038 and $1.132 COMPLETED under a $1 cap
-    # by up to one indivisible charge: the two aborts reported $1.038 and $1.132
-    # against a $1.00 cap (+3.8%, +13.2%), and S0-4's $0.05 cap returned $0.098
-    # (+97%, one $0.097 cache creation exceeding the cap by itself).
-    # $4.00 is ~4.3x the largest completed call - room for the two stages that
+    # RAISED from 1.0 on 2026-08-31, sized from the 46 calls EXECUTED across
+    # b-s1 and b-s3 - excluding 14 cache replays, which re-attribute a call
+    # already counted, and the 2 aborted calls, whose spend is partial:
+    #   claude/propose     n=10  mean $0.583  max $0.770
+    #   claude/critique    n= 3  mean $0.803  max $0.931
+    #   judge/adjudicate   n=14  mean $0.722  max $0.920
+    #   grok/propose       n=16  mean $0.078  max $0.091
+    #   grok/critique      n= 3  mean $0.080  max $0.104
+    # The largest call ever executed here is $0.931.
+    # This note has been wrong twice, in opposite directions, and both times the
+    # error was the SET rather than the arithmetic: it first quoted $1.038 and
+    # $1.132 as call costs (those are the aborted calls' partial spend), then
+    # counted 60 "completed calls" by taking every cost record whose invocation
+    # finished ok - 14 of which are replays, not calls. Say which records are in
+    # the set, or the mean is of something nobody named.
+    # At 1.0 a critic call and an adjudicator call on plan-sized documents were
+    # ABORTED mid-flight - `error_max_budget_usd` / `budget_exhausted` - which
+    # cost arm 4 both of its plan cells and left b-s3's paired comparison
+    # uncomputable.
+    # The cap is observed AFTER a charge, not before one, so a call aborts PAST
+    # its limit by up to one indivisible charge. Those two aborts reported
+    # $1.038 and $1.132 against a $1.00 cap (+3.8%, +13.2%), and S0-4's $0.05
+    # cap returned $0.098 (+97%, one $0.097 cache creation exceeding the cap by
+    # itself). No call has ever COMPLETED above its cap.
+    # $4.00 is ~4.3x the largest executed call - room for the two stages that
     # wanted more than $1. It does NOT make per_run_usd hard: see
     # `Policy._call_cap_fits_the_reservation` for what the ceiling is worth.
     max_budget_usd: 4.0
