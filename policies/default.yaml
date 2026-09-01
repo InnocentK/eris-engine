@@ -52,7 +52,18 @@ workers:
     timeout_s: 600
     max_stdout_bytes: 10000000
     max_stderr_bytes: 1000000
-    max_budget_usd: 1.0
+    # RAISED from 1.0 on 2026-08-31, sized from measured call costs over b-s1
+    # and b-s3 (48 known calls): claude/propose mean $0.583 max $0.770,
+    # claude/critique mean $0.862 max $1.038, judge/adjudicate mean $0.749 max
+    # $1.132. At 1.0 a critic call and an adjudicator call on plan-sized
+    # documents were ABORTED mid-flight - `error_max_budget_usd` /
+    # `budget_exhausted` - which cost arm 4 both of its plan cells and left
+    # b-s3's paired comparison uncomputable. Note the cap is observed AFTER a
+    # call, not before it: calls at $1.038 and $1.132 COMPLETED under a $1 cap
+    # (see also S0-4, where a $0.05 cap returned a $0.098 call). $4.00 is ~3.5x
+    # the largest call ever observed here - room for the two stages that wanted
+    # more than $1, while still stopping a runaway well inside per_run_usd $20.
+    max_budget_usd: 4.0
     tools: [Read, Grep, Glob]
     env:
       DISABLE_AUTOUPDATER: "1"
@@ -66,7 +77,7 @@ workers:
     timeout_s: 300                # a judge TIMEOUT is terminal (E8 hang is deterministic)
     max_stdout_bytes: 10000000
     max_stderr_bytes: 1000000
-    max_budget_usd: 1.0
+    max_budget_usd: 4.0            # raised with `claude` above, same evidence
     tools: []
     env:
       DISABLE_AUTOUPDATER: "1"
