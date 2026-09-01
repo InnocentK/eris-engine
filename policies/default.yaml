@@ -189,7 +189,16 @@ containment: null
 
 budgets:
   per_run_usd: 20.0
-  per_call_usd: 2.0               # pessimistic reservation for a call with no reported cost
+  # Reservation booked for a call with no reported cost, AND the pre-call
+  # margin `BudgetLedger.precheck` leaves against per_run_usd. Those are two
+  # jobs for one number, and the second one binds: a capped worker whose
+  # max_budget_usd exceeds this can be admitted with this much headroom and
+  # then spend more, carrying the cell past per_run_usd with nothing to
+  # refuse it. Raised 2.0 -> 4.0 with claude/judge's cap; `Policy.
+  # _call_cap_fits_the_reservation` now refuses a policy where a cap exceeds
+  # it. Cost note: this DOUBLES what a missing-cost call reserves, so a
+  # four-family campaign reserves 2x what the S3 sizing table says.
+  per_call_usd: 4.0
   per_campaign_usd: 200.0
 
 # Snapshot sanitization (eris.sanitize) for workers with `sanitize_snapshot: true`.

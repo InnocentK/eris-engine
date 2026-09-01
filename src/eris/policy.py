@@ -255,6 +255,44 @@ class Policy(_Strict):
         return self
 
     @model_validator(mode="after")
+    def _call_cap_fits_the_reservation(self) -> Policy:
+        """A capped worker's call must fit inside the pre-call budget margin.
+
+        `BudgetLedger.precheck` admits a call when
+        `committed + per_call_usd <= run_ceiling_usd`, and the ceiling is tested
+        BEFORE a call and never after. So a worker whose `max_budget_usd`
+        exceeds `per_call_usd` can be admitted with `per_call_usd` of headroom
+        and then spend more than that, carrying the cell past `per_run_usd`
+        without anything refusing - the ceiling stops being a bound and becomes
+        a suggestion.
+
+        This fired for real: raising claude's cap from $1 to $4 against a $2
+        `per_call_usd` was committed on 2026-08-31 with the claim that a runaway
+        would still stop "well inside per_run_usd $20", which was not true of
+        the code. Refused at load rather than left as two numbers someone has to
+        remember to keep in step.
+
+        Uncapped workers (`max_budget_usd: null` - codex, grok, agy) are not
+        bounded by anything here, which this validator cannot fix and does not
+        pretend to: `per_call_usd` is what Eris BOOKS for them, not a limit they
+        obey.
+        """
+        capped = {
+            name: w.max_budget_usd
+            for name, w in self.workers.items()
+            if w.max_budget_usd is not None and w.max_budget_usd > self.budgets.per_call_usd
+        }
+        if capped:
+            worst = ", ".join(f"{n}={v}" for n, v in sorted(capped.items()))
+            raise ValueError(
+                f"per_call_usd={self.budgets.per_call_usd} is smaller than max_budget_usd for "
+                f"{worst}. `precheck` reserves per_call_usd before admitting a call, so such a "
+                "call can be admitted and then spend past per_run_usd with nothing to refuse it. "
+                "Raise per_call_usd to at least the largest cap, or lower the cap."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _cross_checks(self) -> Policy:
         for name, w in self.workers.items():
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):

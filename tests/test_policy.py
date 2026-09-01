@@ -522,3 +522,41 @@ def test_containment_declaration_is_refused_until_a_mechanism_exists(tmp_path: P
         load_policy(write(tmp_path, minimal_policy(containment="container")))
     # the unset case still loads
     assert load_policy(write(tmp_path, minimal_policy())).policy.containment is None
+
+
+def test_a_call_cap_larger_than_the_reservation_is_refused(tmp_path: Path) -> None:
+    """`per_call_usd` is the pre-call margin, so no cap may exceed it.
+
+    `BudgetLedger.precheck` admits a call when `committed + per_call_usd <=
+    run_ceiling_usd`, and the ceiling is tested BEFORE a call, never after. A
+    worker whose `max_budget_usd` is larger than `per_call_usd` can therefore be
+    admitted with that much headroom and then spend more, carrying the cell past
+    `per_run_usd` with nothing to refuse it.
+
+    Raising claude's cap from $1 to $4 against a $2 `per_call_usd` was committed
+    on 2026-08-31 with the claim that a runaway would still stop "well inside
+    per_run_usd $20". The code did not say that. Two numbers that must move
+    together are a refusal, not a thing to remember.
+    """
+    raw = yaml.safe_load(REPO_POLICY.read_text(encoding="utf-8"))
+    raw["budgets"]["per_call_usd"] = 2.0
+    raw["workers"]["claude"]["max_budget_usd"] = 4.0
+    bad = tmp_path / "cap-too-big.yaml"
+    bad.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(PolicyError, match="smaller than max_budget_usd"):
+        load_policy(bad)
+
+    # Equal is fine: the margin exactly covers the worst admitted call.
+    raw["budgets"]["per_call_usd"] = 4.0
+    ok = tmp_path / "cap-equal.yaml"
+    ok.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    assert load_policy(ok).policy.budgets.per_call_usd == 4.0
+
+    # An UNCAPPED worker is not bounded by this and must not be refused for it -
+    # `per_call_usd` is what Eris books for such a worker, not a limit it obeys.
+    raw["budgets"]["per_call_usd"] = 1.0
+    raw["workers"]["claude"]["max_budget_usd"] = None
+    raw["workers"]["judge"]["max_budget_usd"] = None
+    unc = tmp_path / "uncapped.yaml"
+    unc.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    assert load_policy(unc).policy.budgets.per_call_usd == 1.0
