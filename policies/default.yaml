@@ -67,16 +67,24 @@ workers:
     #     16  executed ok, NO cost         <- codex/agy in b-s1; uncapped, and
     #                                         invisible to any figure here
     #      2  aborted (budget_tripped)     <- partial spend, not a call cost
-    #      2  failed (interrupted)         <- no cost reported
+    #      2  failed, and NOT two of a kind:
+    #           1  agy in b-s1, 'agy: timeout waiting for response', which
+    #              retried and succeeded - so one logical call booked $2 TWICE
+    #           1  grok in b-s3, killed by the deliberate SIGINT
+    #         Neither reported a cost, but Eris booked per_call_usd for each
+    #         (counted, estimated), so both ARE in committed spend
     #     14  cache replays                <- re-attribute a call already counted
     #
-    # This note has now been wrong three times, always about WHICH RECORDS, never
-    # about the arithmetic: it quoted the aborted partials as call costs; then
-    # counted 60 "completed calls" including 14 replays; then called 46 "the
-    # calls executed" when 62 executed and 16 of those report no cost. The
-    # instruction that would have prevented all three is to enumerate the
-    # population exhaustively, as above, so a dropped class has to be written
-    # down to be dropped.
+    # This note has now been wrong FOUR times, never about the arithmetic:
+    #   1. quoted the two aborted partials as call costs
+    #   2. counted 60 "completed calls", 14 of them replays
+    #   3. called 46 "the calls executed" when 62 executed, 16 reporting no cost
+    #   4. labelled both failures "interrupted" when one is an agy TIMEOUT
+    # The first three are the same mistake - which records are in the set - and
+    # enumerating the population fixed them. The fourth survived that fix,
+    # because enumerating a class does not check that its LABEL is true of every
+    # member: the count was right and the name was wrong. Both are needed, and
+    # the only thing that has caught either is reading the records themselves.
     # At 1.0 a critic call and an adjudicator call on plan-sized documents were
     # ABORTED mid-flight - `error_max_budget_usd` / `budget_exhausted` - which
     # cost arm 4 both of its plan cells and left b-s3's paired comparison
