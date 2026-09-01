@@ -537,6 +537,12 @@ def test_a_call_cap_larger_than_the_reservation_is_refused(tmp_path: Path) -> No
     on 2026-08-31 with the claim that a runaway would still stop "well inside
     per_run_usd $20". The code did not say that. Two numbers that must move
     together are a refusal, not a thing to remember.
+
+    What this pins is the DESIGNED gap only. The vendor cap is observed after a
+    charge, so a call aborts past its limit by up to one indivisible charge -
+    measured at +3.8% and +13.2% on a $1.00 cap here. `per_run_usd` stays a soft
+    bound and `Policy._call_cap_fits_the_reservation` says so; this test does
+    not claim otherwise, and there is nothing here that could enforce it.
     """
     raw = yaml.safe_load(REPO_POLICY.read_text(encoding="utf-8"))
     raw["budgets"]["per_call_usd"] = 2.0

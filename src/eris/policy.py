@@ -256,21 +256,33 @@ class Policy(_Strict):
 
     @model_validator(mode="after")
     def _call_cap_fits_the_reservation(self) -> Policy:
-        """A capped worker's call must fit inside the pre-call budget margin.
+        """No capped worker may be admitted with less headroom than its cap.
 
         `BudgetLedger.precheck` admits a call when
         `committed + per_call_usd <= run_ceiling_usd`, and the ceiling is tested
         BEFORE a call and never after. So a worker whose `max_budget_usd`
         exceeds `per_call_usd` can be admitted with `per_call_usd` of headroom
         and then spend more than that, carrying the cell past `per_run_usd`
-        without anything refusing - the ceiling stops being a bound and becomes
-        a suggestion.
+        without anything refusing.
 
         This fired for real: raising claude's cap from $1 to $4 against a $2
         `per_call_usd` was committed on 2026-08-31 with the claim that a runaway
         would still stop "well inside per_run_usd $20", which was not true of
-        the code. Refused at load rather than left as two numbers someone has to
-        remember to keep in step.
+        the code.
+
+        WHAT THIS DOES NOT BUY. It closes the DESIGNED gap; it does not make
+        `per_run_usd` a hard ceiling, because the vendor cap is not a hard cap
+        either. `--max-budget-usd` is observed after a charge, so a call aborts
+        PAST its limit by up to one indivisible charge. Measured here: two calls
+        aborted at a $1.00 cap reporting $1.038 and $1.132 (+3.8%, +13.2%), and
+        in S0-4 a $0.05 cap returned $0.098 (+97%, where a single $0.097 cache
+        creation exceeded the whole cap on its own). No COMPLETED call has ever
+        exceeded its cap - the largest is $0.931 - so the residual is the
+        overshoot on an abort, not a multiple of the cap. `per_run_usd` is
+        therefore a soft bound, exceedable by roughly that overshoot per
+        admitted call. Stated rather than asserted away, because an earlier
+        version of this docstring claimed the call "must fit inside" the margin,
+        which the repository's own evidence contradicts.
 
         Uncapped workers (`max_budget_usd: null` - codex, grok, agy) are not
         bounded by anything here, which this validator cannot fix and does not
