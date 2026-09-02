@@ -510,23 +510,23 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     )
     assert iv["attempts"] >= 2 and iv["wall_ms"] is not None and iv["wall_ms"] >= 0
     assert iv["containment"] is None and iv["propose_keys"] == ivc["propose_keys"]
-    # Neither pair is a measurement, for two different reasons.
+    # 3b-3 PAIRS, and is annotated. `indep_verify_iter` spawned nothing here -
+    # 0 invocations, 2 replays of `indep_verify`'s - because the judge requested
+    # no evidence and `adjudicate_iter` broke out of its loop on the first pass.
+    # Its deltas are therefore zero by construction, and `treatment_executed_no
+    # _calls` says so. It is NOT dropped: whether the arm executed anything is
+    # an outcome of the treatment, so refusing those rows would keep the cells
+    # where the mechanism engaged and discard the ones where it did not, biasing
+    # the estimate upward. Zero is a measurement.
     #
-    # 3b-3: `indep_verify_iter` SPAWNED NOTHING here - 0 invocations, 2 replays
-    # of `indep_verify`'s - because the judge requested no evidence and
-    # `adjudicate_iter` broke out of its loop on the first pass. This assertion
-    # used to read `paired is True`, so the test blessed a delta between an arm
-    # and a byte copy of itself; b-s3b showed the same shape in production, with
-    # `delta_cost_spent_usd` reading -$1.02 to -$1.56 as though the arm that made
-    # no calls were the cheaper one.
-    #
-    # 4-3: its treatment arm's adjudication is malformed, so any delta would be
-    # confounded with the malformation rather than measuring critique.
+    # 4-3 does not pair: its treatment arm's adjudication is malformed, so any
+    # delta would be confounded with the malformation rather than measuring
+    # critique - a confound, not an outcome, which is why that one is refused.
     pairs = {p["pair"]: p for p in summary["paired"]}
     assert set(pairs) == {"3b-3", "4-3"}
-    assert pairs["3b-3"]["paired"] is False
-    assert "executed no calls of its own" in pairs["3b-3"]["reason"]
-    assert "delta_recall" not in pairs["3b-3"]
+    assert pairs["3b-3"]["paired"] is True
+    assert pairs["3b-3"]["treatment_executed_no_calls"] is True
+    assert pairs["3b-3"]["delta_wrong_accept"] == 0
     assert pairs["4-3"]["paired"] is False and "validator errors" in pairs["4-3"]["reason"]
     assert "delta_recall" not in pairs["4-3"]  # no delta is emitted for an unpaired cell
     per_arm = summary["per_arm"]
@@ -2892,6 +2892,9 @@ def test_a_paired_delta_marks_spent_cost_as_order_dependent(tmp_path: Path) -> N
     pair = next(p for p in summary["paired"] if p["pair"] == "4-3")
 
     assert pair["paired"] is True, pair.get("reason")
+    # The other value of the annotation: arm 4 replayed the proposal but DID
+    # spawn its own critique and adjudication, so it is not a no-op replay.
+    assert pair["treatment_executed_no_calls"] is False
     assert pair["delta_cost_spent_is_order_dependent"] is True, (
         "arm 4 replayed the proposal arm 3 paid for, so its spent cost omits "
         "that call and the spent delta flatters it"

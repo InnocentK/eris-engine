@@ -1472,24 +1472,6 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                     "output bytes from the base arm (or recorded none)"
                 )
                 entry["unshared_propose_keys"] = differing
-            elif s_treat.executed_invocations == 0:
-                # The treatment SPAWNED NOTHING: every invocation was replayed
-                # from cache, so this cell is a byte copy of the base arm's and
-                # the delta is definitionally zero. Reporting it as a measured
-                # zero says "the treatment changed nothing" where the truth is
-                # "the treatment did nothing" - and its cost columns are worse
-                # than useless, since `delta_cost_spent_usd` then reads as a
-                # large SAVING (b-s3b: -$1.02 to -$1.56 for an arm that made no
-                # calls) while `delta_cost_attributed_usd` correctly reads 0.
-                # Observed in b-s3b: `indep_verify_iter` replayed all 12 of its
-                # invocations from `indep_verify`, because the judge requested
-                # no evidence and `adjudicate_iter` broke out of its loop on the
-                # first pass. The arms are then the same run, not two runs.
-                entry["paired"] = False
-                entry["reason"] = (
-                    "treatment executed no calls of its own: every invocation was replayed "
-                    "from cache, so this pair compares the base arm with a copy of itself"
-                )
             elif (s_treat.validator_errors or s_base.validator_errors) or (
                 s_treat.exclusion == "validator_unknown" or s_base.exclusion == "validator_unknown"
             ):
@@ -1533,6 +1515,22 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                 entry["delta_cost_spent_is_order_dependent"] = bool(
                     s_treat.replayed_invocations or s_base.replayed_invocations
                 )
+                # The treatment made no call of its own: every invocation was
+                # replayed from the base arm, so every delta above is zero BY
+                # CONSTRUCTION. b-s3b's `indep_verify_iter` did this on all four
+                # tasks - the judge requested no evidence, so `adjudicate_iter`
+                # broke out of its loop on the first pass and the arm reduced to
+                # `indep_verify`.
+                #
+                # ANNOTATED, NOT DROPPED. An earlier version refused to pair
+                # these rows, which is post-treatment selection: whether the arm
+                # executed anything is an OUTCOME of the treatment, so filtering
+                # on it keeps the cells where the mechanism engaged and discards
+                # the ones where it did not - exactly the subset most likely to
+                # show an effect, and the estimate is biased upward by the
+                # dropping. A cell where the treatment did nothing has a delta of
+                # zero, and zero is a measurement. It belongs in the mean.
+                entry["treatment_executed_no_calls"] = s_treat.executed_invocations == 0
             out.append(entry)
     return out
 
