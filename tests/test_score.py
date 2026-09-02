@@ -31,6 +31,7 @@ from eval.score import (
     match_findings,
     paired_deltas,
     read_cell,
+    run_health,
     score_campaign,
     task_is_scored,
 )
@@ -592,6 +593,7 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -916,6 +918,7 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -1131,6 +1134,7 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -1290,6 +1294,7 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -1413,6 +1418,7 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -1625,6 +1631,7 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -1714,6 +1721,7 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             post_scan_errors=0,
             orphan_invocations=0,
             executed_invocations=1,
+            attempted_invocations=1,
             replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
@@ -2007,6 +2015,7 @@ def _cs(**over: Any) -> CellScore:
         post_scan_errors=0,
         orphan_invocations=0,
         executed_invocations=1,
+        attempted_invocations=1,
         replayed_invocations=0,
         downgrades_n=0,
         rulings_n=0,
@@ -2900,3 +2909,95 @@ def test_a_paired_delta_marks_spent_cost_as_order_dependent(tmp_path: Path) -> N
         "that call and the spent delta flatters it"
     )
     assert "delta_cost_attributed_usd" in pair
+
+
+def test_a_treatment_whose_calls_failed_is_not_a_no_op_replay(tmp_path: Path) -> None:
+    """`treatment_executed_no_calls` must mean "spawned nothing", not "produced
+    nothing".
+
+    The annotation was first keyed on `executed_invocations`, which counts only
+    invocations that finished OK. An arm whose calls all failed - or were
+    aborted on budget, which b-s3 saw twice - has zero of those while having
+    spawned, run and paid for work. Calling that a no-op replay overclaims: its
+    deltas are confounded by the failures, which is a different thing from being
+    zero by construction, and it would have carried the "the treatment did
+    nothing" reading into a report about an arm that did quite a lot and lost it.
+    """
+    from dataclasses import dataclass, field
+
+    from eris.ledger import LedgerView
+    from eris.redact import Redactor
+    from eris.writer import RunWriter
+
+    @dataclass
+    class Stub:
+        """`run_health` reads only `view` and `manifest`."""
+
+        view: LedgerView
+        manifest: dict[str, Any] = field(default_factory=dict)
+
+    d = tmp_path / "cell"
+    with RunWriter(d, Redactor(), run_id="cell") as w:
+        w.append("run.started", {"eris_version": "0.0.0"})
+        # spawned by this cell, and it failed
+        w.append(
+            "invocation.finished",
+            {"invocation_id": "inv-a", "worker_id": "grok", "status": "failed", "attempt": 1},
+        )
+        # a replay, which is not a call this cell made
+        w.append(
+            "invocation.finished",
+            {
+                "invocation_id": "inv-b",
+                "worker_id": "claude",
+                "status": "ok",
+                "attempt": 1,
+                "reused_from": "inv-origin",
+            },
+        )
+    health = run_health(Stub(LedgerView.from_path(d / "events.jsonl")))
+
+    assert health["executed_invocations"] == 0, "nothing finished ok"
+    assert health["attempted_invocations"] == 1, "but one call WAS spawned by this cell"
+    assert health["replayed_invocations"] == 1
+
+
+def test_the_no_op_annotation_reads_attempted_calls_not_successful_ones() -> None:
+    """A treatment whose calls FAILED is not a no-op replay.
+
+    `treatment_executed_no_calls` was first keyed on `executed_invocations`,
+    which requires status ok. An arm that spawned two calls and lost both has
+    zero of those, and would have been annotated "the treatment did nothing" -
+    in a report about an arm that did quite a lot and failed. Its deltas are
+    confounded by the failures, which is not the same as being zero by
+    construction, and the two want different readings.
+
+    Driven through `paired_deltas` rather than `run_health`, because what needs
+    pinning is which counter the ANNOTATION reads: a unit test over the counters
+    passes happily while the annotation reads the wrong one.
+    """
+    same = ["a" * 64]
+    shared = {k: ["sha-" + k] for k in same}
+
+    def cell(arm: str, executed: int, attempted: int) -> CellScore:
+        return _cs(
+            run_id=f"r-{arm}",
+            arm=arm,
+            arm_key=arm,
+            propose_keys=same,
+            propose_blobs=shared,
+            executed_invocations=executed,
+            attempted_invocations=attempted,
+        )
+
+    # treatment spawned two calls and lost both: NOT a no-op
+    failed = paired_deltas([cell("indep_verify", 1, 1), cell("indep_verify_iter", 0, 2)])
+    row = next(r for r in failed if r["pair"] == "3b-3")
+    assert row["paired"] is True, row.get("reason")
+    assert row["treatment_executed_no_calls"] is False
+
+    # treatment spawned nothing at all: a no-op replay
+    replayed = paired_deltas([cell("indep_verify", 1, 1), cell("indep_verify_iter", 0, 0)])
+    row = next(r for r in replayed if r["pair"] == "3b-3")
+    assert row["paired"] is True, row.get("reason")
+    assert row["treatment_executed_no_calls"] is True

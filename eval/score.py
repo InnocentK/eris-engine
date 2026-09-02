@@ -555,6 +555,13 @@ def run_health(cell: CellData) -> dict[str, Any]:
         "executed_invocations": sum(
             1 for p in finished if not p.get("reused_from") and p.get("status") == "ok"
         ),
+        # Calls the cell ATTEMPTED itself, whatever became of them. Distinct
+        # from `executed_invocations`, which requires status ok: an arm whose
+        # calls all failed, or were aborted on budget, has zero of THOSE while
+        # having spawned, run and paid for work. Labelling it a no-op replay
+        # would overclaim - its deltas are confounded by the failures, which is
+        # a different thing from being zero by construction.
+        "attempted_invocations": sum(1 for p in finished if not p.get("reused_from")),
         "replayed_invocations": sum(1 for p in finished if p.get("reused_from")),
     }
 
@@ -850,6 +857,7 @@ class CellScore:
     cost_spent_usd: float
     cost_attributed_usd: float
     executed_invocations: int
+    attempted_invocations: int
     replayed_invocations: int
     cost_by_stage_spent: dict[str, float]
     cost_by_stage_attributed: dict[str, float]
@@ -1156,6 +1164,7 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         post_scan_errors=int(health["post_scan_errors"]),
         orphan_invocations=int(health["orphan_invocations"]),
         executed_invocations=int(health["executed_invocations"]),
+        attempted_invocations=int(health["attempted_invocations"]),
         replayed_invocations=int(health["replayed_invocations"]),
         downgrades_n=enforced.downgrades if enforced is not None else 0,
         rulings_n=len(enforced.rulings) if enforced is not None else 0,
@@ -1530,7 +1539,10 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                 # show an effect, and the estimate is biased upward by the
                 # dropping. A cell where the treatment did nothing has a delta of
                 # zero, and zero is a measurement. It belongs in the mean.
-                entry["treatment_executed_no_calls"] = s_treat.executed_invocations == 0
+                # ATTEMPTED, not executed: a treatment whose calls all failed
+                # spawned work and is not a no-op replay, even though it
+                # produced no ok invocation.
+                entry["treatment_executed_no_calls"] = s_treat.attempted_invocations == 0
             out.append(entry)
     return out
 
