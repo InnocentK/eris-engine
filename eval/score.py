@@ -555,13 +555,24 @@ def run_health(cell: CellData) -> dict[str, Any]:
         "executed_invocations": sum(
             1 for p in finished if not p.get("reused_from") and p.get("status") == "ok"
         ),
-        # Calls the cell ATTEMPTED itself, whatever became of them. Distinct
-        # from `executed_invocations`, which requires status ok: an arm whose
-        # calls all failed, or were aborted on budget, has zero of THOSE while
-        # having spawned, run and paid for work. Labelling it a no-op replay
-        # would overclaim - its deltas are confounded by the failures, which is
-        # a different thing from being zero by construction.
-        "attempted_invocations": sum(1 for p in finished if not p.get("reused_from")),
+        # Calls the cell ATTEMPTED itself, counted from `invocation.spawned`,
+        # which is written only when a process group is actually started.
+        #
+        # Distinct from `executed_invocations`, which requires status ok: an arm
+        # whose calls all failed, or were aborted mid-flight by the vendor's own
+        # cap, has zero of THOSE while having spawned, run and paid for work.
+        # Labelling it a no-op replay would overclaim.
+        #
+        # And distinct from "non-replay `invocation.finished`", which was the
+        # first definition and counts calls that were never made: `retry.py`
+        # prechecks the budget "before EVERY spawn ... nothing is spawned on a
+        # trip" and then still records an attempt, so an Eris budget trip leaves
+        # a finished record for a call that never ran. Counting it would say the
+        # treatment tried, in precisely the case where it was refused before
+        # trying. No such trip occurs in b-s0/b-s1/b-s3/b-s3b - spawned and
+        # non-replay-finished agree on every cell there - so this is a latent
+        # defect, fixed on the code rather than on an observation.
+        "attempted_invocations": len(cell.view.of_kind("invocation.spawned")),
         "replayed_invocations": sum(1 for p in finished if p.get("reused_from")),
     }
 

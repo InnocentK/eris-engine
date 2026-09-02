@@ -2941,8 +2941,26 @@ def test_a_treatment_whose_calls_failed_is_not_a_no_op_replay(tmp_path: Path) ->
         w.append("run.started", {"eris_version": "0.0.0"})
         # spawned by this cell, and it failed
         w.append(
+            "invocation.spawned",
+            {"idempotency_key": "k" * 64, "pgid": 4242, "stage": "propose", "worker_id": "grok"},
+        )
+        w.append(
             "invocation.finished",
             {"invocation_id": "inv-a", "worker_id": "grok", "status": "failed", "attempt": 1},
+        )
+        # An Eris budget PRECHECK trip: `retry.py` records an attempt without
+        # spawning anything ("nothing is spawned on a trip"), so this leaves a
+        # non-replay `invocation.finished` for a call that never ran. Counting
+        # it as attempted would say the treatment tried, in exactly the case
+        # where it was refused before trying.
+        w.append(
+            "invocation.finished",
+            {
+                "invocation_id": "inv-c",
+                "worker_id": "grok",
+                "status": "budget_tripped",
+                "attempt": 1,
+            },
         )
         # a replay, which is not a call this cell made
         w.append(
@@ -2958,7 +2976,10 @@ def test_a_treatment_whose_calls_failed_is_not_a_no_op_replay(tmp_path: Path) ->
     health = run_health(Stub(LedgerView.from_path(d / "events.jsonl")))
 
     assert health["executed_invocations"] == 0, "nothing finished ok"
-    assert health["attempted_invocations"] == 1, "but one call WAS spawned by this cell"
+    assert health["attempted_invocations"] == 1, (
+        "exactly one call was SPAWNED: the failed one. The replay was not a call this "
+        "cell made, and the budget trip never ran"
+    )
     assert health["replayed_invocations"] == 1
 
 
