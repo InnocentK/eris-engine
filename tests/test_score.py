@@ -510,12 +510,23 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     )
     assert iv["attempts"] >= 2 and iv["wall_ms"] is not None and iv["wall_ms"] >= 0
     assert iv["containment"] is None and iv["propose_keys"] == ivc["propose_keys"]
-    # paired deltas exist for both pairs; 3b-3 pairs (both adjudications clean),
-    # 4-3 does NOT - its treatment arm's adjudication is malformed, so any delta
-    # would be confounded with the malformation rather than measuring critique.
+    # Neither pair is a measurement, for two different reasons.
+    #
+    # 3b-3: `indep_verify_iter` SPAWNED NOTHING here - 0 invocations, 2 replays
+    # of `indep_verify`'s - because the judge requested no evidence and
+    # `adjudicate_iter` broke out of its loop on the first pass. This assertion
+    # used to read `paired is True`, so the test blessed a delta between an arm
+    # and a byte copy of itself; b-s3b showed the same shape in production, with
+    # `delta_cost_spent_usd` reading -$1.02 to -$1.56 as though the arm that made
+    # no calls were the cheaper one.
+    #
+    # 4-3: its treatment arm's adjudication is malformed, so any delta would be
+    # confounded with the malformation rather than measuring critique.
     pairs = {p["pair"]: p for p in summary["paired"]}
     assert set(pairs) == {"3b-3", "4-3"}
-    assert pairs["3b-3"]["paired"] is True
+    assert pairs["3b-3"]["paired"] is False
+    assert "executed no calls of its own" in pairs["3b-3"]["reason"]
+    assert "delta_recall" not in pairs["3b-3"]
     assert pairs["4-3"]["paired"] is False and "validator errors" in pairs["4-3"]["reason"]
     assert "delta_recall" not in pairs["4-3"]  # no delta is emitted for an unpaired cell
     per_arm = summary["per_arm"]
@@ -580,11 +591,14 @@ def test_paired_deltas_require_identical_propose_keys_and_inclusion() -> None:
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -901,11 +915,14 @@ def test_paired_deltas_refuse_to_pair_arms_that_did_not_share_proposals() -> Non
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1113,11 +1130,14 @@ def test_an_arm_with_no_propose_output_never_pairs() -> None:
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1269,11 +1289,14 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1389,11 +1412,14 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1598,11 +1624,14 @@ def test_coarsely_scored_cells_block_the_comparison() -> None:
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1684,11 +1713,14 @@ def test_the_gate_explanation_is_true_for_a_mixed_cell() -> None:
             run_errors=[],
             post_scan_errors=0,
             orphan_invocations=0,
+            executed_invocations=1,
+            replayed_invocations=0,
             downgrades_n=0,
             rulings_n=0,
             downgrades=0,
             severe_false_positive=False,
             wrong_accept=False,
+            wrong_reject=False,
             abstained=False,
             expected_abstain=False,
             cost_spent_usd=1.0,
@@ -1974,11 +2006,14 @@ def _cs(**over: Any) -> CellScore:
         run_errors=[],
         post_scan_errors=0,
         orphan_invocations=0,
+        executed_invocations=1,
+        replayed_invocations=0,
         downgrades_n=0,
         rulings_n=0,
         downgrades=0,
         severe_false_positive=False,
         wrong_accept=False,
+        wrong_reject=False,
         abstained=False,
         expected_abstain=False,
         cost_spent_usd=0.0,
@@ -2536,8 +2571,8 @@ def test_wrong_accept_is_mechanical_and_severity_cannot_move_it() -> None:
     pre-registered build/don't-build rule read - that made a tone change enough
     to satisfy one of the two branches authorising an orchestrator.
     """
-    loud = _cs(wrong_accept=True, severe_false_positive=True)
-    quiet = _cs(wrong_accept=True, severe_false_positive=False)
+    loud = _cs(wrong_accept=True, wrong_reject=False, severe_false_positive=True)
+    quiet = _cs(wrong_accept=True, wrong_reject=False, severe_false_positive=False)
     agg_loud = aggregate([loud])["single:w"]
     agg_quiet = aggregate([quiet])["single:w"]
 
@@ -2552,7 +2587,9 @@ def test_the_decision_rule_metric_is_reported_apart_from_the_severity_one() -> N
     """Both rates and both paired deltas are published under their own names, so
     no reader can quote "the confident-wrong rate" and mean either one.
     """
-    agg = aggregate([_cs(wrong_accept=False, severe_false_positive=True)])["single:w"]
+    agg = aggregate([_cs(wrong_accept=False, wrong_reject=False, severe_false_positive=True)])[
+        "single:w"
+    ]
     assert agg["wrong_accept_rate"] == 0.0 and agg["severe_false_positive_rate"] == 1.0
     assert "confident_wrong_rate" not in agg
 
@@ -2566,6 +2603,7 @@ def test_the_decision_rule_metric_is_reported_apart_from_the_severity_one() -> N
                 propose_keys=same,
                 propose_blobs=blobs,
                 wrong_accept=False,
+                wrong_reject=False,
                 severe_false_positive=True,
             ),
         ]
@@ -2746,3 +2784,116 @@ def test_no_shipped_key_can_be_swept_by_one_prediction() -> None:
                 "space the findings, or choose tokens one sentence would not carry."
             )
     assert checked, "no key has two findings in one file - this test would check nothing"
+
+
+def test_an_arm_that_never_accepts_is_caught_by_wrong_reject(tmp_path: Path) -> None:
+    """Through the real scoring path. `wrong_accept` sees ONE direction.
+
+    An arm that never accepts cannot wrongly accept, so it scores a perfect
+    `wrong_accept_rate` of 0 whatever it says. b-s3b's arm 4 did exactly that:
+    REVISE on all four tasks - right on the two plan tasks, wrong on both
+    controls - and the pre-registered rule, which reads `wrong_accept_rate`,
+    moved in the direction that authorises building an orchestrator. On a corpus
+    half of which expects ACCEPT, a constant-REVISE judge satisfies the rule
+    while being wrong half the time.
+
+    `wrong_reject` is the other direction, and it must fire HERE: the key
+    expects ACCEPT and the judge said REVISE.
+    """
+    w = world(tmp_path)
+    write_key(w, expected_verdict=["ACCEPT"], findings=[])
+    revise = {**ADJ, "verdict": "REVISE", "rulings": []}
+    popen = Popen(
+        {
+            "grok": [grok_envelope(GOOD_PROPOSAL)],
+            "claude": [claude_envelope(revise)],
+        }
+    )
+    cdir = campaign(w, tmp_path, "indep_verify", popen=popen)
+    cell = score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"][0]
+
+    assert cell["verdict"] == "REVISE"
+    assert cell["wrong_accept"] is False, "it never accepted, so it cannot have wrongly accepted"
+    assert cell["wrong_reject"] is True, (
+        "the key expects ACCEPT and the judge refused; without this the arm is "
+        "invisible to every verdict metric the report carries"
+    )
+
+
+def test_an_engine_forced_escalate_counts_as_a_wrong_reject(tmp_path: Path) -> None:
+    """ESCALATE refuses the work too, so it belongs with REVISE.
+
+    This started out asserting that a correct ACCEPT sets neither flag, and it
+    could not be written: H3 refuses an ACCEPT with no evidenced ruling
+    (`VERDICT_UNSUPPORTED`, "ACCEPT with no evidenced SUPPORTED/REFUTED ruling;
+    forced to ESCALATE"), and a ruling must name a `claim_id` that Eris assigns
+    at runtime, so no static fixture can produce a clean enforced ACCEPT. That
+    is the engine being strict, not a defect.
+
+    What it pins instead is the case that actually arises: the judge said
+    ACCEPT, the engine escalated it, the key expected ACCEPT. The cell did not
+    accept, so `wrong_accept` is False - and it refused work it should have
+    accepted, so `wrong_reject` is True. Scoring reads the ENFORCED verdict, and
+    an arm whose adjudications cannot survive enforcement is refusing work
+    whatever its judge intended.
+    """
+    w = world(tmp_path)
+    write_key(w, expected_verdict=["ACCEPT"], findings=[])
+    quiet = {**GOOD_PROPOSAL, "claims": [], "findings": [], "evidence_requests": []}
+    accept = {**ADJ, "verdict": "ACCEPT", "rulings": []}
+    popen = Popen({"grok": [grok_envelope(quiet)], "claude": [claude_envelope(accept)]})
+    cdir = campaign(w, tmp_path, "indep_verify", popen=popen)
+    cell = score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"][0]
+
+    assert cell["verdict"] == "ESCALATE"
+    assert cell["wrong_accept"] is False
+    assert cell["wrong_reject"] is True
+
+
+def test_a_correct_revise_on_a_revise_key_is_not_a_wrong_reject(tmp_path: Path) -> None:
+    """And the other mirror: REVISE where the key wants REVISE is correct."""
+    w = world(tmp_path)  # default key expects REVISE
+    write_key(w)
+    revise = {**ADJ, "verdict": "REVISE", "rulings": []}
+    popen = Popen({"grok": [grok_envelope(GOOD_PROPOSAL)], "claude": [claude_envelope(revise)]})
+    cdir = campaign(w, tmp_path, "indep_verify", popen=popen)
+    cell = score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"][0]
+
+    assert cell["verdict"] == "REVISE"
+    assert cell["wrong_accept"] is False and cell["wrong_reject"] is False
+
+
+def test_a_paired_delta_marks_spent_cost_as_order_dependent(tmp_path: Path) -> None:
+    """`delta_cost_spent_usd` measures campaign ORDER, not the arms.
+
+    A paired delta exists BECAUSE the arms share proposals, and a shared
+    proposal is paid for by whichever arm ran first. So the treatment's spent
+    cost omits everything it replayed: in b-s3b the 3b-3 rows read -$1.02 to
+    -$1.56 in favour of an arm that made no calls at all.
+    `delta_cost_attributed_usd` charges each arm for what it used, replayed or
+    not, and is the comparable figure. The flag marks every row where the
+    distinction bites, which is every row with a replay on either side.
+    """
+    w = world(tmp_path)
+    write_key(w)
+    # An empty critique: with GOOD_CRITIQUE's challenges the arm-4 adjudication
+    # trips DISSENT_EMPTY_WITH_CONTEST and the pair is refused for validator
+    # errors before it can carry any cost delta.
+    no_challenges: dict[str, Any] = {"challenges": []}
+    revise = {**ADJ, "verdict": "REVISE", "rulings": []}
+    popen = Popen(
+        {
+            "grok": [grok_envelope(GOOD_PROPOSAL), grok_envelope(no_challenges)],
+            "claude": [claude_envelope(revise), claude_envelope(revise)],
+        }
+    )
+    cdir = campaign(w, tmp_path, "indep_verify,indep_verify_critique", popen=popen)
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    pair = next(p for p in summary["paired"] if p["pair"] == "4-3")
+
+    assert pair["paired"] is True, pair.get("reason")
+    assert pair["delta_cost_spent_is_order_dependent"] is True, (
+        "arm 4 replayed the proposal arm 3 paid for, so its spent cost omits "
+        "that call and the spent delta flatters it"
+    )
+    assert "delta_cost_attributed_usd" in pair

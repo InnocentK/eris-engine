@@ -538,12 +538,24 @@ def run_health(cell: CellData) -> dict[str, Any]:
     """
     errors = [str(p.get("kind", "run.error")) for p in cell.view.payloads("run.error")]
     post = cell.manifest.get("post_scan_errors") or []
-    inv = {p.get("invocation_id") for p in cell.view.payloads("invocation.finished")} - {None}
+    finished = cell.view.payloads("invocation.finished")
+    inv = {p.get("invocation_id") for p in finished} - {None}
     costed = {p.get("invocation_id") for p in cell.view.payloads("cost")} - {None}
     return {
         "run_errors": sorted(errors),
         "post_scan_errors": len(post) if isinstance(post, list) else 0,
         "orphan_invocations": len(inv - costed),
+        # Calls this cell actually MADE, as opposed to replayed from cache. An
+        # arm can reach the end of its steps having spawned nothing: b-s3b's
+        # `indep_verify_iter` replayed all 12 of its invocations from
+        # `indep_verify`, adjudication included, because the judge requested no
+        # evidence and `adjudicate_iter` therefore broke out of its loop on the
+        # first pass. A delta between such an arm and its base compares a cell
+        # with a copy of itself; `paired_deltas` refuses it.
+        "executed_invocations": sum(
+            1 for p in finished if not p.get("reused_from") and p.get("status") == "ok"
+        ),
+        "replayed_invocations": sum(1 for p in finished if p.get("reused_from")),
     }
 
 
@@ -831,11 +843,14 @@ class CellScore:
     # rule now reads `wrong_accept`; the severity number is reported beside it
     # and is not load-bearing.
     wrong_accept: bool
+    wrong_reject: bool
     severe_false_positive: bool
     abstained: bool
     expected_abstain: bool
     cost_spent_usd: float
     cost_attributed_usd: float
+    executed_invocations: int
+    replayed_invocations: int
     cost_by_stage_spent: dict[str, float]
     cost_by_stage_attributed: dict[str, float]
     unknown_cost_records: int
@@ -1094,6 +1109,21 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
     wrong_accept = exclusion is None and (
         verdict is Verdict.ACCEPT and Verdict.ACCEPT not in key.expected_verdict
     )
+    # The other direction, which `wrong_accept` cannot see by construction: a
+    # verdict that REFUSES work the key says should have been accepted.
+    # b-s3b's arm 4 returned REVISE on all four tasks - right on the two plan
+    # tasks, wrong on both controls - and scored a perfect `wrong_accept` of 0
+    # for it, because an arm that never accepts can never wrongly accept. The
+    # pre-registered rule reads `wrong_accept`, so on a corpus that is half
+    # ACCEPT-expected a constant-REVISE judge satisfies it while being wrong
+    # half the time. REJECT and ESCALATE count with REVISE: all three refuse the
+    # work. ABSTAIN does not - it declines to judge rather than claiming a
+    # defect - and is handled by `expected_abstain`.
+    wrong_reject = exclusion is None and (
+        verdict in (Verdict.REVISE, Verdict.ESCALATE, Verdict.REJECT)
+        and Verdict.ACCEPT in key.expected_verdict
+        and verdict not in key.expected_verdict
+    )
     severe_false_positive = exclusion is None and any(
         s in ("high", "critical") for s in matching.fp_severities
     )
@@ -1125,10 +1155,13 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         run_errors=list(health["run_errors"]),
         post_scan_errors=int(health["post_scan_errors"]),
         orphan_invocations=int(health["orphan_invocations"]),
+        executed_invocations=int(health["executed_invocations"]),
+        replayed_invocations=int(health["replayed_invocations"]),
         downgrades_n=enforced.downgrades if enforced is not None else 0,
         rulings_n=len(enforced.rulings) if enforced is not None else 0,
         downgrades=enforced.downgrades if enforced else 0,
         wrong_accept=wrong_accept,
+        wrong_reject=wrong_reject,
         severe_false_positive=severe_false_positive,
         abstained=verdict is Verdict.ABSTAIN,
         expected_abstain=expected_abstain,
@@ -1264,6 +1297,7 @@ def _by_category(inc: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             "precision": _rates(cells, "precision"),
             "recall": _rates(cells, "recall"),
             "wrong_accept_rate": _mean([float(s.wrong_accept) for s in cells]),
+            "wrong_reject_rate": _mean([float(s.wrong_reject) for s in cells]),
             "severe_false_positive_rate": _mean([float(s.severe_false_positive) for s in cells]),
             "distractor_hits": sum(s.distractor_hits for s in cells),
             "redundant": sum(s.redundant for s in cells),
@@ -1344,6 +1378,7 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             # is reported beside it and is NOT an input to any rule: it is the
             # model's own severity label on its own claim.
             "wrong_accept_rate": _mean([float(s.wrong_accept) for s in inc]),
+            "wrong_reject_rate": _mean([float(s.wrong_reject) for s in inc]),
             "severe_false_positive_rate": _mean([float(s.severe_false_positive) for s in inc]),
             "distractor_hits": sum(s.distractor_hits for s in inc),
             # Predictions that repeated a key finding another prediction was
@@ -1437,6 +1472,24 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                     "output bytes from the base arm (or recorded none)"
                 )
                 entry["unshared_propose_keys"] = differing
+            elif s_treat.executed_invocations == 0:
+                # The treatment SPAWNED NOTHING: every invocation was replayed
+                # from cache, so this cell is a byte copy of the base arm's and
+                # the delta is definitionally zero. Reporting it as a measured
+                # zero says "the treatment changed nothing" where the truth is
+                # "the treatment did nothing" - and its cost columns are worse
+                # than useless, since `delta_cost_spent_usd` then reads as a
+                # large SAVING (b-s3b: -$1.02 to -$1.56 for an arm that made no
+                # calls) while `delta_cost_attributed_usd` correctly reads 0.
+                # Observed in b-s3b: `indep_verify_iter` replayed all 12 of its
+                # invocations from `indep_verify`, because the judge requested
+                # no evidence and `adjudicate_iter` broke out of its loop on the
+                # first pass. The arms are then the same run, not two runs.
+                entry["paired"] = False
+                entry["reason"] = (
+                    "treatment executed no calls of its own: every invocation was replayed "
+                    "from cache, so this pair compares the base arm with a copy of itself"
+                )
             elif (s_treat.validator_errors or s_base.validator_errors) or (
                 s_treat.exclusion == "validator_unknown" or s_base.exclusion == "validator_unknown"
             ):
@@ -1459,6 +1512,7 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                     a, b = getattr(s_treat, metric), getattr(s_base, metric)
                     entry[f"delta_{metric}"] = None if a is None or b is None else round(a - b, 4)
                 entry["delta_wrong_accept"] = int(s_treat.wrong_accept) - int(s_base.wrong_accept)
+                entry["delta_wrong_reject"] = int(s_treat.wrong_reject) - int(s_base.wrong_reject)
                 entry["delta_severe_false_positive"] = int(s_treat.severe_false_positive) - int(
                     s_base.severe_false_positive
                 )
@@ -1467,6 +1521,17 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                 )
                 entry["delta_cost_attributed_usd"] = round(
                     s_treat.cost_attributed_usd - s_base.cost_attributed_usd, 6
+                )
+                # A paired delta exists BECAUSE the arms share proposals, and a
+                # shared proposal is paid for by whichever arm ran first. So
+                # `delta_cost_spent_usd` measures campaign ORDER, not the arms:
+                # in b-s3b it read -$1.02 to -$1.56 in favour of an arm that
+                # made no calls at all. `delta_cost_attributed_usd` charges each
+                # arm for what it used, replayed or not, and is the comparable
+                # figure. Flagged rather than dropped, because spent is the real
+                # money and worth seeing - just not worth comparing.
+                entry["delta_cost_spent_is_order_dependent"] = bool(
+                    s_treat.replayed_invocations or s_base.replayed_invocations
                 )
             out.append(entry)
     return out
@@ -1731,6 +1796,18 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         },
         "pre_registration_notes": [
             "arm consensus is scored on the RAW summarizer verdict (enforced is also recorded)",
+            "`wrong_accept_rate` sees ONE direction and `wrong_reject_rate` is reported beside "
+            "it for the other. An arm that never accepts cannot wrongly accept: b-s3b's arm 4 "
+            "returned REVISE on all four tasks - correct on the two plan tasks, wrong on both "
+            "controls - and scored wrong_accept 0 for it, moving the pre-registered rule in the "
+            "direction that authorises building. Read the two together; the rule still reads "
+            "`wrong_accept_rate` (user decision 2026-08-30) and `wrong_reject_rate` is an input "
+            "to no rule.",
+            "In a paired delta, read `delta_cost_attributed_usd`, not "
+            "`delta_cost_spent_usd`. The pair exists because the arms share proposals, and a "
+            "shared proposal is paid for by whichever arm ran first, so spent measures campaign "
+            "order: in b-s3b it read -$1.02 to -$1.56 in favour of an arm that made no calls. "
+            "`delta_cost_spent_is_order_dependent` marks every such row.",
             M1_PRE_REGISTRATION,
             "categories revert/planted/insufficient require ArmRun.containment == container (E1)",
             "containment basis: " + CONTAINMENT_BASIS,
