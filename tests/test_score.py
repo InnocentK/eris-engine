@@ -1481,11 +1481,19 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
     assert malformed["per_arm"]["indep_verify_critique"]["dropped_for_absent_validator_record"] == 0
     assert malformed["per_arm"]["indep_verify"]["malformed_rate"] == 0.0
 
-    # `validator_unknown` counts too - an uncheckable record is not a clean one
+    # An ABSENT record still drops and still blocks - an uncheckable record is
+    # not a clean one - and the reason must say ABSENT, not "finding". After the
+    # split, `validator_unknown` was the only thing left that could block while
+    # the message still read "dropped cells for validator findings", describing
+    # a missing record as its opposite and sending a reader to look for findings
+    # that do not exist.
     unknown = _comparison_block(
         [cell("indep_verify", None), cell("indep_verify_iter", "validator_unknown")]
     )
     assert unknown["blocked"] is True
+    reason = unknown["reason"]
+    assert "ABSENT" in reason and "validator_unknown" in reason
+    assert "dropped cells for validator findings" not in reason
 
 
 def test_an_inert_REF_error_excludes_the_cell_even_though_its_code_is_handled() -> None:

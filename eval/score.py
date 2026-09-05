@@ -1651,10 +1651,17 @@ def _comparison_block(
 ) -> dict[str, Any]:
     """Whether the per-arm quality means may be compared at all.
 
-    Blocked when any arm dropped cells for `validator_errors`/`validator_unknown`:
-    its mean is then over a cleaner subsample than the arms it is being compared
-    with, and "catch rate" stops meaning the same thing per arm. Mechanical, so
-    a reader cannot quote `per_arm[*].recall` without seeing it.
+    Blocked when any arm dropped cells for `validator_unknown` - an ABSENT
+    validator record, where nothing has been shown to be clean. Its mean is then
+    over a smaller subsample than the arms it is compared with, and "catch rate"
+    stops meaning the same thing per arm. Mechanical, so a reader cannot quote
+    `per_arm[*].recall` without seeing it.
+
+    A validator FINDING does not drop a cell and does not block (2026-09-04). It
+    is reported as `malformed_rate`. The two were one condition until then, and
+    the reason text still said "dropped cells for validator findings" after the
+    split - describing an absent record as a finding, which is its opposite:
+    there is no finding because there is no record.
     """
     per_arm: dict[str, dict[str, Any]] = {}
     for arm in sorted({s.arm_key for s in scores}):
@@ -1723,8 +1730,12 @@ def _comparison_block(
         )
     if offenders:
         reasons.append(
-            "arms " + ", ".join(offenders) + " dropped cells for validator findings; their "
-            "quality means are over a cleaner subsample than the other arms"
+            "arms " + ", ".join(offenders) + " dropped cells whose validator record is "
+            "ABSENT (`validator_unknown`) - no findings event matched the final adjudication, "
+            "so the cell has not been shown to be clean and there is nothing to report about "
+            "it either way. Their quality means are over a smaller subsample than the other "
+            "arms. This is NOT a malformed adjudication: a validator FINDING no longer drops "
+            "anything and is reported as `malformed_rate`"
         )
     if coarse:
         # Honesty about the fallback: wherever `acted` is absent the coarse code set
