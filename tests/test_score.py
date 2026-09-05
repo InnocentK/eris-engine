@@ -3137,6 +3137,7 @@ def test_the_absent_record_reason_makes_no_claim_about_subsample_size() -> None:
         "smaller subsample",
         "scored for NO arm",
         "every mean below",
+        "keep their own cell",
     )
 
     # (a) EVERY arm an offender, dropping the SAME cell: supports are equal, so
@@ -3152,6 +3153,10 @@ def test_the_absent_record_reason_makes_no_claim_about_subsample_size() -> None:
     assert every["blocked"] is True
     for phrase in banned:
         assert phrase not in every["reason"], phrase
+    # This case is what falsifies "other arms keep their own cell for the same
+    # task": BOTH arms dropped t2, so no arm holds a cell for it.
+    assert every["per_arm"]["indep_verify"]["included_cells"] == 1
+    assert every["per_arm"]["indep_verify_critique"]["included_cells"] == 1
 
     # (b) The offender holds the LARGER included set: one arm drops a single
     # cell for an absent record, the other loses two to contamination.

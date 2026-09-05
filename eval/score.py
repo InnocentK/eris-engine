@@ -1744,8 +1744,17 @@ def _comparison_block(
         #                                                  that task, and an arm
         #                                                  that dropped nothing
         #                                                  is over its full set
+        #   "other arms keep their own cell for the same task"
+        #                                                - false when another arm
+        #                                                  dropped ITS cell for
+        #                                                  that task too, which
+        #                                                  is the all-offenders
+        #                                                  case exactly
         # `offenders` knows which arms lost cells and why. It does not know
-        # anyone's relative size, and it is not a statement about the campaign.
+        # anyone's relative size, it is not a statement about the campaign, and
+        # it cannot speak for what any OTHER arm still holds. Every clause below
+        # is about the arms named in it and nothing else; four previous versions
+        # each failed by saying one thing more than that.
         counts = ", ".join(
             f"{a} ({per_arm[a]['dropped_for_absent_validator_record']})" for a in offenders
         )
@@ -1755,9 +1764,9 @@ def _comparison_block(
             "(`validator_unknown`) - no findings event matched the final adjudication, so the "
             "cell has not been shown to be clean and there is nothing to report about it "
             "either way. A cell dropped this way is not scored for the arm that produced it, "
-            "so THAT arm's mean is over fewer cells than the campaign declared for it; other "
-            "arms keep their own cell for the same task. `common_support` says which cells "
-            "the arms actually share. This is NOT a malformed adjudication: a validator "
+            "so THAT arm's mean is over fewer cells than the campaign declared for it. "
+            "`common_support` says which cells the arms actually share. This is NOT a "
+            "malformed adjudication: a validator "
             "FINDING no longer drops anything and is reported as `malformed_rate`"
         )
     if coarse:
