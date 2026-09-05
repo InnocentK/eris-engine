@@ -3128,7 +3128,16 @@ def test_the_absent_record_reason_makes_no_claim_about_subsample_size() -> None:
             exclusion=exclusion,
         )
 
-    banned = ("than the other arms", "arms that dropped none", "smaller subsample")
+    # Every phrasing this sentence has carried that turned out to be false: two
+    # comparatives, then two universals. All are about arms other than the ones
+    # that actually dropped a cell, which is what this reason cannot speak to.
+    banned = (
+        "than the other arms",
+        "arms that dropped none",
+        "smaller subsample",
+        "scored for NO arm",
+        "every mean below",
+    )
 
     # (a) EVERY arm an offender, dropping the SAME cell: supports are equal, so
     # this reason stands alone and must be true unaided.
@@ -3161,8 +3170,26 @@ def test_the_absent_record_reason_makes_no_claim_about_subsample_size() -> None:
     for phrase in banned:
         assert phrase not in inverted["reason"], phrase
 
-    # What it DOES say, in both: which arm, how many, and that nobody scored them.
-    for block in (every, inverted):
+    # (c) ONE arm drops, the other drops nothing at all. This is what falsified
+    # the universals: B's cell for t2 IS scored, and B's mean IS over its full
+    # declared set, so nothing may be said about "no arm" or "every mean".
+    lone = _comparison_block(
+        [
+            cell("indep_verify", "t1", None),
+            cell("indep_verify", "t2", "validator_unknown"),
+            cell("indep_verify_iter", "t1", None),
+            cell("indep_verify_iter", "t2", None),
+        ]
+    )
+    assert lone["per_arm"]["indep_verify_iter"]["included_cells"] == 2, "the other arm lost nothing"
+    for phrase in banned:
+        assert phrase not in lone["reason"], phrase
+    assert "arm indep_verify (1)" in lone["reason"], "singular, and the count is named"
+
+    # What it DOES say, in all three: which arm, how many, and a PER-ARM
+    # consequence.
+    for block in (every, inverted, lone):
         assert "validator_unknown" in block["reason"]
-        assert "scored for NO arm" in block["reason"]
+        assert "not scored for the arm that produced it" in block["reason"]
+        assert "THAT arm's mean is over fewer cells" in block["reason"]
     assert "indep_verify (1)" in inverted["reason"], "the count of dropped cells is named"

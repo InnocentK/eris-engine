@@ -1729,19 +1729,23 @@ def _comparison_block(
             "measured on"
         )
     if offenders:
-        # NO COMPARATIVE. This sentence twice asserted something about relative
-        # subsample size and was twice false, because `offenders` is defined by
-        # a REASON (`validator_unknown`) while the claim was about SIZE, and
-        # cells drop for seven reasons. "Smaller than the other arms" is false
-        # when every arm is an offender; "smaller than the arms that dropped
-        # none" is false whenever a non-offender lost more cells to
-        # contamination, budget or a run error - an arm can drop one cell here
-        # and still hold the LARGEST included set in the campaign.
-        #
-        # So it states only what holds in every case: which arms, how many
-        # cells, why they are unusable, and that nobody scored them. Relative
-        # population is `common_support`'s job and already has its own reason
-        # above.
+        # PER-ARM ONLY. No comparative, and no universal either. This sentence
+        # has been false three times, each time by generalising a fact about
+        # some arms into a claim about all of them:
+        #   "smaller subsample than the other arms"      - no other arms exist
+        #                                                  when all are offenders
+        #   "smaller than the arms that dropped none"    - a non-offender can be
+        #                                                  smaller still, having
+        #                                                  lost cells to
+        #                                                  contamination
+        #   "scored for NO arm, so every mean is over    - a dropped cell belongs
+        #    less than the declared matrix"                to ONE arm; other arms
+        #                                                  keep their cell for
+        #                                                  that task, and an arm
+        #                                                  that dropped nothing
+        #                                                  is over its full set
+        # `offenders` knows which arms lost cells and why. It does not know
+        # anyone's relative size, and it is not a statement about the campaign.
         counts = ", ".join(
             f"{a} ({per_arm[a]['dropped_for_absent_validator_record']})" for a in offenders
         )
@@ -1750,10 +1754,11 @@ def _comparison_block(
             head + counts + " dropped cells whose validator record is ABSENT "
             "(`validator_unknown`) - no findings event matched the final adjudication, so the "
             "cell has not been shown to be clean and there is nothing to report about it "
-            "either way. Those cells are scored for NO arm, so every mean below is over less "
-            "than the matrix the campaign declared; `common_support` says whether the arms "
-            "kept the same cells as each other. This is NOT a malformed adjudication: a "
-            "validator FINDING no longer drops anything and is reported as `malformed_rate`"
+            "either way. A cell dropped this way is not scored for the arm that produced it, "
+            "so THAT arm's mean is over fewer cells than the campaign declared for it; other "
+            "arms keep their own cell for the same task. `common_support` says which cells "
+            "the arms actually share. This is NOT a malformed adjudication: a validator "
+            "FINDING no longer drops anything and is reported as `malformed_rate`"
         )
     if coarse:
         # Honesty about the fallback: wherever `acted` is absent the coarse code set
