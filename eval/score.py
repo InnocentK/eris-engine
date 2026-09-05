@@ -972,13 +972,22 @@ def _validator_errors(cell: CellData) -> tuple[int | None, dict[str, int]]:
     Matching by id also survives resume, which replays a stored adjudication
     rather than re-deriving it.
 
-    Only `severity == "error"` codes in `validate.UNHANDLED_CODES` count. That
-    set is the point of M1: every other error code already changes an outcome -
-    REF_NOT_MECHANICAL downgrades its ruling and is measured by
-    `unsupported_claim_rate`; VERDICT_* forces ACCEPT to ESCALATE. Excluding
-    cells for those would delete the denominator for normal, already-handled
-    behaviour (4 of the 6 real live runs carry REF_NOT_MECHANICAL) and would gut
-    the very metric that reports it. Findings are counted as a MULTISET - three
+    An error counts when the engine did NOT act on it - `Finding.acted is
+    False` - WHATEVER its code. `validate.UNHANDLED_CODES` is only the fallback
+    for legacy ledgers that carry no `acted` at all; on those it classifies by
+    code, calling every `REF_*` handled and so UNDER-reporting.
+
+    An earlier version of this docstring said "only codes in UNHANDLED_CODES
+    count" and named REF_NOT_MECHANICAL as one that must never exclude, because
+    excluding on it "would delete the denominator for normal, already-handled
+    behaviour". That described the fallback, not the behaviour: b-s3b excluded a
+    cell on a REF_NOT_MECHANICAL carrying `acted: false`, which is the code
+    working as designed and the docstring being wrong. Across every ledger in
+    this repository, REF_NOT_MECHANICAL appears 13 times - 11 legacy (no
+    `acted`), 1 acted, 1 unacted.
+
+    Since 2026-09-04 the count no longer excludes anything; it is reported as
+    `validator.malformed_rate`. Findings are counted as a MULTISET - three
     `CLAIM_MISSING`s are three errors, not one.
 
     Returns `None` when the cell has no final adjudication, or none of its
@@ -1098,13 +1107,25 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
         # which has no judge - stays scoreable; there is no adjudication to
         # judge, which is different from one we cannot vouch for.)
         exclusion = "validator_unknown"
-    elif validator_errors:
-        # M1: the engine itself judged this adjudication malformed. Scoring it
-        # would let a cell whose record is internally broken contribute to
-        # precision/recall - a metric reading better than the adjudications it
-        # summarises, which is the C1 mistake. Excluded, and counted loudly as
-        # `malformed` in the per-arm block so the denominator drop is visible.
-        exclusion = "validator_errors"
+    # A validator ERROR no longer excludes the cell (user decision 2026-09-04,
+    # after a three-family panel; see
+    # `docs/decisions/2026-09-04-validator-errors-stop-excluding-cells.md`).
+    # M1 excluded it on the reasoning that "a record the engine judged
+    # incoherent is not evidence". The trigger for that exclusion is
+    # `Finding.acted == False` - the engine DECLINING to change anything - so
+    # the exclusion gave a finding the power to delete a cell in exactly the
+    # case where the recorded protocol decision denied it any power over the
+    # verdict. It is also post-treatment selection: whether an arm's judge emits
+    # a malformed adjudication is an OUTCOME of that arm, so dropping those
+    # cells measures the arm on a cleaner subsample of its own work.
+    #
+    # Measured, on b-s3b: the one excluded cell was ITSELF an arm-4 failure
+    # (REVISE on an ACCEPT-expected control). Removing the exclusion moved arm
+    # 4's `wrong_reject_rate` 0.333 -> 0.5 and unblocked the pooled comparison.
+    # The exclusion was hiding a failure of the arm under test.
+    #
+    # `validator_unknown` above is NOT affected: that is an absent record, not
+    # an arm outcome, and nothing has been shown to be clean.
     basis: str | None
     adj: Adjudication | None
     if ar.arm is Arm.CONSENSUS:
@@ -1492,18 +1513,24 @@ def paired_deltas(scores: Sequence[CellScore]) -> list[dict[str, Any]]:
                     "output bytes from the base arm (or recorded none)"
                 )
                 entry["unshared_propose_keys"] = differing
-            elif (s_treat.validator_errors or s_base.validator_errors) or (
+            elif (
                 s_treat.exclusion == "validator_unknown" or s_base.exclusion == "validator_unknown"
             ):
-                # M1: a paired delta attributes a difference to the TREATMENT.
-                # If either adjudication is malformed the difference is
-                # confounded with "this judge emitted CLAIM_MISSING", exactly as
-                # C1 was confounded with proposal variance. Both sides must be
-                # well formed before a delta means anything.
+                # An ABSENT validator record: nothing has been shown to be
+                # clean, so there is no basis for a delta.
+                #
+                # A validator ERROR no longer refuses the pair. It used to, on
+                # the M1 reasoning that the delta would be "confounded with
+                # this judge emitted CLAIM_MISSING". A malformed adjudication is
+                # not a confound - it is the treatment's own output, so
+                # refusing the pair drops the arm's failures at the dyad level
+                # exactly as the cell exclusion did at the pooled level. Keeping
+                # only one of the two would have moved the bias rather than
+                # removed it (panel, unanimous, 2026-09-04).
                 entry["paired"] = False
                 entry["reason"] = (
-                    f"validator errors/unknown: treatment {s_treat.validator_errors}, "
-                    f"base {s_base.validator_errors}"
+                    f"validator record absent: treatment {s_treat.exclusion}, "
+                    f"base {s_base.exclusion}"
                 )
             elif not (s_treat.included and s_base.included):
                 entry["paired"] = False
@@ -1583,25 +1610,35 @@ def cell_dirs(campaign_dir: Path) -> list[Path]:
 # `test_score.py::test_the_binding_pre_registration_matches_the_scorer`, because
 # the plan previously kept stating a rule the scorer had stopped implementing.
 M1_PRE_REGISTRATION = (
-    "A cell whose FINAL adjudication carries an error-severity validator finding that the "
-    "engine did NOT act on is EXCLUDED from quality metrics (`exclusion: validator_errors`) "
-    "and from paired deltas: a record the engine judged incoherent is not evidence, and a "
-    "delta against one is confounded with the malformation. Whether a finding was acted on "
-    "is recorded per finding as `Finding.acted`, NOT inferred from its code - only "
-    "SUPPORTED/REFUTED rulings are downgraded, so the same code (e.g. `REF_MISSING`) is "
-    "consequential on one ruling and inert on a CONTESTED or UNSUPPORTED one. Excluding "
-    "creates a new bias, because only arm 4 passes critiques to the validator and so only it "
-    "can emit `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore set "
-    "MECHANICALLY whenever any arm dropped cells for validator findings, and while it is set "
-    "the decision rule may NOT be applied to the per-arm means. One exception is stated "
-    "rather than hidden: a ledger written before 0.4.2 carries no `Finding.acted`, so those "
-    "findings ARE classified by code, using the coarse `validate.UNHANDLED_CODES` fallback "
-    "that treats every `REF_*` as handled and therefore UNDER-REPORTS malformation on such "
-    "a ledger. Classification is per FINDING, so a cell counts as coarsely scored when ANY "
-    "of its findings lacks `acted`, not only when all do, and is reported as `validator_basis: coarse_codes`. `summary.comparison` reports which arms "
-    "were scored that way and is BLOCKED "
-    "while any were, because an arm scored by code and an arm scored by `acted` are measured "
-    "against two different definitions of malformed."
+    "A validator finding NO LONGER excludes a cell (user decision 2026-09-04, on a "
+    "three-family panel that was unanimous). Malformation is REPORTED - per arm as "
+    "`validator.malformed_rate`, per cell as `validator_codes` - and the cell is scored on "
+    "its enforced verdict like any other. Until then, an error-severity finding the engine "
+    "did NOT act on excluded the cell from quality metrics and from paired deltas, on the "
+    "reasoning that a record the engine judged incoherent is not evidence. Two things were "
+    "wrong with that. The trigger is `Finding.acted == False`, the engine DECLINING to "
+    "change anything, so the exclusion gave a finding the power to delete a cell in exactly "
+    "the case where the recorded protocol decision denied it any power over the verdict. And "
+    "whether an arm's judge emits a malformed adjudication is an OUTCOME of that arm, so "
+    "dropping those cells is post-treatment selection: it measures the arm on a cleaner "
+    "subsample of its own work. Measured on b-s3b - the one excluded cell was itself an "
+    "arm-4 failure (REVISE on an ACCEPT-expected control), and restoring it moved arm 4's "
+    "`wrong_reject_rate` from 0.333 to 0.5. A previous version of this text asserted that "
+    "'only arm 4 passes critiques to the validator and so only it can emit "
+    "`DISSENT_EMPTY_WITH_CONTEST`'; that is FALSE - the only occurrence observed in this "
+    "repository is on an arm 3 cell, because `_contest_exists` also fires on a CONTESTED "
+    "ruling, which needs no critique. Whether a finding was acted on is recorded per finding "
+    "as `Finding.acted`, NOT inferred from its code - only SUPPORTED/REFUTED rulings are "
+    "downgraded, so the same code (e.g. `REF_MISSING`) is consequential on one ruling and "
+    "inert on a CONTESTED or UNSUPPORTED one. A ledger written before 0.4.2 carries no "
+    "`Finding.acted`, so those findings are classified by code using the coarse "
+    "`validate.UNHANDLED_CODES` fallback, which treats every `REF_*` as handled and "
+    "therefore UNDER-REPORTS malformation; classification is per FINDING, so a cell is "
+    "`validator_basis: coarse_codes` when ANY of its findings lacks `acted`. "
+    "`summary.comparison` reports which arms were scored that way and is BLOCKED while any "
+    "were, because an arm scored by code and an arm scored by `acted` are measured against "
+    "two different definitions of malformed. An ABSENT validator record "
+    "(`validator_unknown`) still excludes: nothing has been shown to be clean."
 )
 
 

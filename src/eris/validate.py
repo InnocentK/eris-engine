@@ -71,11 +71,24 @@ ESCALATE_AT = 3
 # recorded, an ACCEPT with no residual risks - and NOTHING happens. `eval/score.py`
 # treats a cell whose final adjudication carries one of these as not-evidence.
 # DECIDED 2026-08-30 (user): they keep NO verdict powers. Giving them any is a
-# protocol change of the same kind as H3, and `DISSENT_EMPTY_WITH_CONTEST` would
-# fire on nearly every arm-4 cell today because `_contest_exists` counts any
-# non-REFUTED challenge and nothing ever refutes one. Reasons and the concrete
-# triggers for revisiting are in
-# `docs/decisions/2026-08-30-deferred-validator-decisions.md` - read it before
+# protocol change of the same kind as H3. That decision stands.
+#
+# The same comment used to add that `DISSENT_EMPTY_WITH_CONTEST` "would fire on
+# nearly every arm-4 cell today because `_contest_exists` counts any non-REFUTED
+# challenge and nothing ever refutes one". The runs do not bear that out: across
+# 32 cells carrying `validate.findings` in this repository it has fired ONCE,
+# and on an ARM 3 cell, via the CONTESTED-ruling branch of `_contest_exists`,
+# which needs no critique at all. The prediction was about the challenge branch
+# and the only observation came from the other one.
+#
+# What DID change (2026-09-04, user, on a unanimous three-family panel): these
+# findings no longer exclude a cell from scoring either. Excluding keyed on
+# `acted == False` - the engine declining to act - so it handed a finding the
+# power to delete a cell precisely where this decision denies it power over the
+# verdict. Reasons in
+# `docs/decisions/2026-09-04-validator-errors-stop-excluding-cells.md`, and the
+# original deferral in
+# `docs/decisions/2026-08-30-deferred-validator-decisions.md` - read both before
 # proposing a change here.
 UNHANDLED_CODES: frozenset[str] = frozenset(
     {

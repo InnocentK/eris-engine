@@ -3,6 +3,22 @@
 **Decided 2026-08-30 by the user: leave both as they are.** Recorded so the
 choice is visible and revisitable, not re-litigated by the next agent.
 
+> **PARTLY SUPERSEDED, 2026-09-04.** The decision below - that these findings
+> get NO VERDICT POWERS - still stands. What changed is the separate M1
+> behaviour it describes under "What happens today": a validator error no
+> longer EXCLUDES the cell from quality metrics or from paired deltas. It is
+> reported instead. See
+> [`2026-09-04-validator-errors-stop-excluding-cells.md`](2026-09-04-validator-errors-stop-excluding-cells.md).
+>
+> Two of this document's stated premises did not survive the campaigns. Reason
+> 3 below says `DISSENT_EMPTY_WITH_CONTEST` "would fire far too broadly today"
+> and that "essentially every arm-4 cell with a challenge would escalate": it
+> has fired ONCE in 32 cells, on an ARM 3 cell, through the CONTESTED-ruling
+> branch rather than the challenge branch the reason blames. And the revisit
+> trigger below - watch `summary.per_arm[*].validator.codes` after the first
+> scored campaign - fired on a DIFFERENT code, `REF_NOT_MECHANICAL`, which this
+> document never covered.
+
 Both items came out of the multi-family pre-live review
 (`2026-08-26-multi-family-prelive-review.md`, finding M1) and survived the M1
 fix (v0.4.1/0.4.2) deliberately.

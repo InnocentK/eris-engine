@@ -33,29 +33,40 @@ M1 clause verbatim (coupled by test) and prints the caveats with every summary;
   worker as the others; `plan` and `control` are scored without
   containment by user decision, and their results carry the same E1 risk.
   **Malformation is first-class (M1, 0.4.1), and BINDING.**
-  A cell whose FINAL adjudication carries an error-severity validator
-  finding that the engine did NOT act on is EXCLUDED from quality metrics
-  (`exclusion: validator_errors`) and from paired deltas: a record the
-  engine judged incoherent is not evidence, and a delta against one is
-  confounded with the malformation. Whether a finding was acted on is
-  recorded per finding as `Finding.acted`, NOT inferred from its code - only
-  SUPPORTED/REFUTED rulings are downgraded, so the same code (e.g.
-  `REF_MISSING`) is consequential on one ruling and inert on a CONTESTED or
-  UNSUPPORTED one. Excluding creates a new bias, because only arm 4 passes
-  critiques to the validator and so only it can emit
-  `DISSENT_EMPTY_WITH_CONTEST`; `summary.comparison.blocked` is therefore
-  set MECHANICALLY whenever any arm dropped cells for validator findings,
-  and while it is set the decision rule may NOT be applied to the per-arm
-  means. One exception is stated rather than hidden: a ledger written before
-  0.4.2 carries no `Finding.acted`, so those findings ARE classified by
-  code, using the coarse `validate.UNHANDLED_CODES` fallback that treats
-  every `REF_*` as handled and therefore UNDER-REPORTS malformation on such
-  a ledger. Classification is per FINDING, so a cell counts as coarsely
-  scored when ANY of its findings lacks `acted`, not only when all do, and
-  is reported as `validator_basis: coarse_codes`. `summary.comparison`
-  reports which arms were scored that way and is BLOCKED while any were,
-  because an arm scored by code and an arm scored by `acted` are measured
-  against two different definitions of malformed.
+  A validator finding NO LONGER excludes a cell (user decision 2026-09-04,
+  on a three-family panel that was unanimous). Malformation is REPORTED -
+  per arm as `validator.malformed_rate`, per cell as `validator_codes` - and
+  the cell is scored on its enforced verdict like any other. Until then, an
+  error-severity finding the engine did NOT act on excluded the cell from
+  quality metrics and from paired deltas, on the reasoning that a record the
+  engine judged incoherent is not evidence. Two things were wrong with that.
+  The trigger is `Finding.acted == False`, the engine DECLINING to change
+  anything, so the exclusion gave a finding the power to delete a cell in
+  exactly the case where the recorded protocol decision denied it any power
+  over the verdict. And whether an arm's judge emits a malformed
+  adjudication is an OUTCOME of that arm, so dropping those cells is
+  post-treatment selection: it measures the arm on a cleaner subsample of
+  its own work. Measured on b-s3b - the one excluded cell was itself an
+  arm-4 failure (REVISE on an ACCEPT-expected control), and restoring it
+  moved arm 4's `wrong_reject_rate` from 0.333 to 0.5. A previous version of
+  this text asserted that 'only arm 4 passes critiques to the validator and
+  so only it can emit `DISSENT_EMPTY_WITH_CONTEST`'; that is FALSE - the
+  only occurrence observed in this repository is on an arm 3 cell, because
+  `_contest_exists` also fires on a CONTESTED ruling, which needs no
+  critique. Whether a finding was acted on is recorded per finding as
+  `Finding.acted`, NOT inferred from its code - only SUPPORTED/REFUTED
+  rulings are downgraded, so the same code (e.g. `REF_MISSING`) is
+  consequential on one ruling and inert on a CONTESTED or UNSUPPORTED one. A
+  ledger written before 0.4.2 carries no `Finding.acted`, so those findings
+  are classified by code using the coarse `validate.UNHANDLED_CODES`
+  fallback, which treats every `REF_*` as handled and therefore
+  UNDER-REPORTS malformation; classification is per FINDING, so a cell is
+  `validator_basis: coarse_codes` when ANY of its findings lacks `acted`.
+  `summary.comparison` reports which arms were scored that way and is
+  BLOCKED while any were, because an arm scored by code and an arm scored by
+  `acted` are measured against two different definitions of malformed. An
+  ABSENT validator record (`validator_unknown`) still excludes: nothing has
+  been shown to be clean.
   Findings the engine DID act on do not exclude - the `REF_*` family downgrades
   its ruling and is measured by `unsupported_claim_rate`; `VERDICT_*` forces
   ACCEPT to ESCALATE. That is the engine working, and excluding it would delete

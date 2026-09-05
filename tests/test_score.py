@@ -466,16 +466,19 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
         "indep_verify_iter",
         "indep_verify_critique",
     }
-    # M1: the critique fixture returns a contest with EMPTY DISSENT - a finding
-    # the engine emits and then does nothing about - so that cell is no longer
-    # scored as evidence. The consensus fixture's ACCEPT findings (VERDICT_*)
-    # are HANDLED (the verdict was forced to ESCALATE), so it stays included:
-    # excluding already-corrected behaviour would delete the denominator for
-    # something the engine got right.
-    assert by["indep_verify_critique"]["exclusion"] == "validator_errors"
+    # The critique fixture returns a contest with EMPTY DISSENT - a finding the
+    # engine emits and then does nothing about. That used to EXCLUDE the cell.
+    # It no longer does (user decision 2026-09-04): the trigger was the engine
+    # DECLINING to act, so the exclusion gave the finding a power the protocol
+    # denied it, and whether a judge emits a malformed adjudication is an
+    # outcome of the arm under test - dropping it measured the arm on a cleaner
+    # subsample of its own work. The finding is REPORTED and the cell is scored.
+    assert by["indep_verify_critique"]["exclusion"] is None
+    assert by["indep_verify_critique"]["included"] is True
     assert by["indep_verify_critique"]["validator_codes"] == {"DISSENT_EMPTY_WITH_CONTEST": 1}
+    assert by["indep_verify_critique"]["validator_errors"] == 1
     assert by["consensus"]["validator_errors"] == 0 and by["consensus"]["included"] is True
-    assert all(c["included"] for c in by.values() if c["arm"] != "indep_verify_critique")
+    assert all(c["included"] for c in by.values())
     # a cell with no adjudication at all is UNKNOWN, never "clean"
     assert by["single:grok"]["validator_errors"] is None
     # arm 1: findings from the proposal, no verdict
@@ -520,22 +523,29 @@ def test_cells_are_scored_with_verdict_basis_costs_and_paired_deltas(tmp_path: P
     # where the mechanism engaged and discard the ones where it did not, biasing
     # the estimate upward. Zero is a measurement.
     #
-    # 4-3 does not pair: its treatment arm's adjudication is malformed, so any
-    # delta would be confounded with the malformation rather than measuring
-    # critique - a confound, not an outcome, which is why that one is refused.
+    # 4-3 ALSO pairs now. Its treatment arm's adjudication is malformed, which
+    # used to refuse the pair on the reasoning that the delta would be
+    # "confounded with the malformation". A malformed adjudication is the
+    # treatment's own output, not a confound, so refusing the pair dropped the
+    # arm's failures at the dyad level exactly as the cell exclusion did at the
+    # pooled level (user decision 2026-09-04). The malformation is reported
+    # instead, per arm as `validator.malformed_rate`.
     pairs = {p["pair"]: p for p in summary["paired"]}
     assert set(pairs) == {"3b-3", "4-3"}
     assert pairs["3b-3"]["paired"] is True
     assert pairs["3b-3"]["treatment_executed_no_calls"] is True
     assert pairs["3b-3"]["delta_wrong_accept"] == 0
-    assert pairs["4-3"]["paired"] is False and "validator errors" in pairs["4-3"]["reason"]
-    assert "delta_recall" not in pairs["4-3"]  # no delta is emitted for an unpaired cell
+    assert pairs["4-3"]["paired"] is True
+    # the malformation is still first-class - asserted on `per_arm` below
     per_arm = summary["per_arm"]
     assert per_arm["single:grok"]["recall"]["micro"] == 1.0
     # M1 reporting: the malformation is first-class per arm, and the campaign
     # summary carries the same counts across all cells
     assert per_arm["indep_verify_critique"]["validator"]["malformed"] == 1
-    assert per_arm["indep_verify_critique"]["excluded"]["validator_errors"] == 1
+    assert per_arm["indep_verify_critique"]["validator"]["malformed_rate"] == 1.0
+    # ...and nothing is excluded FOR it any more: the rate is how malformation
+    # is carried, instead of a hole in the denominator.
+    assert per_arm["indep_verify_critique"]["excluded"].get("validator_errors", 0) == 0
     assert per_arm["consensus"]["wrong_accept_rate"] == 1.0
     assert per_arm["indep_verify_critique"]["validator"]["codes"] == {
         "DISSENT_EMPTY_WITH_CONTEST": 1
@@ -1333,7 +1343,7 @@ def test_an_adjudication_with_no_findings_event_is_excluded_not_scored() -> None
         )
     }
     assert out["4-3"]["paired"] is False
-    assert out["4-3"]["reason"].startswith("validator errors/unknown:")
+    assert out["4-3"]["reason"].startswith("validator record absent:")
     assert "delta_recall" not in out["4-3"]
 
     # two well-formed cells still pair
