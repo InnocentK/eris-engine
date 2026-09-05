@@ -1729,13 +1729,26 @@ def _comparison_block(
             "measured on"
         )
     if offenders:
+        # The comparative half of this sentence has to survive EVERY arm being
+        # an offender. It read "a smaller subsample than the other arms", which
+        # is false when there are no other arms - and that is not a corner
+        # case: arms dropping the SAME cell have equal support, so the
+        # `unequal` reason above stays silent and this becomes the only stated
+        # justification for the block.
+        every = len(offenders) == len(per_arm)
+        head = "arm " if len(offenders) == 1 else "arms "
+        tail = (
+            "EVERY arm dropped cells this way, so none of them is a clean baseline for the "
+            "others and no arm's mean is over the population the campaign declared"
+            if every
+            else "their quality means are over a smaller subsample than the arms that dropped none"
+        )
         reasons.append(
-            "arms " + ", ".join(offenders) + " dropped cells whose validator record is "
-            "ABSENT (`validator_unknown`) - no findings event matched the final adjudication, "
-            "so the cell has not been shown to be clean and there is nothing to report about "
-            "it either way. Their quality means are over a smaller subsample than the other "
-            "arms. This is NOT a malformed adjudication: a validator FINDING no longer drops "
-            "anything and is reported as `malformed_rate`"
+            head + ", ".join(offenders) + " dropped cells whose validator record is ABSENT "
+            "(`validator_unknown`) - no findings event matched the final adjudication, so the "
+            "cell has not been shown to be clean and there is nothing to report about it "
+            "either way. " + tail + ". This is NOT a malformed adjudication: a validator "
+            "FINDING no longer drops anything and is reported as `malformed_rate`"
         )
     if coarse:
         # Honesty about the fallback: wherever `acted` is absent the coarse code set

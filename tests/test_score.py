@@ -3095,3 +3095,53 @@ def test_the_comparison_block_reports_malformation_it_no_longer_drops(tmp_path: 
     # ...and the malformed cell is NOT dropped: that field counts absent records
     assert comparison["dropped_for_absent_validator_record"] == 0
     assert summary["per_arm"][arm]["excluded"].get("validator_errors", 0) == 0
+
+
+def test_the_absent_record_reason_is_true_when_every_arm_dropped_cells() -> None:
+    """The gate's comparative claim must survive every arm being an offender.
+
+    It read "their quality means are over a smaller subsample than the other
+    arms", which is false when there are no other arms. That is not a corner
+    case: arms dropping the SAME cell have EQUAL support, so the different-
+    populations reason stays silent and this becomes the ONLY stated
+    justification for blocking - a block whose reason does not hold.
+    """
+    from eval.score import _comparison_block
+
+    def cell(arm: str, task: str, exclusion: str | None) -> Any:
+        return _cs(
+            run_id=f"r-{arm}-{task}-{exclusion}",
+            task_id=task,
+            arm=arm,
+            arm_key=arm,
+            included=exclusion is None,
+            exclusion=exclusion,
+        )
+
+    # EVERY arm drops the same task: supports stay equal, so this reason stands
+    # alone and must be true on its own.
+    every = _comparison_block(
+        [
+            cell("indep_verify", "t1", None),
+            cell("indep_verify", "t2", "validator_unknown"),
+            cell("indep_verify_critique", "t1", None),
+            cell("indep_verify_critique", "t2", "validator_unknown"),
+        ]
+    )
+    assert every["blocked"] is True
+    assert "EVERY arm dropped cells this way" in every["reason"]
+    assert "than the other arms" not in every["reason"]
+    assert "arms that dropped none" not in every["reason"]
+
+    # Only one arm drops: the comparative claim is the right one to make.
+    some = _comparison_block(
+        [
+            cell("indep_verify", "t1", None),
+            cell("indep_verify", "t2", None),
+            cell("indep_verify_iter", "t1", None),
+            cell("indep_verify_iter", "t2", "validator_unknown"),
+        ]
+    )
+    assert some["blocked"] is True
+    assert "arms that dropped none" in some["reason"]
+    assert "EVERY arm dropped" not in some["reason"]
