@@ -3097,14 +3097,24 @@ def test_the_comparison_block_reports_malformation_it_no_longer_drops(tmp_path: 
     assert summary["per_arm"][arm]["excluded"].get("validator_errors", 0) == 0
 
 
-def test_the_absent_record_reason_is_true_when_every_arm_dropped_cells() -> None:
-    """The gate's comparative claim must survive every arm being an offender.
+def test_the_absent_record_reason_makes_no_claim_about_subsample_size() -> None:
+    """The gate must not compare subsample sizes, because it cannot.
 
-    It read "their quality means are over a smaller subsample than the other
-    arms", which is false when there are no other arms. That is not a corner
-    case: arms dropping the SAME cell have EQUAL support, so the different-
-    populations reason stays silent and this becomes the ONLY stated
-    justification for blocking - a block whose reason does not hold.
+    `offenders` is defined by a REASON (`validator_unknown`); the sentence kept
+    making a claim about SIZE. Both versions were false:
+
+      "smaller than the other arms"       - false when EVERY arm is an offender,
+                                            and arms dropping the SAME cell have
+                                            equal support, so the different-
+                                            populations reason stays silent and
+                                            this one stands alone.
+      "smaller than the arms that dropped - false whenever a non-offender lost
+       none"                                more cells to contamination, budget
+                                            or a run error.
+
+    Cells drop for seven reasons. An arm can drop one cell here and still hold
+    the largest included set in the campaign. So the reason states only what
+    holds in every case, and `common_support` carries the population question.
     """
     from eval.score import _comparison_block
 
@@ -3118,8 +3128,10 @@ def test_the_absent_record_reason_is_true_when_every_arm_dropped_cells() -> None
             exclusion=exclusion,
         )
 
-    # EVERY arm drops the same task: supports stay equal, so this reason stands
-    # alone and must be true on its own.
+    banned = ("than the other arms", "arms that dropped none", "smaller subsample")
+
+    # (a) EVERY arm an offender, dropping the SAME cell: supports are equal, so
+    # this reason stands alone and must be true unaided.
     every = _comparison_block(
         [
             cell("indep_verify", "t1", None),
@@ -3129,19 +3141,28 @@ def test_the_absent_record_reason_is_true_when_every_arm_dropped_cells() -> None
         ]
     )
     assert every["blocked"] is True
-    assert "EVERY arm dropped cells this way" in every["reason"]
-    assert "than the other arms" not in every["reason"]
-    assert "arms that dropped none" not in every["reason"]
+    for phrase in banned:
+        assert phrase not in every["reason"], phrase
 
-    # Only one arm drops: the comparative claim is the right one to make.
-    some = _comparison_block(
+    # (b) The offender holds the LARGER included set: one arm drops a single
+    # cell for an absent record, the other loses two to contamination.
+    inverted = _comparison_block(
         [
             cell("indep_verify", "t1", None),
             cell("indep_verify", "t2", None),
+            cell("indep_verify", "t3", "validator_unknown"),
             cell("indep_verify_iter", "t1", None),
-            cell("indep_verify_iter", "t2", "validator_unknown"),
+            cell("indep_verify_iter", "t2", "contaminated"),
+            cell("indep_verify_iter", "t3", "contaminated"),
         ]
     )
-    assert some["blocked"] is True
-    assert "arms that dropped none" in some["reason"]
-    assert "EVERY arm dropped" not in some["reason"]
+    assert inverted["per_arm"]["indep_verify"]["included_cells"] == 2
+    assert inverted["per_arm"]["indep_verify_iter"]["included_cells"] == 1
+    for phrase in banned:
+        assert phrase not in inverted["reason"], phrase
+
+    # What it DOES say, in both: which arm, how many, and that nobody scored them.
+    for block in (every, inverted):
+        assert "validator_unknown" in block["reason"]
+        assert "scored for NO arm" in block["reason"]
+    assert "indep_verify (1)" in inverted["reason"], "the count of dropped cells is named"
