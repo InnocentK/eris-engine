@@ -1366,6 +1366,10 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                     "ledger_invalid",
                     "no_scan",
                     "run_error",
+                    # kept as a schema key so a reader diffing summaries sees
+                    # it go to zero rather than vanish; `score_cell` no longer
+                    # assigns it (2026-09-04) and it is always 0 on a ledger
+                    # scored by this version
                     "validator_errors",
                     "validator_unknown",
                 )
@@ -1655,13 +1659,26 @@ def _comparison_block(
     per_arm: dict[str, dict[str, Any]] = {}
     for arm in sorted({s.arm_key for s in scores}):
         cells = [s for s in scores if s.arm_key == arm]
-        dropped = len(
-            [s for s in cells if s.exclusion in ("validator_errors", "validator_unknown")]
-        )
+        # Two DIFFERENT quantities that were one until 2026-09-04, when a
+        # validator error stopped excluding cells:
+        #   `dropped_for_validator` - cells removed from the comparison because
+        #     their validator record is ABSENT (`validator_unknown`). This is
+        #     what blocks the comparison, below.
+        #   `malformed_rate`        - cells whose adjudication carried an
+        #     unacted error. These are now SCORED, not dropped.
+        # `malformed_rate` used to be derived from the drop count, which was
+        # correct only while malformation implied exclusion. After the exclusion
+        # was removed it reported 0.0 for an arm with malformed cells - the same
+        # arm reading 0.25 in `per_arm[*].validator.malformed_rate`, two fields
+        # of the same name disagreeing. Deriving a rate from a consequence
+        # rather than from the thing itself is what made that possible.
+        dropped = len([s for s in cells if s.exclusion == "validator_unknown"])
+        malformed = len([s for s in cells if s.validator_errors])
         per_arm[arm] = {
             "cells": len(cells),
-            "dropped_for_validator": dropped,
-            "malformed_rate": round(dropped / len(cells), 4) if cells else None,
+            "dropped_for_absent_validator_record": dropped,
+            "malformed_cells": malformed,
+            "malformed_rate": round(malformed / len(cells), 4) if cells else None,
         }
     coarse = sorted({s.arm_key for s in scores if s.validator_basis == "coarse_codes"})
     for arm, v in per_arm.items():
@@ -1687,7 +1704,7 @@ def _comparison_block(
         )
     unequal = sorted(a for a in per_arm if support[a] != common)
 
-    offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_validator"])
+    offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_absent_validator_record"])
     reasons: list[str] = []
     missing = (matrix or {}).get("missing")
     if missing:

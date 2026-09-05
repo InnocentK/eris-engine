@@ -1391,17 +1391,25 @@ def test_a_cell_whose_findings_event_is_missing_is_excluded_end_to_end(tmp_path:
 
 
 def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() -> None:
-    """M1, panel finding: EXCLUDING creates a new bias, so say so mechanically.
+    """An ABSENT validator record blocks; a malformed one is reported, not dropped.
 
-    Only arm 4 passes critiques to the validator, so only it can emit
-    `DISSENT_EMPTY_WITH_CONTEST`. An arm that drops its malformed cells is left
-    with a cleaner SUBSAMPLE and can win on catch rate against arms that kept
-    theirs. Prose in EVAL-PLAN is advice; `summary.comparison.blocked` is a gate
-    a reader cannot quote `per_arm[*].recall` without seeing.
+    Dropping cells leaves an arm with a cleaner SUBSAMPLE, so it can win on catch
+    rate against arms that kept theirs. `summary.comparison.blocked` is a gate a
+    reader cannot quote `per_arm[*].recall` without seeing.
+
+    Since 2026-09-04 a validator ERROR does not drop a cell, so it cannot create
+    that bias and does not block. It is reported as `malformed_rate` - counted
+    from `validator_errors`, NOT from the drop count, which is how the field
+    silently read 0.0 for a malformed arm the moment the exclusion was removed.
+    An ABSENT record (`validator_unknown`) still drops and still blocks.
+
+    The old version of this test asserted that a `validator_errors` exclusion
+    blocked the comparison, and constructed a cell in that state directly -
+    which `score_cell` can no longer produce.
     """
     from eval.score import CellScore, _comparison_block
 
-    def cell(arm: str, exclusion: str | None) -> Any:
+    def cell(arm: str, exclusion: str | None, validator_errors: int = 0) -> Any:
         return CellScore(
             run_id=f"r-{arm}-{exclusion}",
             task_id="t",
@@ -1446,7 +1454,7 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
             wall_ms=1,
             attempts=1,
             propose_keys=[],
-            validator_errors=0,
+            validator_errors=validator_errors,
             validator_codes={},
             validator_basis="acted",
             propose_blobs={},
@@ -1459,17 +1467,19 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
     clean = _comparison_block([cell("indep_verify", None), cell("indep_verify_critique", None)])
     assert clean["blocked"] is False and clean["reason"] is None
 
-    biased = _comparison_block(
+    # A MALFORMED cell: scored, reported, and NOT a reason to block.
+    malformed = _comparison_block(
         [
             cell("indep_verify", None),
             cell("indep_verify_critique", None),
-            cell("indep_verify_critique", "validator_errors"),
+            cell("indep_verify_critique", None, validator_errors=1),
         ]
     )
-    assert biased["blocked"] is True
-    assert "indep_verify_critique" in biased["reason"] and "NOT comparable" in biased["reason"]
-    assert biased["per_arm"]["indep_verify_critique"]["malformed_rate"] == 0.5
-    assert biased["per_arm"]["indep_verify"]["malformed_rate"] == 0.0
+    assert malformed["blocked"] is False, malformed["reason"]
+    assert malformed["per_arm"]["indep_verify_critique"]["malformed_rate"] == 0.5
+    assert malformed["per_arm"]["indep_verify_critique"]["malformed_cells"] == 1
+    assert malformed["per_arm"]["indep_verify_critique"]["dropped_for_absent_validator_record"] == 0
+    assert malformed["per_arm"]["indep_verify"]["malformed_rate"] == 0.0
 
     # `validator_unknown` counts too - an uncheckable record is not a clean one
     unknown = _comparison_block(
@@ -3032,3 +3042,48 @@ def test_the_no_op_annotation_reads_attempted_calls_not_successful_ones() -> Non
     row = next(r for r in replayed if r["pair"] == "3b-3")
     assert row["paired"] is True, row.get("reason")
     assert row["treatment_executed_no_calls"] is True
+
+
+def test_the_comparison_block_reports_malformation_it_no_longer_drops(tmp_path: Path) -> None:
+    """`comparison.malformed_rate` must count malformed cells, not dropped ones.
+
+    It was derived from the count of cells EXCLUDED for validator reasons, which
+    was correct only while malformation implied exclusion. When a validator
+    error stopped excluding (2026-09-04), the field silently went to 0.0 for an
+    arm that still had malformed cells - while `per_arm[*].validator.
+    malformed_rate` reported 0.25 for the same arm. Two fields of the same name
+    disagreeing, and the one that went quiet is in the block a reader consults
+    to decide whether the comparison is usable.
+
+    That is the exact failure the decision was meant to prevent: the whole point
+    of removing the exclusion was to keep malformation VISIBLE while the cell is
+    scored. A rate derived from a consequence rather than from the thing itself
+    is what let removing the consequence erase the rate.
+    """
+    w = world(tmp_path)
+    write_key(w)
+    popen = Popen(
+        {
+            "grok": [grok_envelope(GOOD_PROPOSAL), grok_envelope(GOOD_CRITIQUE)],
+            "claude": [
+                claude_envelope({**ADJ, "rulings": []}),
+                claude_envelope({**ADJ, "rulings": []}),
+            ],
+        }
+    )
+    cdir = campaign(w, tmp_path, "indep_verify,indep_verify_critique", popen=popen)
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+    arm = "indep_verify_critique"
+    per_arm_rate = summary["per_arm"][arm]["validator"]["malformed_rate"]
+    comparison = summary["comparison"]["per_arm"][arm]
+
+    assert per_arm_rate > 0, "fixture must produce a malformed arm-4 cell"
+    assert comparison["malformed_rate"] == per_arm_rate, (
+        "the comparison block and the per-arm block must report the same "
+        f"malformed rate; got {comparison['malformed_rate']} vs {per_arm_rate}"
+    )
+    assert comparison["malformed_cells"] >= 1
+    # ...and the malformed cell is NOT dropped: that field counts absent records
+    assert comparison["dropped_for_absent_validator_record"] == 0
+    assert summary["per_arm"][arm]["excluded"].get("validator_errors", 0) == 0
