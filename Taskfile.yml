@@ -16,14 +16,14 @@ tasks:
   lint:
     desc: ruff check + ruff format --check
     cmds:
-      - .venv/bin/ruff check src tests eval
-      - .venv/bin/ruff format --check src tests eval
+      - .venv/bin/ruff check src tests eval reviews
+      - .venv/bin/ruff format --check src tests eval reviews
 
   fmt:
     desc: ruff format + autofix imports
     cmds:
-      - .venv/bin/ruff check --fix src tests eval
-      - .venv/bin/ruff format src tests eval
+      - .venv/bin/ruff check --fix src tests eval reviews
+      - .venv/bin/ruff format src tests eval reviews
 
   typecheck:
     desc: mypy strict on src (eval is checked non-strict)

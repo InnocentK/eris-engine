@@ -35,3 +35,4 @@ eval/snapshots/
 
 # Machine-specific executable pins written by `eris policy pin`
 policies/pins.yaml
+reviews/*/snapshot/
