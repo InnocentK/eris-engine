@@ -2274,6 +2274,16 @@ def test_campaign_status_reports_committed_cost_and_names_what_it_cannot_read(
     assert valued["unreadable_ledgers"] == []  # readable, just unvaluable
     assert valued["committed_usd"] == pytest.approx(cost["committed_usd"])
 
+    # Isolation (panel 2026-09-06, B4): with the valueless cell still present,
+    # `unknown_records == 1` already held the flag False, so the assertion after
+    # the corruption below could not see the `unreadable` half - dropping
+    # `not unreadable` from the flag left this whole test green. Remove the cell
+    # and prove the flag RECOVERED, so the next False is unreadable's alone.
+    shutil.rmtree(valueless)
+    recovered = status()["cost"]
+    assert recovered["counted_records_without_cost"] == 0
+    assert recovered["committed_is_complete"] is True
+
     # A cell whose ledger will not parse is NAMED rather than skipped: dropping
     # it silently would lower the committed figure the operator is watching.
     lines = (extra / "events.jsonl").read_bytes().splitlines(keepends=True)

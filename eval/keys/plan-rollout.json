@@ -14,8 +14,17 @@
       "line_end": 22,
       "severity": "high",
       "must_mention": [
-        "severity",
-        "assign"
+        [
+          "severity"
+        ],
+        [
+          "assign",
+          "own",
+          "confidence",
+          "tone",
+          "game",
+          "self"
+        ]
       ]
     },
     {
@@ -25,8 +34,19 @@
       "line_end": 60,
       "severity": "medium",
       "must_mention": [
-        "lint",
-        "config"
+        [
+          "lint",
+          "config",
+          "preflight"
+        ],
+        [
+          "only",
+          "sufficient",
+          "incomplete",
+          "scope",
+          "gap",
+          "no other"
+        ]
       ]
     }
   ],

@@ -145,6 +145,45 @@ def test_a_stale_snapshot_stops_a_run_before_any_worker_is_spawned(tmp_path: Pat
         load_task(task / "task.json")
 
 
+def test_a_stale_snapshot_also_stops_invoke_which_skips_load_task(tmp_path: Path) -> None:
+    """`invoke` builds its call in `_build_call`, never touching `load_task` -
+    so the refusal above protects only the paths that happen to use it. The
+    duplicate check inside `_build_call` is the one standing between a stale
+    snapshot and a real spawn on this path, and until this test (panel
+    2026-09-06, B3) deleting it broke nothing.
+    """
+    import argparse
+
+    from eval.run import _build_call
+
+    from eris.launch import LaunchRefused
+    from eris.policy import load_policy
+    from tests.test_run_harness import world
+
+    w = world(tmp_path)  # a valid policy with CLI workers; its corpus is unused
+    task = _task_dir(tmp_path)
+    build_snapshot(task, runner=lambda argv, cwd: None)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("q")
+    args = argparse.Namespace(
+        worker="grok",
+        prompt_file=str(prompt),
+        snapshot=str(task / "snapshot"),
+        task_id="t_01",
+        stage="propose",
+        repeat_index=0,
+    )
+    loaded = load_policy(w["policy"])
+
+    # fresh snapshot: the call builds
+    _build_call(loaded, args, {}, home=tmp_path, scratch_dir=None)
+
+    # drift the committed files: the SAME invocation must now refuse
+    (task / "files" / "calc.py").write_text("def add(a, b):\n    return a + b  # drifted\n")
+    with pytest.raises(LaunchRefused, match="does not match the committed"):
+        _build_call(loaded, args, {}, home=tmp_path, scratch_dir=None)
+
+
 def test_the_builder_can_make_every_snapshot_a_clone_is_missing(tmp_path: Path) -> None:
     """Snapshots are gitignored, so a fresh checkout has NONE and every run
     refuses. `--all` is the one command that makes a clone runnable; without it

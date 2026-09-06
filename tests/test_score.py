@@ -1496,7 +1496,7 @@ def test_comparison_is_blocked_when_an_arm_drops_cells_for_validator_findings() 
     assert "dropped cells for validator findings" not in reason
 
 
-def test_an_inert_REF_error_excludes_the_cell_even_though_its_code_is_handled() -> None:
+def test_an_inert_REF_error_counts_as_malformed_even_though_its_code_is_handled() -> None:
     """M1, stop-gate finding: the scorer must use `acted`, not the code.
 
     `REF_MISSING` is in the HANDLED family - it downgrades a SUPPORTED ruling -
@@ -1847,8 +1847,16 @@ def test_the_shipped_key_is_outside_the_corpus_and_has_a_canary() -> None:
     root = Path(__file__).resolve().parent.parent
     corpus = root / "eval" / "corpus"
     for task_dir in sorted(p for p in corpus.iterdir() if p.is_dir()):
-        assert not (task_dir / "key.json").exists(), (
-            f"{task_dir.name} has a key inside the corpus - readable by its own worker"
+        # `find_leaked_keys` ITSELF, not a re-implementation and not one
+        # filename at the root (panel 2026-09-06, B5): a committed
+        # `files/key.json` or `snapshot/answer.json` sat outside the old
+        # check's field of view, and a copied walk would drift from the real one.
+        from eval.score import find_leaked_keys
+
+        leaked = find_leaked_keys(task_dir)
+        assert not leaked, (
+            f"{task_dir.name} has key-shaped files inside the corpus - readable by "
+            f"its own worker: {[str(x) for x in leaked]}"
         )
     keys = sorted((root / "eval" / "keys").glob("*.json"))
     # asserted, not assumed: an empty glob would walk the loop zero times and
@@ -2299,6 +2307,239 @@ def test_a_control_key_may_not_plant_findings() -> None:
     assert Key.model_validate(key_dict(category="planted")).findings
 
 
+def test_must_mention_groups_are_or_within_and_across() -> None:
+    """A `must_mention` entry is one required CONCEPT: a bare string, or a list
+    of interchangeable phrasings (panel 2026-09-06, E1/E2/E5). Single tokens
+    demanded ONE wording - a correct dual-parser finding that did not say
+    "pydantic" scored as a miss, verified against the live key before the
+    change. AND still holds across entries, so a generic sentence that hits one
+    group and not the other still misses.
+    """
+    import json
+
+    from eval.score import Key
+
+    key = Key.model_validate(
+        {
+            "key_version": 1,
+            "task_id": "t",
+            "category": "plan",
+            "expected_verdict": ["REVISE"],
+            "line_tolerance": 0,
+            "findings": [
+                {
+                    "id": "f1",
+                    "path": "D.md",
+                    "line_start": 1,
+                    "line_end": 5,
+                    "severity": "medium",
+                    "must_mention": [["graded"], ["pydantic", "reader", "diverg"]],
+                }
+            ],
+            "distractors": [],
+            "scan": {"fix_hunk_lines": [], "extra_strings": []},
+        }
+    )
+
+    def hit(desc: str) -> bool:
+        got = match_findings([Predicted("D.md", 1, 5, Severity.MEDIUM, desc)], key).matched_ids
+        return "f1" in got
+
+    assert hit("the graded flag has two readers")  # group 2 via "reader"
+    assert hit("graded is parsed with pydantic")  # group 2 via "pydantic"
+    assert hit("graded defaults diverge between parsers")  # group 2 via "diverg"
+    assert not hit("two readers can diverge"), "group 1 (graded) is still required"
+    assert not hit("the graded flag exists"), "group 2 is still required"
+    # a BARE STRING entry still works and still means AND
+    plain = json.loads(json.dumps(key.model_dump(mode="json")))
+    plain["findings"][0]["must_mention"] = ["graded", "pydantic"]
+    key2 = Key.model_validate(plain)
+    got = match_findings(
+        [Predicted("D.md", 1, 5, Severity.MEDIUM, "graded has readers")], key2
+    ).matched_ids
+    assert "f1" not in got, "bare strings remain exact AND requirements"
+
+
+def test_the_live_plan_keys_credit_the_paraphrases_the_panel_proved_they_missed() -> None:
+    """The shipped keys, not fixtures: each row is a CORRECT wording that the
+    panel verified scored as a miss before 2026-09-06, plus a generic wording
+    that must STILL miss so the groups have not gone slack.
+    """
+    import json
+
+    root = Path(__file__).resolve().parent.parent
+    cases = [
+        (
+            "plan-migration",
+            "MIGRATION.md",
+            75,
+            79,
+            "graded flag is read by two components with independent defaults",
+            "m3",
+            True,
+        ),
+        ("plan-migration", "MIGRATION.md", 75, 79, "the graded flag exists", "m3", False),
+        (
+            "plan-migration",
+            "MIGRATION.md",
+            22,
+            29,
+            "leaving MARKERS unchanged means the detector misses the new key location",
+            "m1",
+            True,
+        ),
+        (
+            "plan-rollout",
+            "ROLLOUT.md",
+            14,
+            22,
+            "success metric uses the model's own severity label as a confidence "
+            "signal, which is gameable by tone",
+            "r1",
+            True,
+        ),
+        (
+            "plan-rollout",
+            "ROLLOUT.md",
+            56,
+            60,
+            "the preflight scope is incomplete before enabling the pipeline",
+            "r2",
+            True,
+        ),
+        ("plan-rollout", "ROLLOUT.md", 56, 60, "there is a lint step for the config", "r2", False),
+    ]
+    from eval.score import Key
+
+    for key_name, path, ls, le, desc, want, should in cases:
+        key = Key.model_validate(
+            json.loads((root / "eval" / "keys" / f"{key_name}.json").read_text())
+        )
+        got = match_findings([Predicted(path, ls, le, Severity.MEDIUM, desc)], key).matched_ids
+        assert (want in got) == should, f"{key_name}/{want}: {desc!r} -> {got}"
+
+
+def test_m2_is_no_longer_a_keyed_finding() -> None:
+    """MIGRATION.md lines 49-54 state a pre-existing workspace fact - generated,
+    gitignored, builder run once - and name no step of the migration that
+    breaks. Requiring it for full recall paid reviewers for citing a non-defect
+    (panel 2026-09-06, E3; the raiser conceded after failing to name a step it
+    predicts will fail). Dropped, and NOT converted to a distractor: the span
+    is TRUE, and paying a penalty for quoting it would replace one scoring
+    error with another. A prediction there now counts against precision like
+    any other unmatched claim, which is the metric doing its job.
+    """
+    import json
+
+    root = Path(__file__).resolve().parent.parent
+    key = json.loads((root / "eval" / "keys" / "plan-migration.json").read_text())
+    assert [f["id"] for f in key["findings"]] == ["m1", "m3"]
+    assert all(
+        not (int(d["line_start"]) <= 51 <= int(d["line_end"])) for d in key["distractors"]
+    ), "m2's span must not be FP bait either"
+
+
+def test_symmetric_exclusions_also_block_the_comparison() -> None:
+    """The block fired only on ASYMMETRIC loss (panel 2026-09-06, A1): when
+    every arm excluded the SAME cell, `unequal` stayed empty, `blocked` read
+    False, and the pooled rates quietly described the survivor subset. Two arms
+    that both lose the hard task to contamination report recall over the easy
+    one with nothing saying so.
+    """
+    from eval.score import _comparison_block
+
+    scores = [
+        _cs(task_id="easy", repeat_index=0, arm_key="A", included=True),
+        _cs(task_id="hard", repeat_index=0, arm_key="A", included=False, exclusion="contaminated"),
+        _cs(task_id="easy", repeat_index=0, arm_key="B", included=True),
+        _cs(task_id="hard", repeat_index=0, arm_key="B", included=False, exclusion="contaminated"),
+    ]
+    block = _comparison_block(scores, {"missing": []})
+    assert block["blocked"] is True
+    assert "covers 1 of the 2" in block["reason"]
+    assert "hard#0" in block["reason"], "the lost cell is named, not implied"
+    assert block["common_support"] == ["easy#0"]
+
+    # full coverage does NOT fire it: same arms, nothing excluded
+    covered = [
+        _cs(task_id="easy", repeat_index=0, arm_key="A", included=True),
+        _cs(task_id="hard", repeat_index=0, arm_key="A", included=True),
+        _cs(task_id="easy", repeat_index=0, arm_key="B", included=True),
+        _cs(task_id="hard", repeat_index=0, arm_key="B", included=True),
+    ]
+    assert _comparison_block(covered, {"missing": []})["blocked"] is False
+
+    # one arm alone is never a comparison, whatever it lost
+    solo = [
+        _cs(task_id="easy", repeat_index=0, arm_key="A", included=True),
+        _cs(task_id="hard", repeat_index=0, arm_key="A", included=False, exclusion="contaminated"),
+    ]
+    assert _comparison_block(solo, {"missing": []})["blocked"] is False
+
+
+def test_the_block_is_stamped_inside_every_per_arm_block() -> None:
+    """b-s3 shipped `blocked: true` beside per-arm rates that stayed readable
+    without it (panel 2026-09-06, A2). The marker rides inside each per-arm
+    block, in both states, so `.per_arm[arm]` cannot be read without it.
+    """
+    from eval.score import _stamp_pooled_comparison
+
+    per_arm = {"A": {"recall": 1.0}, "B": {"recall": 0.5}}
+    _stamp_pooled_comparison(per_arm, {"blocked": True})
+    assert per_arm["A"]["pooled_comparison"].startswith("BLOCKED")
+    assert per_arm["B"]["pooled_comparison"].startswith("BLOCKED")
+    _stamp_pooled_comparison(per_arm, {"blocked": False})
+    assert per_arm["A"]["pooled_comparison"] == "ok"
+
+
+def test_verdict_error_rates_are_none_without_a_verdict() -> None:
+    """b-s1's sixteen single-arm cells carry `verdict: None` and reported
+    `wrong_accept_rate 0.0` - indistinguishable from a judge that never erred
+    (panel 2026-09-06, A3, extended to `wrong_reject` by a round-2 addition).
+    A cell with no verdict cannot commit a verdict error and is not in the
+    denominator.
+    """
+    verdictless = [_cs(task_id=f"t{i}", repeat_index=0, verdict=None) for i in range(4)]
+    agg = aggregate(verdictless)["single:w"]
+    assert agg["wrong_accept_rate"] is None
+    assert agg["wrong_reject_rate"] is None
+    assert agg["verdict_cells"] == 0
+
+    # the mutation this exists to kill: averaging over ALL included cells. One
+    # wrong accept beside one verdictless cell is 1/1, not 1/2.
+    mixed = [
+        _cs(task_id="t0", repeat_index=0, wrong_accept=True),
+        _cs(task_id="t1", repeat_index=0, verdict=None),
+    ]
+    agg = aggregate(mixed)["single:w"]
+    assert agg["wrong_accept_rate"] == 1.0
+    assert agg["verdict_cells"] == 1
+
+
+def test_malformed_rate_is_over_assessed_cells_only() -> None:
+    """1 malformed + 9 `validator_errors=None` read 0.1, and an all-unknown arm
+    read a reassuring 0.0 (panel 2026-09-06, A4). A cell with no validator
+    record proves nothing either way; `unknown` beside the rate counts what it
+    cannot see. Both fields of this name - `per_arm[*].validator` and
+    `comparison.per_arm[*]` - share the denominator.
+    """
+    from eval.score import _comparison_block
+
+    one_bad = [_cs(task_id="t0", repeat_index=0, validator_errors=1)] + [
+        _cs(task_id=f"t{i}", repeat_index=0, validator_errors=None) for i in range(1, 10)
+    ]
+    agg = aggregate(one_bad)["single:w"]
+    assert agg["validator"]["malformed_rate"] == 1.0, "the one assessed cell IS malformed"
+    assert agg["validator"]["unknown"] == 9
+
+    all_unknown = [_cs(task_id=f"t{i}", repeat_index=0, validator_errors=None) for i in range(4)]
+    agg = aggregate(all_unknown)["single:w"]
+    assert agg["validator"]["malformed_rate"] is None, "nothing assessed, nothing to rate"
+
+    comp = _comparison_block(one_bad, {"missing": []})
+    assert comp["per_arm"]["single:w"]["malformed_rate"] == 1.0
+
+
 def test_comparison_is_blocked_when_arms_scored_different_cells() -> None:
     """Cells are excluded PER ARM - contamination, budget, missing, incomplete,
     no_scan, validator - so two arms' pooled rates can be computed over different
@@ -2618,6 +2859,16 @@ def test_wrong_accept_is_mechanical_and_severity_cannot_move_it() -> None:
     assert agg_quiet["severe_false_positive_rate"] == 0.0
     # ...and cannot touch the one the decision rule reads
     assert agg_loud["wrong_accept_rate"] == agg_quiet["wrong_accept_rate"] == 1.0
+    # The distinguishing cell IN THIS TEST (panel 2026-09-06, B2): both fixtures
+    # above already carry wrong_accept=True, so an OR-merge of the two flags in
+    # `aggregate` left every assertion green - the cell that catches it lived
+    # only in a sibling. severity WITHOUT a wrong accept must read 0.0 here.
+    sfp_only = _cs(wrong_accept=False, wrong_reject=False, severe_false_positive=True)
+    agg_sfp = aggregate([sfp_only])["single:w"]
+    assert agg_sfp["severe_false_positive_rate"] == 1.0
+    assert agg_sfp["wrong_accept_rate"] == 0.0, (
+        "a severe false positive alone moved wrong_accept_rate - the two flags have been re-merged"
+    )
 
 
 def test_the_decision_rule_metric_is_reported_apart_from_the_severity_one() -> None:
@@ -2794,7 +3045,14 @@ def test_no_shipped_key_can_be_swept_by_one_prediction() -> None:
                 continue  # one finding cannot be over-covered
             checked += 1
             doc_lines = len((task_dir / "files" / path).read_text().splitlines())
-            every_token = " ".join(tok for f in here for tok in f.must_mention)
+            # groups flattened: the sweeping adversary this models says every
+            # alternative of every concept, which is the hardest case
+            every_token = " ".join(
+                alt
+                for f in here
+                for tok in f.must_mention
+                for alt in (tok if isinstance(tok, list) else [tok])
+            )
             # The widest window the KEY permits, slid over the whole document -
             # not merely a full-document claim. A bound of 46 over a 47-line
             # file rejects the full sweep and admits every near-sweep, so
@@ -2936,7 +3194,25 @@ def test_a_paired_delta_marks_spent_cost_as_order_dependent(tmp_path: Path) -> N
         "arm 4 replayed the proposal arm 3 paid for, so its spent cost omits "
         "that call and the spent delta flatters it"
     )
-    assert "delta_cost_attributed_usd" in pair
+    # The VALUE, not just the key (panel 2026-09-06, B1): `in pair` alone let
+    # attributed alias to spent, to zero, or to -spent. Attributed = treatment
+    # attributed minus base attributed, and it differs from the spent delta by
+    # construction here: arm 4 replays the proposal arm 3 paid for (attributed
+    # to both, spent by arm 3) and pays for its own critique.
+    t_cell = next(
+        c for c in summary["cells"] if c["arm"] == "indep_verify_critique" and c["included"]
+    )
+    b_cell = next(c for c in summary["cells"] if c["arm"] == "indep_verify" and c["included"])
+    assert pair["delta_cost_attributed_usd"] == round(
+        t_cell["cost_attributed_usd"] - b_cell["cost_attributed_usd"], 6
+    )
+    assert pair["delta_cost_attributed_usd"] > 0, (
+        "arm 4 used everything arm 3 used plus a critique; attributed must charge for it"
+    )
+    assert pair["delta_cost_attributed_usd"] != pair["delta_cost_spent_usd"], (
+        "if these agree the fixture no longer distinguishes the two figures and "
+        "this test has stopped testing B1"
+    )
 
 
 def test_a_treatment_whose_calls_failed_is_not_a_no_op_replay(tmp_path: Path) -> None:

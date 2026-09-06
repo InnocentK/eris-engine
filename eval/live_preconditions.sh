@@ -19,28 +19,55 @@ IDS="$CAMPAIGN_IDS $SINGLE_RUN_IDS"
 fail=0
 chk() { if [ "$1" -eq 0 ]; then echo "  PASS  $2"; else echo "  FAIL  $2"; fail=1; fi; }
 
+# Private scratch, never "$TMPD"/pf.out and friends (panel 2026-09-06, round-2
+# addition): fixed names are writable by any local process and shared by any
+# two gates running at once, so one invocation could grep another's output -
+# or an attacker's.
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/eris-gate.XXXXXX") || exit 1
+trap 'rm -rf "$TMPD"' EXIT
+
 # preflight EXITS 0 even when it reports problems: a missing env-file and a
 # grok worker with no XAI_API_KEY come back as WARN with status 0. Checking the
 # exit code alone passed a doctor that was telling us the run would fail. The
 # WARN lines that matter for a live run are the ones about workers this campaign
 # uses; every non-OK line is surfaced and any worker WARN fails the gate.
-"$PY" eval/run.py preflight --policy "$POLICY" --env-file "$ENVFILE" >/tmp/pf.out 2>&1
+"$PY" eval/run.py preflight --policy "$POLICY" --env-file "$ENVFILE" >"$TMPD"/pf.out 2>&1
 pf_rc=$?
-grep -vE "^(OK|doctor:)" /tmp/pf.out || true
+grep -vE "^(OK|doctor:)" "$TMPD"/pf.out || true
 # Scoped to the workers this campaign actually spawns - the CLI panel and the
 # judge. `openai-api` is an api-transport worker with no key configured and it
 # WARNs every time; failing the gate on it would block a run for a worker that
 # is never called, which is a false alarm and trains an operator to ignore the
 # gate.
-USED=$("$PY" -c "import sys; sys.path.insert(0,'src')
+# Ids are REGEX-ESCAPED (they may contain `.`, which bare in an ERE matched
+# fooXbar for foo.bar) and the id is anchored with `[.:]` - the doctor writes
+# `worker.<id>: msg` and `worker.<id>.<subfield>: msg`, and `\b` both
+# over-matched (worker.grok also prefixes worker.grok2? no - but foo.bar
+# matched fooXbar) and UNDER-matched an id ending in a non-word character,
+# where no boundary exists before the `:` (panel 2026-09-06, D2 + the raiser's
+# counter). NOTE this is every CLI worker the POLICY declares, not the subset a
+# given campaign spawns - equal today, and a WARN on a declared-but-unused CLI
+# worker would fail the gate early rather than silently (round-2 addition,
+# recorded).
+USED=$("$PY" -c "import sys, re; sys.path.insert(0,'src')
 from pathlib import Path
 from eris.policy import load_policy
 from eris.schemas import Transport
 p = load_policy(Path('$POLICY')).policy
-print('|'.join(n for n, w in p.workers.items() if w.transport is Transport.CLI))")
-[ "$pf_rc" -eq 0 ] && ! grep -qE "^(FAIL|ERROR)" /tmp/pf.out \
-    && ! grep -qE "^WARN worker\.($USED)\b" /tmp/pf.out
-chk $? "preflight: exit 0, no FAIL/ERROR, no WARN for a worker this run uses ($USED)"
+print('|'.join(re.escape(n) for n, w in p.workers.items() if w.transport is Transport.CLI))")
+if [ -n "$USED" ]; then
+    # Empty USED is skipped OUTRIGHT rather than interpolated (panel
+    # 2026-09-06, D1): `worker\.()\b` is implementation-defined - BSD grep
+    # matches it against EVERY worker WARN (false FAIL), ugrep errors and the
+    # `!` turned that error into a silent pass (false PASS). Both observed on
+    # this machine, one per grep on PATH.
+    [ "$pf_rc" -eq 0 ] && ! grep -qE "^(FAIL|ERROR)" "$TMPD"/pf.out \
+        && ! grep -qE "^WARN worker\.($USED)[.:]" "$TMPD"/pf.out
+    chk $? "preflight: exit 0, no FAIL/ERROR, no WARN for a worker this run uses ($USED)"
+else
+    [ "$pf_rc" -eq 0 ] && ! grep -qE "^(FAIL|ERROR)" "$TMPD"/pf.out
+    chk $? "preflight: exit 0, no FAIL/ERROR (no CLI workers declared, so no WARN scope)"
+fi
 
 # Calls the REAL launch-time gate, `launch.preflight_executable`, once per CLI
 # worker - it resolves the pinned path, hashes the realpath and compares with
@@ -52,7 +79,7 @@ chk $? "preflight: exit 0, no FAIL/ERROR, no WARN for a worker this run uses ($U
 # verbatim and NOTHING hashes the binary at load time, so a stale pin loads as
 # pinned=True. Five deliberately corrupted pins all passed that check
 # (2026-08-31), while the binaries had genuinely changed under it.
-"$PY" - "$POLICY" <<'PY' >/tmp/pins.out 2>&1
+"$PY" - "$POLICY" <<'PY' >"$TMPD"/pins.out 2>&1
 import sys
 sys.path.insert(0, "src")
 from pathlib import Path
@@ -76,8 +103,14 @@ sys.exit(1 if bad else 0)
 PY
 chk $? "every CLI worker passes the launch-time pin check (stale pin = refusal mid-campaign)"
 
-[ -f "$ENVFILE" ] && grep -q '^XAI_API_KEY=' "$ENVFILE"
-chk $? "$ENVFILE exists and carries XAI_API_KEY (grok refuses at launch without it)"
+# `=..*` - a non-empty VALUE (panel 2026-09-06, D4): `XAI_API_KEY=` satisfied
+# the name-only grep, and launch does not save you - `_read_env_values` keeps
+# empty values and `plan_call` checks name presence only, so the empty string
+# would be handed to grok as its credential. (Today the doctor's
+# `worker.grok.env` WARN also fails the gate above, since the doctor drops
+# empty values; this line stops being decorative the day that changes.)
+[ -f "$ENVFILE" ] && grep -q '^XAI_API_KEY=..*' "$ENVFILE"
+chk $? "$ENVFILE exists and carries a NON-EMPTY XAI_API_KEY (grok refuses at launch without it)"
 
 # Resolved ABSOLUTE and shell-QUOTED. A runs_dir containing a space is valid
 # (`runs_dir: "my runs"`), and an unquoted relative path turned the stop command
@@ -96,7 +129,7 @@ chk $? "runs_dir resolved from the policy: ${RUNS:-<unresolved>}"
 # Snapshots are GENERATED and gitignored, so a clean checkout has none and every
 # run refuses with "snapshot ... is not a directory" - after the campaign has
 # started. Nothing in the earlier gate looked at them.
-"$PY" - <<'PY' >/tmp/snap.out 2>&1
+"$PY" - <<'PY' >"$TMPD"/snap.out 2>&1
 import sys
 sys.path.insert(0, ".")
 from pathlib import Path

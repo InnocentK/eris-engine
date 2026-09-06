@@ -105,6 +105,16 @@ independent, one persuaded by evidence", not three witnesses. The strongest
 argument is structural rather than statistical and does not depend on n: only
 2 cells have ever been excluded, out of 32.
 
+> **CORRECTION 2026-09-06** (§9.9 diff panel, finding C3): "out of 32" is
+> wrong. 32 = b-s1 (20) + b-s3 (12), but one of the two exclusions happened in
+> b-s3b, whose 12 cells the denominator omits - the numerator and denominator
+> were drawn from different populations. The true figure: **2 exclusions out of
+> 44 scored cells** across b-s1 (20, 0 exclusions), b-s3 (12, 1:
+> `DISSENT_EMPTY_WITH_CONTEST`) and b-s3b (12, 1: `REF_NOT_MECHANICAL`). The
+> structural argument survives - the rate was never the point - but the number
+> as written was an arithmetic error, found by a reviewer, verified against the
+> ledgers.
+
 grok's round-3 caution is worth keeping: an unblocked pooled comparison is not
 the same as a usable one, and `common_support: 4` is the pooled set - a paired
 delta is a different question.

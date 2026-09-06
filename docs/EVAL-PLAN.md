@@ -106,8 +106,13 @@ M1 clause verbatim (coupled by test) and prints the caveats with every summary;
     `critical` as `low` without changing anything it found.
   * Mechanical scoring of a `plan` task is APPROXIMATE and is an upper bound
     on precision. A match is a location overlap plus every `must_mention`
-    token; the tokens are a subject-and-object conjunction chosen to survive
-    paraphrase, and the key's `max_prediction_span` bounds how wide a
+    CONCEPT - each entry a bare token or a group of interchangeable phrasings,
+    ANY one of which satisfies it (2026-09-06; the single-token form was
+    "chosen to survive paraphrase" and did not: a correct dual-parser finding
+    that omitted the word "pydantic" scored as a miss, verified against the
+    live matcher). Editing a key after a campaign ran does not silently rescore
+    it - the scorer refuses on the recorded key hash, so a key revision starts
+    a new scoring epoch. The key's `max_prediction_span` bounds how wide a
     prediction may be and still count as pointing at a finding, so a whole-file
     claim identifies nothing. That bound is per-KEY and unset by default: on a
     plan document a sweep is meaningless, but on code a model naming the whole

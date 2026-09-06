@@ -14,19 +14,16 @@
       "line_end": 29,
       "severity": "high",
       "must_mention": [
-        "marker",
-        "answers"
-      ]
-    },
-    {
-      "id": "m2",
-      "path": "MIGRATION.md",
-      "line_start": 49,
-      "line_end": 54,
-      "severity": "medium",
-      "must_mention": [
-        "workspace",
-        "generat"
+        [
+          "marker"
+        ],
+        [
+          "answers",
+          "new location",
+          "new path",
+          "keys/",
+          "miss"
+        ]
       ]
     },
     {
@@ -36,8 +33,17 @@
       "line_end": 79,
       "severity": "medium",
       "must_mention": [
-        "graded",
-        "pydantic"
+        [
+          "graded"
+        ],
+        [
+          "pydantic",
+          "reader",
+          "parser",
+          "independent",
+          "diverg",
+          "two components"
+        ]
       ]
     }
   ],

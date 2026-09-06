@@ -23,7 +23,8 @@ Per cell (one run dir with ``manifest.json``):
   keys are as readable as the others is recorded in EVAL-PLAN).
 
 Metrics: precision / recall over findings (path + line overlap within
-``line_tolerance``, ``must_mention`` strings present; 0/0 -> None),
+``line_tolerance``, every ``must_mention`` concept present - a concept is a
+bare string or an any-of group; 0/0 -> None),
 distractor hits (counted as FP), unsupported-claim rate
 (``adjudication.enforced.downgrades`` / rulings), confident-wrong (ACCEPT
 off-key, or a high/critical FP), abstention 2x2, cost spent AND attributed
@@ -115,7 +116,16 @@ class _Span(_Strict):
 class KeyFinding(_Span):
     id: str = Field(min_length=1)
     severity: Severity
-    must_mention: list[str] = Field(default_factory=list)
+    # AND across entries; each entry is one required CONCEPT - a bare string
+    # (exact substring) or a list of interchangeable phrasings, any one of
+    # which satisfies it. Single-token entries demanded ONE wording of a
+    # correct answer: a dual-parser finding that did not say "pydantic" and a
+    # stale-MARKERS finding that did not say "answers" both scored as misses,
+    # verified with this matcher before the change (panel 2026-09-06,
+    # E1/E2/E5). Groups hold synonyms OF THE DEFECT, not topical fillers - a
+    # group loose enough for a generic sentence re-opens the gap from the
+    # other side.
+    must_mention: list[str | list[str]] = Field(default_factory=list)
 
 
 class Distractor(_Span):
@@ -686,7 +696,10 @@ def _matches(pred: Predicted, kf: KeyFinding, tolerance: int, max_span: int | No
     if not _overlap(ps, pe, kf.line_start, kf.line_end, tolerance):
         return False
     text = pred.description.lower()
-    return all(m.lower() in text for m in kf.must_mention)
+    return all(
+        any(alt.lower() in text for alt in (m if isinstance(m, list) else [m]))
+        for m in kf.must_mention
+    )
 
 
 @dataclass
@@ -1337,8 +1350,17 @@ def _by_category(inc: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             "cells": len(cells),
             "precision": _rates(cells, "precision"),
             "recall": _rates(cells, "recall"),
-            "wrong_accept_rate": _mean([float(s.wrong_accept) for s in cells]),
-            "wrong_reject_rate": _mean([float(s.wrong_reject) for s in cells]),
+            # Over cells WITH a verdict, None when none has one (panel 2026-09-06,
+            # A3): a cell that produced no verdict cannot have made a verdict
+            # error, and averaging its False as 0.0 made an arm that never
+            # judges read exactly like a judge that never erred. b-s1's sixteen
+            # single-arm cells all carry `verdict: None` and reported 0.0.
+            "wrong_accept_rate": _mean(
+                [float(s.wrong_accept) for s in cells if s.verdict is not None]
+            ),
+            "wrong_reject_rate": _mean(
+                [float(s.wrong_reject) for s in cells if s.verdict is not None]
+            ),
             "severe_false_positive_rate": _mean([float(s.severe_false_positive) for s in cells]),
             "distractor_hits": sum(s.distractor_hits for s in cells),
             "redundant": sum(s.redundant for s in cells),
@@ -1383,10 +1405,19 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                 "unknown": len([s for s in cells if s.validator_errors is None]),
                 "errors": sum(s.validator_errors or 0 for s in cells),
                 # a RATE, not just counts: 1-of-1 and 2-of-100 are not comparable
-                # as counts, and EVAL-PLAN's rule is stated in terms of a rate
+                # as counts, and EVAL-PLAN's rule is stated in terms of a rate.
+                # Over ASSESSED cells only (panel 2026-09-06, A4): a cell with
+                # no validator record proves nothing either way, and leaving it
+                # in the denominator let 1 malformed + 9 unknown read as 0.1 -
+                # and an all-unknown arm as a reassuring 0.0. `unknown` beside
+                # it is the count of what this rate cannot see.
                 "malformed_rate": (
-                    round(len([s for s in cells if s.validator_errors]) / len(cells), 4)
-                    if cells
+                    round(
+                        len([s for s in cells if s.validator_errors])
+                        / len([s for s in cells if s.validator_errors is not None]),
+                        4,
+                    )
+                    if any(s.validator_errors is not None for s in cells)
                     else None
                 ),
                 "codes": {
@@ -1422,8 +1453,17 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
             # the decision rule reads `wrong_accept_rate`. `severe_false_positive_rate`
             # is reported beside it and is NOT an input to any rule: it is the
             # model's own severity label on its own claim.
-            "wrong_accept_rate": _mean([float(s.wrong_accept) for s in inc]),
-            "wrong_reject_rate": _mean([float(s.wrong_reject) for s in inc]),
+            # Denominator: included cells WITH a verdict; None when none has one
+            # (panel 2026-09-06, A3 + a round-2 addition extending it to
+            # `wrong_reject`). `float(False)` over verdictless cells scored an
+            # arm that never judges as a judge that never erred.
+            "wrong_accept_rate": _mean(
+                [float(s.wrong_accept) for s in inc if s.verdict is not None]
+            ),
+            "wrong_reject_rate": _mean(
+                [float(s.wrong_reject) for s in inc if s.verdict is not None]
+            ),
+            "verdict_cells": len([s for s in inc if s.verdict is not None]),
             "severe_false_positive_rate": _mean([float(s.severe_false_positive) for s in inc]),
             "distractor_hits": sum(s.distractor_hits for s in inc),
             # Predictions that repeated a key finding another prediction was
@@ -1646,6 +1686,26 @@ M1_PRE_REGISTRATION = (
 )
 
 
+def _stamp_pooled_comparison(
+    per_arm: dict[str, dict[str, Any]], comparison: dict[str, Any]
+) -> None:
+    """Put the comparison block INSIDE each per-arm block, not only beside it.
+
+    A consumer who reads `per_arm[arm].recall.micro` never passes through
+    `comparison`, and b-s3 shipped `blocked: true` with the pooled rates it
+    forbids sitting readable one key over (panel 2026-09-06, A2). The rates
+    stay - each is a true description of ONE arm - but the block travels with
+    them. Recorded dissent: one reviewer holds that comparative outputs should
+    be WITHHELD when blocked; adjudicated against, because no per-arm field is
+    itself a comparison and nulling them deletes real per-arm description.
+    """
+    marker = (
+        "BLOCKED - see comparison.reason before comparing arms" if comparison["blocked"] else "ok"
+    )
+    for block in per_arm.values():
+        block["pooled_comparison"] = marker
+
+
 def _comparison_block(
     scores: Sequence[CellScore], matrix: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1685,7 +1745,14 @@ def _comparison_block(
             "cells": len(cells),
             "dropped_for_absent_validator_record": dropped,
             "malformed_cells": malformed,
-            "malformed_rate": round(malformed / len(cells), 4) if cells else None,
+            # over assessed cells, like `per_arm[*].validator.malformed_rate`
+            # (panel 2026-09-06, A4) - the two fields share a name and must
+            # share a denominator
+            "malformed_rate": (
+                round(malformed / len([s for s in cells if s.validator_errors is not None]), 4)
+                if any(s.validator_errors is not None for s in cells)
+                else None
+            ),
         }
     coarse = sorted({s.arm_key for s in scores if s.validator_basis == "coarse_codes"})
     for arm, v in per_arm.items():
@@ -1710,6 +1777,14 @@ def _comparison_block(
             f"{tid}#{rep}" for tid, rep in sorted(support[arm] - common)
         )
     unequal = sorted(a for a in per_arm if support[a] != common)
+    # Every (task, repeat) that produced a scored cell RECORD, included or not.
+    # `common` is the intersection of INCLUDED supports, so a cell excluded by
+    # every arm vanishes from all of them symmetrically and `unequal` stays
+    # empty - which is how a campaign that lost its hardest task to shared
+    # contamination reported `blocked: False` with rates over the survivors
+    # (panel 2026-09-06, A1: reproduced before fixing). Missing-from-disk cells
+    # are the matrix reason, not this one.
+    population = {(s.task_id, s.repeat_index) for s in scores}
 
     offenders = sorted(a for a, v in per_arm.items() if v["dropped_for_absent_validator_record"])
     reasons: list[str] = []
@@ -1727,6 +1802,16 @@ def _comparison_block(
             "are over different task populations. `common_support` lists what they share; a "
             "difference between arms here is confounded with the difference in what they were "
             "measured on"
+        )
+    if len(support) > 1 and common != population:
+        lost = sorted(f"{tid}#{rep}" for tid, rep in sorted(population - common))
+        reasons.append(
+            f"the arms' common support covers {len(common)} of the {len(population)} "
+            "(task, repeat) cells that produced a scored record - "
+            f"{', '.join(lost[:8])}{', ...' if len(lost) > 8 else ''} outside it - so the "
+            "pooled rates are over the surviving subset. A rate quoted from this summary "
+            "describes `common_support`, and its difference from a rate over the declared "
+            "corpus is confounded with which cells survived"
         )
     if offenders:
         # PER-ARM ONLY. No comparative, and no universal either. This sentence
@@ -1884,6 +1969,9 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         key = load_key(corpus, task_id)
         scores.append(score_cell(cell, key, home=home, corpus=corpus))
     matrix = _matrix_block(campaign_dir, scores)
+    per_arm = aggregate(scores)
+    comparison = _comparison_block(scores, matrix)
+    _stamp_pooled_comparison(per_arm, comparison)
     return {
         "campaign_dir": str(campaign_dir),
         "cells": [asdict(s) for s in scores],
@@ -1892,7 +1980,7 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         # cells from a ledger written before task/key hashes were recorded: their
         # inputs cannot be shown to be the ones they ran against
         "inputs_unbound": unbound,
-        "per_arm": aggregate(scores),
+        "per_arm": per_arm,
         "matrix": matrix,
         "paired": paired_deltas(scores),
         # M1 (panel): excluding malformed cells creates a NEW bias - only arm 4
@@ -1902,7 +1990,7 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
         # per-arm means are then computed over different populations and are not
         # comparable. Saying so in prose is advice; this says it in the output,
         # the way the E1 gate does.
-        "comparison": _comparison_block(scores, matrix),
+        "comparison": comparison,
         "validator": {
             "malformed_cells": len([s for s in scores if s.validator_errors]),
             "unknown_cells": len([s for s in scores if s.validator_errors is None]),

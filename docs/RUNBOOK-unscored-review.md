@@ -38,6 +38,7 @@ Use somewhere like `~/eris-reviews/<slug>/`.
 
 ```bash
 SLUG=my-design-doc                    # becomes task_id; must equal the dir name
+RUN_ID="$SLUG-001"                    # the ONE id used by the gate AND the run
 DEST=~/eris-reviews/$SLUG
 SRC=/path/to/YOUR-DOC.md              # the document under review
 DOC=$(basename "$SRC")
@@ -108,9 +109,16 @@ print('excerpts:', [(e.path, e.line_start, e.line_end) for e in t.excerpts] or
 
 ```bash
 cd /path/to/eris-engine
-CAMPAIGN_IDS='' SINGLE_RUN_IDS="$SLUG" bash eval/live_preconditions.sh
+CAMPAIGN_IDS='' SINGLE_RUN_IDS="$RUN_ID" bash eval/live_preconditions.sh
 echo "gate exit=$?"
 ```
+
+`$RUN_ID`, not `$SLUG` - the gate's collision check guards whatever id you hand
+it, and the first version of this runbook handed it `$SLUG` while step 3 ran
+`--run-id "$SLUG-001"`: the check passed against an id the run never created
+(panel 2026-09-06, C1). No overwrite was possible - `RunWriter.open` refuses an
+existing ledger - but a stale `runs/$RUN_ID` would have failed AFTER the gate
+said go, and an empty pre-created directory slips even that net.
 
 Must exit 0. It checks the worker pins against the binaries on disk, which is
 not the same as `preflight`'s exit code - `preflight` exits 0 while reporting
@@ -131,7 +139,7 @@ Re-pinning authorises new binaries. Look at what changed first.
     --arm indep_verify \
     --panel claude,codex,grok,agy \
     --judge judge \
-    --run-id "$SLUG-001" \
+    --run-id "$RUN_ID" \
     --fresh
 echo "exit=$?"
 ```
@@ -155,7 +163,7 @@ echo "exit=$?"
 adjudication:
 
 ```bash
-.venv/bin/python reviews/show_review.py runs/$SLUG-001
+.venv/bin/python reviews/show_review.py "runs/$RUN_ID"
 ```
 
 It prints the verdict (and whether the ENGINE forced it rather than the judge
@@ -171,7 +179,7 @@ error · `5` stopped · **`6` contaminated** · `7` gate refused · `130` interr
 **Exit 6 on a real repository is the one to expect that a synthetic corpus never
 produced.** It means a scan marker reached the output. Do not use the review.
 
-To resume an interrupted run: `--resume "$SLUG-001"` (it takes the run id as its
+To resume an interrupted run: `--resume "$RUN_ID"` (it takes the run id as its
 value; drop `--run-id`).
 
 ## Stopping

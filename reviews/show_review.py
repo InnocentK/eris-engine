@@ -101,8 +101,13 @@ def main(argv: list[str]) -> int:
     quotes = [k for k, _ in pack if k == "document_quote"]
     facts = [k for k, _ in pack if k == "repo_fact"]
     excerpts = [k for k, no_argv in pack if k == "repo_fact" and no_argv]
+    # "document quote(s)", not "question" (panel 2026-09-06, D3): a task with
+    # `plan_text` adds a second document_quote labelled "plan", and the ledger
+    # payload carries no label to count by - so the count is honest and the
+    # name is the kind, not a guess at its label.
     print(
-        f"\nEVIDENCE PACK: {len(pack)} item(s) - {len(quotes)} question, "
+        f"\nEVIDENCE PACK: {len(pack)} item(s) - {len(quotes)} document quote(s) "
+        f"(the question, plus the plan text when the task carries one), "
         f"{len(facts)} repo fact(s), of which {len(excerpts)} file excerpt(s)"
     )
     if not excerpts:
