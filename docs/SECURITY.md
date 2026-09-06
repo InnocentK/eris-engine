@@ -233,12 +233,16 @@ What each part of the required argv enforces, and what it does not:
   `worker.absent` and continues WITHOUT that worker, while the invocation
   record itself keeps `status: ok`: an absent panel member degrades the
   panel, an absent judge leaves the cell excluded as `incomplete`. The
-  ad-hoc `invoke` path requests NO schema (`_build_call`), so there an empty
-  SUCCESS envelope classifies OK and is handed to the caller as-is - that
-  path, and only that path, degrades to silence. Two earlier versions of
-  this sentence each misstated these semantics in one direction ("scores as
-  a proposal with no findings"; then "FAILS the invocation") and were caught
-  by stop-time review; each clause above now names its evidence.
+  ad-hoc `invoke` path never classifies at all: `cmd_invoke` calls
+  `run_worker` directly - no retry driver, so `classify` never runs and
+  `_build_call` requests no schema either - and the empty SUCCESS envelope
+  is recorded and returned to the caller as-is. That path, and only that
+  path among the CLI spawn paths (campaign and single-cell runs go through
+  the stage machinery above), degrades to silence. Three earlier versions of
+  this sentence each misstated one clause of these semantics ("scores as a
+  proposal with no findings"; "FAILS the invocation"; "classifies OK" on a
+  path that has no classifier) and each was caught by stop-time review;
+  every clause above now names code, a pinned test, or a probe.
 * Auth is HOME-rooted (A8); the exact file is UNKNOWN.
   `~/.gemini/antigravity-cli/settings.json` is declared as a credential file
   for redaction even though, when inspected, it held only
