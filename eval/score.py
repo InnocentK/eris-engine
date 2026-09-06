@@ -45,7 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -1890,7 +1890,11 @@ def declared_cells(campaign_dir: Path) -> list[dict[str, Any]] | None:
     return cells if isinstance(cells, list) else None
 
 
-def _matrix_block(campaign_dir: Path, scores: Sequence[CellScore]) -> dict[str, Any]:
+def _matrix_block(
+    campaign_dir: Path,
+    scores: Sequence[CellScore],
+    accounted_run_ids: Collection[str] = (),
+) -> dict[str, Any]:
     """What the campaign declared against what was actually scored.
 
     Cells were discovered by listing finalized directories and never compared
@@ -1922,8 +1926,15 @@ def _matrix_block(campaign_dir: Path, scores: Sequence[CellScore]) -> dict[str, 
     if declared is None:
         return {"declared": None, "scored": len(scores), "missing": None, "unexpected": None}
     want = {c["run_id"] for c in declared if isinstance(c, dict) and c.get("run_id")}
-    have = set(counts)
-    unexpected = sorted(have - want)
+    # A declared cell that was read but routed elsewhere - a PLUMBING task's
+    # cells land in `skipped`, never in `scores` - is accounted for, not
+    # missing. `camp --task-file` accepts any task including a `scored: false`
+    # one, so a mixed campaign is a legitimate shape; before this, its plumbing
+    # cells were simultaneously listed in `skipped` AND counted as `missing`,
+    # and the contradiction blocked the comparison of the cells that DID score
+    # (final §9.9 reviewer, 2026-09-06, reproduced on a mixed campaign).
+    have = set(counts) | (set(accounted_run_ids) & want)
+    unexpected = sorted(set(counts) - want)
     if unexpected:
         raise GateRefused(
             f"the campaign scored cells it never declared: {', '.join(unexpected)}. A cell "
@@ -1968,7 +1979,11 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             continue
         key = load_key(corpus, task_id)
         scores.append(score_cell(cell, key, home=home, corpus=corpus))
-    matrix = _matrix_block(campaign_dir, scores)
+    # Only SKIPPED (plumbing) cells are accounted-for-elsewhere: skipping is
+    # the intended handling of a declared `scored: false` cell. An INVALID
+    # ledger stays missing-and-blocking - that is a real hole in the matrix,
+    # and unblocking around it would hide exactly what the block exists to say.
+    matrix = _matrix_block(campaign_dir, scores, accounted_run_ids=[d["run_id"] for d in skipped])
     per_arm = aggregate(scores)
     comparison = _comparison_block(scores, matrix)
     _stamp_pooled_comparison(per_arm, comparison)

@@ -2603,6 +2603,66 @@ def test_editing_the_key_or_task_after_a_run_is_refused(tmp_path: Path) -> None:
     assert score_campaign(cdir, w["corpus"], home=tmp_path / "home")["cells"]
 
 
+def test_a_declared_plumbing_cell_is_skipped_not_missing(tmp_path: Path) -> None:
+    """`camp --task-file` accepts any task, including a `scored: false` one -
+    naming it explicitly is how a plumbing task is meant to be run - so a mixed
+    campaign DECLARES plumbing cells. The scorer routes them to `skipped`, and
+    `_matrix_block`, comparing the declaration against `scores` alone, counted
+    the same run ids as `missing` and blocked the comparison of the cells that
+    DID score (final §9.9 reviewer, 2026-09-06, reproduced before fixing). A
+    ledger-invalid cell stays missing-and-blocking: that hole is real.
+    """
+    import io
+    import shutil
+
+    w = world(tmp_path)
+    write_key(w)
+    plumb_dir = w["corpus"] / "t_plumb"
+    shutil.copytree(w["corpus"] / "t_01", plumb_dir)
+    task = json.loads((plumb_dir / "task.json").read_text())
+    task["task_id"] = "t_plumb"
+    task["scored"] = False
+    (plumb_dir / "task.json").write_text(json.dumps(task))
+
+    out = io.StringIO()
+    rc = run_main(
+        [
+            "campaign",
+            *base_args(w),
+            "--campaign-id",
+            "cmix",
+            "--corpus",
+            str(w["corpus"]),
+            "--repeats",
+            "1",
+            "--arms",
+            "single",
+            "--task-file",
+            str(w["task"]),
+            "--task-file",
+            str(plumb_dir / "task.json"),
+        ],
+        out=out,
+        err=io.StringIO(),
+        home=tmp_path / "home",
+        popen=Popen({"grok": [grok_envelope(GOOD_PROPOSAL)] * 4}),
+        killpg=lambda *_: None,
+    )
+    assert rc == 0, out.getvalue()
+    cdir = w["runs"] / "cmix"
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+
+    skipped_ids = {d["run_id"] for d in summary["skipped"]}
+    assert any("t_plumb" in r for r in skipped_ids), summary["skipped"]
+    assert summary["matrix"]["missing"] == [], (
+        "a declared cell that was READ and deliberately routed to `skipped` is "
+        "accounted for; listing it as missing contradicts the same summary"
+    )
+    assert summary["comparison"]["blocked"] is False, summary["comparison"]["reason"]
+    # the scored side really scored: the plumbing cell is in neither population
+    assert all("t_plumb" not in c["run_id"] for c in summary["cells"])
+
+
 def test_the_scored_cells_are_checked_against_the_declared_matrix(tmp_path: Path) -> None:
     """Cells were discovered by listing finalized directories, never compared
     with the matrix `campaign.started` recorded. A cell that never finished

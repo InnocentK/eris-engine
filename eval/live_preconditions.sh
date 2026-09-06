@@ -103,14 +103,20 @@ sys.exit(1 if bad else 0)
 PY
 chk $? "every CLI worker passes the launch-time pin check (stale pin = refusal mid-campaign)"
 
-# `=..*` - a non-empty VALUE (panel 2026-09-06, D4): `XAI_API_KEY=` satisfied
-# the name-only grep, and launch does not save you - `_read_env_values` keeps
-# empty values and `plan_call` checks name presence only, so the empty string
-# would be handed to grok as its credential. (Today the doctor's
-# `worker.grok.env` WARN also fails the gate above, since the doctor drops
-# empty values; this line stops being decorative the day that changes.)
-[ -f "$ENVFILE" ] && grep -q '^XAI_API_KEY=..*' "$ENVFILE"
-chk $? "$ENVFILE exists and carries a NON-EMPTY XAI_API_KEY (grok refuses at launch without it)"
+# THE SAME PARSER the runtime uses, requiring a non-empty value. Two prior
+# versions of this check were each wrong one way: a name-only grep passed
+# `XAI_API_KEY=` (panel 2026-09-06, D4 - launch keeps empty values and checks
+# name presence only, so the empty string would be handed to grok as its
+# credential), and the `^XAI_API_KEY=..*` grep that replaced it REFUSED syntax
+# the runtime accepts - `parse_dotenv` reads `export XAI_API_KEY='quoted'`,
+# the grep did not (final §9.9 reviewer, 2026-09-06, verified against
+# `eris.redact.parse_dotenv`). A gate stricter than the thing it guards trains
+# an operator to bypass it; a looser one spends money. Same parser, no gap.
+[ -f "$ENVFILE" ] && "$PY" -c "import sys; sys.path.insert(0,'src')
+from pathlib import Path
+from eris.redact import parse_dotenv
+sys.exit(0 if parse_dotenv(Path('$ENVFILE').read_text()).get('XAI_API_KEY') else 1)"
+chk $? "$ENVFILE parses (the runtime's own parser) with a NON-EMPTY XAI_API_KEY"
 
 # Resolved ABSOLUTE and shell-QUOTED. A runs_dir containing a space is valid
 # (`runs_dir: "my runs"`), and an unquoted relative path turned the stop command
