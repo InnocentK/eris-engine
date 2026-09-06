@@ -207,7 +207,25 @@ What each part of the required argv enforces, and what it does not:
 * Residual, not enforced: agy spawns a background auto-updater that can change
   the binary under its sha256 pin. `AGY_CLI_DISABLE_AUTO_UPDATE=1` is set
   (name from the binary's strings; effect ASSUMPTION); the doctor reports a
-  changed hash as FAIL ("re-pin deliberately").
+  changed hash as FAIL ("re-pin deliberately"). That fired for real: the
+  binary went 1.1.18 -> 1.1.27 under the 2026-08-31 pin, the gate FAILED for
+  a day, and the 2026-09-06 re-pin was preceded by re-verification against
+  the NEW binary - env-var name still in strings; `gemini-3.1-pro-high` still
+  listed and executed without the A9 defaulting message; all nine argv flags
+  still present; envelope fields unchanged; `settings.json` still only
+  `enableTelemetry`/`trustedWorkspaces`; a write attempt in Eris's headless
+  shape was AUTO-DENIED (run CANCELED, empty response - fails closed); an
+  outside-workspace read was ATTEMPTED and AUTO-DENIED with no leak. Three
+  1.1.27 behaviors are new and recorded here: (1) stderr warns
+  `--mode plan has no effect while slash command expansion is disabled` - the
+  plan-mode layer Eris requests is INERT in this invocation shape; the
+  containment that held under probing is the headless permission auto-deny
+  plus `--sandbox` plus `--add-dir`, not plan mode, so the layer's loss is
+  noted rather than load-bearing. (2) The envelope can carry a
+  `denied_actions` list naming auto-denied tools - signal the parser does not
+  yet read. (3) A denied tool can yield `status: SUCCESS` with an EMPTY
+  `response`, which downstream scores as a proposal with no findings - a
+  worker that tries a denied action degrades to silence, not to an error.
 * Auth is HOME-rooted (A8); the exact file is UNKNOWN.
   `~/.gemini/antigravity-cli/settings.json` is declared as a credential file
   for redaction even though, when inspected, it held only

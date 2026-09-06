@@ -9,7 +9,10 @@ tests/fixtures/envelopes/*/*.meta.json and docs/EVAL-PLAN.md):
 * codex: ``exec -C <cwd> -s read-only --ephemeral --ignore-user-config
   --ignore-rules -c project_doc_max_bytes=0 --skip-git-repo-check -m <model>
   --json [--output-schema F] [-o F] <prompt>``.
-* agy (Antigravity 1.1.18, the Google lineage): ``-p <prompt> --model <m>
+* agy (Antigravity, the Google lineage; probed on 1.1.18, argv re-verified
+  flag-by-flag on 1.1.27 at the 2026-09-06 re-pin - note 1.1.27 warns that
+  ``--mode plan`` has no effect beside ``--disable-slash-commands``, see
+  SECURITY.md): ``-p <prompt> --model <m>
   --mode plan --sandbox --add-dir <snapshot realpath> --output-format json
   --disable-slash-commands --print-timeout <N>s [--json-schema S]`` (this
   order is canonical) with ``N = timeout_s - 30`` above 60 s, else
