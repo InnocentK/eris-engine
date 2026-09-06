@@ -223,9 +223,17 @@ What each part of the required argv enforces, and what it does not:
   plus `--sandbox` plus `--add-dir`, not plan mode, so the layer's loss is
   noted rather than load-bearing. (2) The envelope can carry a
   `denied_actions` list naming auto-denied tools - signal the parser does not
-  yet read. (3) A denied tool can yield `status: SUCCESS` with an EMPTY
-  `response`, which downstream scores as a proposal with no findings - a
-  worker that tries a denied action degrades to silence, not to an error.
+  yet read. (3) A denied tool can end the run as `status: SUCCESS`
+  with an EMPTY `response` (observed; a second shape ends it `CANCELED`).
+  Neither degrades to silence in Eris: every stage call requests a schema
+  (`wire_schema`), an empty response parses to `structured: None`, and
+  `retry.classify` returns MALFORMED_OUTPUT - retryable - so a persistent
+  denial burns the retry chain and FAILS the invocation, while `CANCELED` is
+  an error status outright. Verified against `classify` and the stage call
+  sites after the first version of this sentence claimed the opposite
+  ("scores as a proposal with no findings") without checking - which a
+  stop-time review caught in the document that exists to hold only verified
+  behavior.
 * Auth is HOME-rooted (A8); the exact file is UNKNOWN.
   `~/.gemini/antigravity-cli/settings.json` is declared as a credential file
   for redaction even though, when inspected, it held only
