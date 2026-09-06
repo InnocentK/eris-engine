@@ -122,6 +122,22 @@ A field named "scored" that counts unscored cells is the shape of lie this
 branch exists to remove; the change is one field and one test and is stated
 here rather than re-convening a panel for it.
 
+## Stop-time review: two regressions introduced by the fixes themselves
+
+A stop-time reviewer (openai, via the session's stop gate) found two defects
+that did not exist before this review's own fixes - the failure mode every
+fix invites, and worth naming as such:
+
+1. The mixed-campaign matrix fix let declared skipped cells satisfy `missing`
+   but left `unexpected` reading scored directories only, so an UNDECLARED
+   plumbing directory vanished from matrix accounting - counted for nothing,
+   refused by nothing. Both populations now face the same gate, and the rogue
+   directory raises `GateRefused` (end-to-end test; revert caught).
+2. The `must_mention` group schema admitted an empty group, which `any([])`
+   makes unmatchable - a correct, precisely-located prediction scored as an FP
+   and an FN at once. Its mirror, an empty string, always matches. Both refuse
+   at key load now (revert of each branch caught).
+
 ## Where the raw record lives
 
 Round-by-round outputs, prompts, rebuttals, counters and the adjudication

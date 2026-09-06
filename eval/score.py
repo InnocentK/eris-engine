@@ -50,7 +50,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from eris.ledger import LedgerCorrupt, LedgerView, cost_totals
 from eris.scan import build_patterns, fold, scan_run
@@ -116,6 +116,26 @@ class _Span(_Strict):
 class KeyFinding(_Span):
     id: str = Field(min_length=1)
     severity: Severity
+
+    @field_validator("must_mention")
+    @classmethod
+    def _no_empty_concepts(cls, v: list[str | list[str]]) -> list[str | list[str]]:
+        """An empty GROUP can never match - `any([])` is False - so a key
+        carrying one makes its finding silently unfindable: a precisely
+        located correct prediction scores as an FP and an FN at once
+        (stop-time review, 2026-09-06; the old `list[str]` schema could not
+        express this). An empty STRING is the same defect mirrored - `"" in
+        text` is always True, so the concept it stands for is silently
+        always-satisfied. Both refuse loudly at key load."""
+        for entry in v:
+            alts = entry if isinstance(entry, list) else [entry]
+            if not alts:
+                raise ValueError("must_mention contains an empty group, which can never match")
+            for alt in alts:
+                if not alt:
+                    raise ValueError("must_mention contains an empty string, which always matches")
+        return v
+
     # AND across entries; each entry is one required CONCEPT - a bare string
     # (exact substring) or a list of interchangeable phrasings, any one of
     # which satisfies it. Single-token entries demanded ONE wording of a
@@ -1934,11 +1954,20 @@ def _matrix_block(
     # and the contradiction blocked the comparison of the cells that DID score
     # (final §9.9 reviewer, 2026-09-06, reproduced on a mixed campaign).
     have = set(counts) | (set(accounted_run_ids) & want)
-    unexpected = sorted(set(counts) - want)
+    # BOTH populations face the same gate. The first version of this fix
+    # intersected `accounted_run_ids` with `want` for `missing` but left
+    # `unexpected` reading scored ids only, so an UNDECLARED plumbing directory
+    # dropped into the campaign dir vanished from matrix accounting entirely -
+    # counted for nothing, refused by nothing (stop-time review, 2026-09-06).
+    # If a skipped cell can satisfy `missing`, an undeclared one is refused
+    # exactly like an undeclared scored one: no campaign legitimately produces
+    # either.
+    unexpected = sorted((set(counts) | set(accounted_run_ids)) - want)
     if unexpected:
         raise GateRefused(
-            f"the campaign scored cells it never declared: {', '.join(unexpected)}. A cell "
-            "directory that is not in `campaign.started` did not come from this matrix."
+            f"the campaign holds cells it never declared: {', '.join(unexpected)}. A cell "
+            "directory that is not in `campaign.started` did not come from this matrix - "
+            "whether it scored or was skipped as plumbing."
         )
     return {
         "declared": len(want),

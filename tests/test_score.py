@@ -2360,6 +2360,43 @@ def test_must_mention_groups_are_or_within_and_across() -> None:
     assert "f1" not in got, "bare strings remain exact AND requirements"
 
 
+def test_a_key_with_an_empty_concept_is_refused_at_load(tmp_path: Path) -> None:
+    """`[[]]` validated under `list[str | list[str]]` and could never match -
+    `any([])` is False - so the finding was silently unfindable and a correct,
+    precisely-located prediction scored as an FP and an FN at once (stop-time
+    review, 2026-09-06). The mirror image, an empty STRING, always matches and
+    silently waives its concept. Both refuse at key load, where the author is
+    looking.
+    """
+    base: dict[str, Any] = {
+        "key_version": 1,
+        "task_id": "t",
+        "category": "plan",
+        "expected_verdict": ["REVISE"],
+        "line_tolerance": 0,
+        "distractors": [],
+        "scan": {"fix_hunk_lines": [], "extra_strings": []},
+    }
+
+    def finding(mm: list[Any]) -> dict[str, Any]:
+        return {
+            "id": "k",
+            "path": "D.md",
+            "line_start": 1,
+            "line_end": 5,
+            "severity": "high",
+            "must_mention": mm,
+        }
+
+    from eval.score import Key
+
+    for bad in ([[]], [""], ["ok", []], [["a", ""]], [[""]]):
+        with pytest.raises(ValidationError):
+            Key.model_validate({**base, "findings": [finding(bad)]})
+    # the shapes real keys use still load
+    Key.model_validate({**base, "findings": [finding(["a", ["b", "c"]])]})
+
+
 def test_the_live_plan_keys_credit_the_paraphrases_the_panel_proved_they_missed() -> None:
     """The shipped keys, not fixtures: each row is a CORRECT wording that the
     panel verified scored as a miss before 2026-09-06, plus a generic wording
@@ -2666,6 +2703,25 @@ def test_a_declared_plumbing_cell_is_skipped_not_missing(tmp_path: Path) -> None
     assert summary["matrix"]["scored"] == len(summary["cells"])
     assert summary["matrix"]["skipped_declared"] == 1
     assert summary["matrix"]["declared"] == summary["matrix"]["scored"] + 1
+
+    # an UNDECLARED skipped cell faces the same gate as an undeclared scored
+    # one. The first version of the fix above intersected accounted ids with
+    # the declaration for `missing` but left `unexpected` reading scored ids
+    # only, so a rogue plumbing directory vanished from matrix accounting -
+    # counted for nothing, refused by nothing (stop-time review, 2026-09-06).
+    plumb_cell = next(d for d in cdir.iterdir() if d.is_dir() and "t_plumb" in d.name)
+    rogue = cdir / plumb_cell.name.replace("t_plumb", "t_rogue")
+    shutil.copytree(plumb_cell, rogue)
+    rogue_task = w["corpus"] / "t_rogue"
+    shutil.copytree(w["corpus"] / "t_plumb", rogue_task)
+    task = json.loads((rogue_task / "task.json").read_text())
+    task["task_id"] = "t_rogue"
+    (rogue_task / "task.json").write_text(json.dumps(task))
+    # the rogue dir records t_plumb's run ids inside its ledger; the scorer
+    # keys skipped cells on the DIRECTORY name via read_cell, so rename alone
+    # is the rogue condition
+    with pytest.raises(GateRefused, match="never declared"):
+        score_campaign(cdir, w["corpus"], home=tmp_path / "home")
 
 
 def test_the_scored_cells_are_checked_against_the_declared_matrix(tmp_path: Path) -> None:
