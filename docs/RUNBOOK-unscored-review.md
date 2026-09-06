@@ -39,8 +39,10 @@ Use somewhere like `~/eris-reviews/<slug>/`.
 ```bash
 SLUG=my-design-doc                    # becomes task_id; must equal the dir name
 DEST=~/eris-reviews/$SLUG
+SRC=/path/to/YOUR-DOC.md              # the document under review
+DOC=$(basename "$SRC")
 mkdir -p "$DEST/snapshot"
-cp /path/to/YOUR-DOC.md "$DEST/snapshot/"
+cp "$SRC" "$DEST/snapshot/"
 
 cd "$DEST/snapshot"
 git init -q -b main
@@ -52,21 +54,26 @@ cd -
 The snapshot must be a git repository: the evidence pack runs `git rev-parse`,
 `ls-files`, `log` and `status` to establish what the worker is looking at.
 
-Then the task file:
+Then the task file. **The document only reaches the reviewers if you declare it
+as an excerpt** - `TaskSpec.excerpts` defaults to an empty list, and the pack
+builder iterates only what is declared. Omit it and the panel receives your
+question plus four git facts and never sees a line of the document, while
+producing a confident review of it.
+
+Each excerpt is capped at `EXCERPT_MAX_LINES = 200` counted from `line_start`,
+so a longer document needs several. `reviews/make_task.py` writes them for you:
 
 ```bash
-cat > "$DEST/task.json" <<JSON
-{
-  "task_id": "$SLUG",
-  "question": "Is this defensible? State a verdict and support every claim with evidence.",
-  "category": "plan",
-  "scored": false,
-  "snapshot": "snapshot"
-}
-JSON
+cd /path/to/eris-engine
+.venv/bin/python reviews/make_task.py "$DEST" "$DOC" \
+    "Is this defensible? State a verdict and support every claim with evidence."
 ```
 
-Four things here are load-bearing, each verified:
+Six things it sets are load-bearing, each verified:
+
+* **`excerpts` naming the document.** Above. `show_review.py` warns loudly after
+  the fact if the pack held no excerpt, but that is a consolation prize - the
+  spend has already happened.
 
 * **`"scored": false`** - `TaskSpec.scored` defaults to **true**
   (`Field(default=True, strict=True)`), and a scored task with no answer key is
@@ -76,6 +83,12 @@ Four things here are load-bearing, each verified:
   scoring.
 * **`category: "plan"`** - the only honest label available. See below.
 * **`snapshot` is relative to `task.json`.**
+* **Excerpts cap at 200 lines each**, counted from `line_start`. An excerpt
+  that asks for more is cut and its label marked `(capped)` - visible in the
+  pack, not silent - which is what the splitting above avoids. Separately, a
+  rendered prompt over 256 KiB is *refused* (`MAX_PROMPT_BYTES` raises
+  `LaunchRefused`): a very large document fails the run rather than being
+  quietly shortened.
 
 Check it loads before spending anything:
 
@@ -86,7 +99,9 @@ import sys; sys.path.insert(0,'.')
 from pathlib import Path
 from eval.run import load_task
 t, s = load_task(Path('$DEST/task.json'))
-print('OK', t.task_id, '| scored:', t.scored, '| snapshot:', s)"
+print('OK', t.task_id, '| scored:', t.scored, '| snapshot:', s)
+print('excerpts:', [(e.path, e.line_start, e.line_end) for e in t.excerpts] or
+      'NONE - the reviewers will not see the document')"
 ```
 
 ## 2. Gate (free, and it has caught a real failure twice)

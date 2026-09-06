@@ -27,6 +27,9 @@ def main(argv: list[str]) -> int:
     enforced: dict | None = None
     proposals: list[dict] = []
     refused: list[str] = []
+    stopped = 0
+    pack: list[tuple[str, str]] = []
+    executed = 0
     contaminated = False
     for line in events.read_bytes().splitlines():
         if not line.strip():
@@ -39,6 +42,22 @@ def main(argv: list[str]) -> int:
             proposals.append(p)
         elif e["kind"] == "verify.refused":
             refused.append(str(p.get("reason", ""))[:100])
+        elif e["kind"] == "verify.stopped":
+            stopped += 1
+        elif e["kind"] == "evidence.item":
+            # `phase` separates what was assembled for the prompt from what a
+            # model asked to be RUN and Eris ran. Counting only refusals printed
+            # "0 executed" unconditionally - true of every campaign so far, and
+            # a lie the moment the allowlist lets something through.
+            if p.get("phase") == "verification":
+                executed += 1
+            else:
+                # An excerpt is a `repo_fact` that no command produced, so its
+                # `argv` is null; the git facts all carry one. `label` is NOT a
+                # discriminator - it is absent from the ledger payload, which is
+                # how the first version of this reported "no file excerpt" on a
+                # run whose pack contained one.
+                pack.append((str(p.get("kind")), p.get("argv") is None))
         elif e["kind"] == "scan.result" and p.get("contaminated"):
             contaminated = True
 
@@ -74,17 +93,38 @@ def main(argv: list[str]) -> int:
             where = f"{loc.get('path')}:{loc.get('line_start')}" if loc else "no location"
             print(f"    [{f.get('severity')}] {where} - {f.get('description', '')[:110]}")
 
+    # What the reviewers were actually GIVEN. A task that declares no
+    # `excerpts` sends the question and the git facts and NOT the document:
+    # `TaskSpec.excerpts` defaults to an empty list and the pack builder only
+    # iterates what is declared, so the review reads like a review of your
+    # document while nobody was shown it.
+    quotes = [k for k, _ in pack if k == "document_quote"]
+    facts = [k for k, _ in pack if k == "repo_fact"]
+    excerpts = [k for k, no_argv in pack if k == "repo_fact" and no_argv]
     print(
-        f"\nMECHANICAL VERIFICATION: {len(refused)} request(s) REFUSED, 0 executed"
-        if refused
-        else "\nMECHANICAL VERIFICATION: no requests made"
+        f"\nEVIDENCE PACK: {len(pack)} item(s) - {len(quotes)} question, "
+        f"{len(facts)} repo fact(s), of which {len(excerpts)} file excerpt(s)"
     )
-    if refused:
-        for r in dict.fromkeys(refused):
-            print(f"  refused: {r}")
-        print("\n  Every check the models asked for was refused by the allowlist, so NOTHING")
-        print("  here is mechanically verified. This is an adjudicated opinion, not a")
-        print("  verified result. Weigh it accordingly.")
+    if not excerpts:
+        print("  !! NO FILE EXCERPT. The reviewers were given the question and the")
+        print("     repository facts, but NOT the contents of any file. Declare")
+        print("     `excerpts` in task.json, or this is a review of a document")
+        print("     nobody was shown.")
+
+    print(
+        f"\nMECHANICAL VERIFICATION: {executed} executed, {len(refused)} refused"
+        + (f", {stopped} stopped" if stopped else "")
+    )
+    for r in dict.fromkeys(refused):
+        print(f"  refused: {r}")
+    if executed == 0:
+        print("\n  Nothing was mechanically verified: no check the models asked for ran.")
+        print("  This is an adjudicated opinion, not a verified result. Weigh it")
+        print("  accordingly.")
+    else:
+        print(f"\n  {executed} check(s) ran; their output is in the ledger as")
+        print("  `evidence.item` with phase `verification`. Claims resting on those are")
+        print("  mechanically supported; claims resting on the rest are not.")
     return 0
 
 
