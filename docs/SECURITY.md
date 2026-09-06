@@ -224,16 +224,21 @@ What each part of the required argv enforces, and what it does not:
   noted rather than load-bearing. (2) The envelope can carry a
   `denied_actions` list naming auto-denied tools - signal the parser does not
   yet read. (3) A denied tool can end the run as `status: SUCCESS`
-  with an EMPTY `response` (observed; a second shape ends it `CANCELED`).
-  Neither degrades to silence in Eris: every stage call requests a schema
-  (`wire_schema`), an empty response parses to `structured: None`, and
-  `retry.classify` returns MALFORMED_OUTPUT - retryable - so a persistent
-  denial burns the retry chain and FAILS the invocation, while `CANCELED` is
-  an error status outright. Verified against `classify` and the stage call
-  sites after the first version of this sentence claimed the opposite
-  ("scores as a proposal with no findings") without checking - which a
-  stop-time review caught in the document that exists to hold only verified
-  behavior.
+  with an EMPTY `response` (observed; a second shape ends it `CANCELED`, an
+  error in the envelope outright). What Eris then does depends on the path,
+  and both are verified. CAMPAIGN stages request a schema, and the denied
+  shape returns `structured_output: null` even with `--json-schema` passed
+  (probed on 1.1.27), so `retry.classify` returns MALFORMED_OUTPUT -
+  retryable, capped at 2 - and when the cap stops the chain the stage writes
+  `worker.absent` and continues WITHOUT that worker, while the invocation
+  record itself keeps `status: ok`: an absent panel member degrades the
+  panel, an absent judge leaves the cell excluded as `incomplete`. The
+  ad-hoc `invoke` path requests NO schema (`_build_call`), so there an empty
+  SUCCESS envelope classifies OK and is handed to the caller as-is - that
+  path, and only that path, degrades to silence. Two earlier versions of
+  this sentence each misstated these semantics in one direction ("scores as
+  a proposal with no findings"; then "FAILS the invocation") and were caught
+  by stop-time review; each clause above now names its evidence.
 * Auth is HOME-rooted (A8); the exact file is UNKNOWN.
   `~/.gemini/antigravity-cli/settings.json` is declared as a credential file
   for redaction even though, when inspected, it held only
