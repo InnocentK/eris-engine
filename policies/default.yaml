@@ -145,7 +145,11 @@ workers:
     # A host where grok authenticates another way (`grok login --device-code`
     # implies a stored token; UNVERIFIED) must remove this line or add the key.
     env_allow: [XAI_API_KEY]
-  agy:                            # Antigravity CLI 1.1.18 (Google lineage; `gemini` CLI is gone)
+  agy:                            # Antigravity CLI 1.1.27, re-pinned 2026-09-06: its
+                                  # auto-updater replaced the 1.1.18 binary under the
+                                  # 2026-08-31 pin (the gate FAILED correctly for a day;
+                                  # user authorised the new binary). Google lineage;
+                                  # `gemini` CLI is gone.
     transport: cli
     cli: agy
     provider: google
