@@ -92,6 +92,36 @@ checks: the `agy` binary on this machine has drifted from its pin since
 (`eris policy pin`) authorises the new binary and is a deliberate human act -
 not performed here.
 
+## The §9.9 final independent review
+
+**openai/gpt-5.4**, a fresh invocation holding no panel seat, family distinct
+from the implementer. Inputs: the branch diff at `08a5920`, repo read access,
+the CI evidence (1257 passed / 95.54% / audit clean), this record, acceptance
+criteria, risks and rollback.
+
+**First pass: REVISE**, three findings, none raised by the panel - all three
+survived my verification and were fixed in `0aee4ea`:
+1. (medium) a declared `scored: false` plumbing cell was simultaneously
+   `skipped` and `missing`, blocking a valid mixed campaign - reproduced by the
+   reviewer end-to-end;
+2. (medium) the gate's `XAI_API_KEY` grep refused `.env` syntax the runtime's
+   `parse_dotenv` accepts (export keyword, quotes) - the gate now calls the
+   runtime's own parser;
+3. (low) two INVARIANTS rows lagged the code (pairing evidence is kept-blob
+   equality; the scorer's allowed roots are three).
+
+**Second pass, same seat, fresh invocation: SHIP** - per-fix VERIFIED,
+including a deliberate hostile check that the skipped-vs-invalid asymmetry in
+fix 1 is correct (an invalid ledger keeps blocking; it is a real hole).
+
+One wart the reviewer examined and tolerated as an internal name mismatch was
+fixed after the disposition, at the trivial rung (§6): `matrix.scored` had
+come to include skipped-but-declared cells; it now counts only scored cells,
+with `skipped_declared` reported beside it, pinned by the mixed-campaign test.
+A field named "scored" that counts unscored cells is the shape of lie this
+branch exists to remove; the change is one field and one test and is stated
+here rather than re-convening a panel for it.
+
 ## Where the raw record lives
 
 Round-by-round outputs, prompts, rebuttals, counters and the adjudication

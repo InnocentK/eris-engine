@@ -2661,6 +2661,11 @@ def test_a_declared_plumbing_cell_is_skipped_not_missing(tmp_path: Path) -> None
     assert summary["comparison"]["blocked"] is False, summary["comparison"]["reason"]
     # the scored side really scored: the plumbing cell is in neither population
     assert all("t_plumb" not in c["run_id"] for c in summary["cells"])
+    # and `matrix.scored` counts what was SCORED, not what was accounted for -
+    # the declared plumbing cell appears in `skipped_declared`, nowhere else
+    assert summary["matrix"]["scored"] == len(summary["cells"])
+    assert summary["matrix"]["skipped_declared"] == 1
+    assert summary["matrix"]["declared"] == summary["matrix"]["scored"] + 1
 
 
 def test_the_scored_cells_are_checked_against_the_declared_matrix(tmp_path: Path) -> None:

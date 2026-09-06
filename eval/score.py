@@ -1942,7 +1942,13 @@ def _matrix_block(
         )
     return {
         "declared": len(want),
-        "scored": len(have),
+        # what was actually SCORED - not `have`, which also holds declared
+        # cells accounted for in `skipped`. The final §9.9 reviewer let this
+        # field slide as an internal name mismatch; a field named "scored"
+        # that counts unscored cells is the exact shape of lie this branch
+        # exists to remove, so it says what it counts.
+        "scored": len(counts),
+        "skipped_declared": len(set(accounted_run_ids) & want),
         "missing": sorted(want - have),
         "unexpected": [],
     }
