@@ -45,8 +45,11 @@ Round 2 on the revised document: openai CLEAN (verified), xai CLEAN - both
 re-probed the round-1 areas. **google unavailable for round 2, stated per
 the protocol**: `google/gemini-3.1-pro-preview` and the antigravity route
 both 403 (license), `agy` reports individual quota exhausted resetting in
-~110h - the family that raised two of the round-1 findings could not confirm
-their fixes, and the round-2 CLEAN is two-family, best-effort. Its round-1
+~110h - measured 2026-09-07, so the family returns on or after
+**2026-09-12** - and the family that raised two of the round-1 findings could
+not confirm their fixes, so the round-2 CLEAN is two-family, best-effort.
+FOLLOW-UP: on or after 2026-09-12, run the round-2 cleanliness prompt past a
+google-family model and append its verdict here. Its round-1
 concerns are the ones the fixes address and the other two seats re-checked.
 
 ## Mechanical changes
