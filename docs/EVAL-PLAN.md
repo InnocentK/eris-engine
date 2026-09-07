@@ -131,8 +131,20 @@ M1 clause verbatim (coupled by test) and prints the caveats with every summary;
 * Corpus tasks are history-truncated snapshots built by `eris.snapshot`.
 * Pre-registered rule (draft, to be finalised HERE — see the status note above): build
   the orchestrator only if arm 4 beats arm 3 by >= 10 points catch rate or
-  halves the **wrong-ACCEPT rate** at <= 2x cost, AND arm 3 beats the
-  incumbents.
+  halves the **wrong-ACCEPT rate** at <= 2x cost, AND arm 4's
+  **wrong-REJECT rate** is no higher than arm 3's over the same cells, AND
+  arm 3 beats the incumbents.
+  * The wrong-REJECT bound was added 2026-09-07, by user decision, while the
+    rule was still a draft and before any Phase 0 campaign. Motivated by
+    pilot data and stated as such: b-s3b's arm 4 returned REVISE on every
+    cell - wrong on both ACCEPT-expected controls - and its perfect
+    `wrong_accept_rate` moved this rule's second branch TOWARD authorising
+    it (§9.9 panel finding E4; `wrong_reject_rate` measured it at 0.5
+    against 0.0 for arm 3). A rule reading one error direction can be
+    satisfied by refusing everything; the bound is comparative rather than
+    an absolute threshold because no defensible constant exists at this
+    corpus size, and comparative is the shape the rest of the rule already
+    has.
   * `wrong_accept_rate` and NOT `confident_wrong_rate`, by user decision
     2026-08-30. The old flag combined a mechanical fact - the engine said
     ACCEPT where the key says it must not - with the model's own severity
