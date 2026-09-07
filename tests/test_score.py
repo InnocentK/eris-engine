@@ -429,7 +429,12 @@ def test_matching_precision_recall_tolerance_must_mention_and_distractors() -> N
     m = match_findings([hit, miss_text, far, distractor, nopath], key)
     assert m.tp == 1 and m.fp == 4 and m.fn == 0 and m.distractor_hits == 1
     assert m.precision == 0.2 and m.recall == 1.0 and "critical" in m.fp_severities
-    empty = match_findings([], Key.model_validate(key_dict(findings=[])))
+    # findings=[] alone is no longer a valid plan shape - an empty plan key
+    # must expect ACCEPT (2026-09-07 validator); the 0/0 -> None behaviour
+    # under test is verdict-independent
+    empty = match_findings(
+        [], Key.model_validate(key_dict(findings=[], expected_verdict=["ACCEPT"]))
+    )
     assert empty.precision is None and empty.recall is None
     assert match_findings([], key).recall == 0.0 and match_findings([], key).precision is None
 

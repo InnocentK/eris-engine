@@ -342,14 +342,25 @@ def test_no_scored_task_tells_the_worker_its_answer() -> None:
 def test_a_control_key_and_its_task_agree_that_nothing_is_planted() -> None:
     """A control's whole job is to measure invented findings, which only works
     if there is genuinely nothing to find. `Key` refuses a control that plants
-    findings; this asserts the shipped corpus actually has none, and that every
-    plan task DOES plant something - a plan key with no findings would measure
-    no catch rate at all while looking like a scored task.
+    findings; this asserts the shipped corpus actually has none.
+
+    The plan side was RELAXED on 2026-09-07, deliberately and narrowly: until
+    then every plan key had to plant something, because "a plan key with no
+    findings would measure no catch rate at all while looking like a scored
+    task". That protection stands for REVISE-expecting plans and is now
+    verdict-aware: a plan that plants nothing must expect exactly ACCEPT -
+    such a task exists to measure the verdict on a SOUND document, which the
+    corpus needs because a judge that accepts all code and revises all plans
+    scored zero on BOTH verdict-error metrics with the old geometry (the
+    Key model enforces the same rule at load). A REVISE-expecting plan with
+    an empty key still fails here, and at least one plan must still plant.
     """
-    from eval.score import load_key
+    from eval.score import Verdict, load_key
 
     corpus = REPO / "eval" / "corpus"
     seen = {"control": 0, "plan": 0}
+    planted_plans = 0
+    accept_plans = 0
     for task_dir in sorted(p.parent for p in corpus.glob("*/task.json")):
         spec = json.loads((task_dir / "task.json").read_text())
         if spec.get("scored", True) is False:
@@ -360,8 +371,20 @@ def test_a_control_key_and_its_task_agree_that_nothing_is_planted() -> None:
         if cat == "control":
             assert not key.findings, f"{task_dir.name}: a control must plant nothing"
         elif cat == "plan":
-            assert key.findings, f"{task_dir.name}: a plan task with no findings measures nothing"
+            if key.findings:
+                planted_plans += 1
+            else:
+                assert key.expected_verdict == [Verdict.ACCEPT], (
+                    f"{task_dir.name}: a plan that plants nothing measures nothing "
+                    "unless its point is the ACCEPT verdict itself"
+                )
+                accept_plans += 1
     assert seen["control"] >= 1 and seen["plan"] >= 1, f"corpus is one-sided: {seen}"
+    assert planted_plans >= 1, "no plan plants anything - catch rate is unmeasurable"
+    assert accept_plans >= 1, (
+        "no ACCEPT-expected plan - a judge that accepts all code and revises all "
+        "plans is invisible to both verdict-error metrics (E4)"
+    )
 
 
 def test_generated_bytecode_does_not_make_a_task_permanently_unrunnable(tmp_path: Path) -> None:

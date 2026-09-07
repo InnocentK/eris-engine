@@ -208,6 +208,18 @@ class Key(_Strict):
                 "an arm invents a defect where there is none, and the control false-positive "
                 "rate is computed on that premise."
             )
+        if (
+            self.category is TaskCategory.PLAN
+            and not self.findings
+            and self.expected_verdict != [Verdict.ACCEPT]
+        ):
+            raise ValueError(
+                f"plan task {self.task_id!r} plants nothing but expects "
+                f"{[v.value for v in self.expected_verdict]}. A plan with no findings exists to "
+                "measure the verdict on a SOUND document (added 2026-09-07 with the first "
+                "ACCEPT-expected plan); expecting anything but ACCEPT from it measures no catch "
+                "rate AND no verdict, while looking like a scored task."
+            )
         return self
 
 

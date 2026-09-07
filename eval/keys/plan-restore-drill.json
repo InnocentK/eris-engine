@@ -1,0 +1,17 @@
+{
+  "key_version": 1,
+  "task_id": "plan-restore-drill",
+  "category": "plan",
+  "expected_verdict": [
+    "ACCEPT"
+  ],
+  "line_tolerance": 3,
+  "findings": [],
+  "distractors": [],
+  "scan": {
+    "fix_hunk_lines": [],
+    "extra_strings": [
+      "ERIS-KEY-CANARY-plan-restore-drill-7022105f3f145459"
+    ]
+  }
+}

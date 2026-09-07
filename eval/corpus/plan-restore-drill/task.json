@@ -1,0 +1,15 @@
+{
+  "task_id": "plan-restore-drill",
+  "question": "Is the restore-drill plan in `DRILL.md` defensible as it stands? State your verdict and support every claim with evidence from the repository.",
+  "category": "plan",
+  "snapshot": "snapshot",
+  "scored": true,
+  "battery": [],
+  "excerpts": [
+    {
+      "path": "DRILL.md",
+      "line_start": 1,
+      "line_end": 91
+    }
+  ]
+}
