@@ -87,9 +87,13 @@ echo "exit=$?"
 # 4. Status + committed cost
 .venv/bin/python eval/run.py campaign status --campaign-id v1
 
-# 5. Score (read-only) and keep the summary
+# 5. Score (read-only) and keep the summary - OUTSIDE runs/: everything under
+#    runs/ belongs to RunWriter (redacted, hashed, append-only), and the gate's
+#    collision check treats any entry there as a run id (stop-time review,
+#    2026-09-07; the B-phase summaries were relocated for the same reason)
+mkdir -p summaries
 .venv/bin/python eval/score.py --campaign-dir runs/v1 --corpus eval/corpus \
-    > runs/v1-summary.json
+    > summaries/v1.json
 echo "score exit=$?"
 ```
 

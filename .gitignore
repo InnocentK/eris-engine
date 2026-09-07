@@ -25,6 +25,10 @@ htmlcov/
 
 # Eris runtime output — machine-specific, may contain repo content
 runs/
+# scorer output: derived, regenerable per key epoch; NEVER under runs/ -
+# the gate's collision check treats any entry there as a run id, and runs/
+# is RunWriter's domain (redacted, hashed, append-only)
+summaries/
 cache/
 eval/corpus/*/snapshot/
 eval/snapshots/
