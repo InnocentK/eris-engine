@@ -1,0 +1,15 @@
+{
+  "_comment": "Shape of the manifest the nightly dump job writes BESIDE each backup. Counts and checksums are computed from the same point-in-time snapshot as the dump, never from the dump file, so a dump-side corruption fails the comparison (see DRILL.md, residual risks). record_checksums holds one entry per record; two shown here.",
+  "backup_id": "archive-2026-09-06T02:10:11Z",
+  "dumped_at": "2026-09-06T02:10:11Z",
+  "row_counts": {
+    "reviews": 184210,
+    "findings": 912877,
+    "verdicts": 184210,
+    "attachments": 33194
+  },
+  "record_checksums": {
+    "reviews/00000001": "sha256:6f1a09c1b0e24d3d8f6a2f9e5b7c4a1d9e8f7061a2b3c4d5e6f708192a3b4c5d",
+    "reviews/00000002": "sha256:0d9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a3928170f6e5d4c3b2a1908f7e6d5c4b"
+  }
+}
