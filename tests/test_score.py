@@ -2481,6 +2481,33 @@ def test_m2_is_no_longer_a_keyed_finding() -> None:
     ), "m2's span must not be FP bait either"
 
 
+def test_the_summary_notes_track_the_amended_decision_rule(tmp_path: Path) -> None:
+    """Every summary ships `pre_registration_notes`, and until 2026-09-07 the
+    wrong_reject note said the rule "still reads wrong_accept_rate" and that
+    `wrong_reject_rate` was "an input to no rule" - which the same day's rule
+    amendment falsified, so every fresh summary contradicted the rule it
+    described (stop-time review, 2026-09-07). The note and EVAL-PLAN's rule
+    must move together: both bound the other direction, or neither.
+    """
+    w = world(tmp_path)
+    write_key(w)
+    cdir = campaign(w, tmp_path, "single")
+    summary = score_campaign(cdir, w["corpus"], home=tmp_path / "home")
+    wr_notes = [n for n in summary["pre_registration_notes"] if "wrong_reject_rate" in n]
+    assert wr_notes, "the wrong_reject note is gone entirely"
+    plan = (Path(__file__).resolve().parent.parent / "docs" / "EVAL-PLAN.md").read_text()
+    rule_bounds_both = "wrong-REJECT rate** is no higher" in plan
+    note_bounds_both = any("no higher than arm 3's" in n for n in wr_notes)
+    assert rule_bounds_both == note_bounds_both, (
+        "EVAL-PLAN's rule and the summary's wrong_reject note disagree about "
+        "whether the rule bounds both verdict-error directions"
+    )
+    assert rule_bounds_both, "the 2026-09-07 amendment is missing from EVAL-PLAN"
+    assert not any("input to no rule" in n and "until then" not in n for n in wr_notes), (
+        "a note still claims wrong_reject_rate feeds no rule, without the date bound"
+    )
+
+
 def test_symmetric_exclusions_also_block_the_comparison() -> None:
     """The block fired only on ASYMMETRIC loss (panel 2026-09-06, A1): when
     every arm excluded the SAME cell, `unequal` stayed empty, `blocked` read

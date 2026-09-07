@@ -1198,10 +1198,12 @@ def score_cell(cell: CellData, key: Key, *, home: Path, corpus: Path) -> CellSco
     # verdict that REFUSES work the key says should have been accepted.
     # b-s3b's arm 4 returned REVISE on all four tasks - right on the two plan
     # tasks, wrong on both controls - and scored a perfect `wrong_accept` of 0
-    # for it, because an arm that never accepts can never wrongly accept. The
-    # pre-registered rule reads `wrong_accept`, so on a corpus that is half
-    # ACCEPT-expected a constant-REVISE judge satisfies it while being wrong
-    # half the time. REJECT and ESCALATE count with REVISE: all three refuse the
+    # for it, because an arm that never accepts can never wrongly accept. Until
+    # 2026-09-07 the pre-registered rule read `wrong_accept` alone, so a
+    # constant-REVISE judge satisfied it while being wrong on every
+    # ACCEPT-expected cell; the draft rule now also bounds `wrong_reject_rate`
+    # (arm 4 no higher than arm 3), which is what this field feeds. REJECT and
+    # ESCALATE count with REVISE: all three refuse the
     # work. ABSTAIN does not - it declines to judge rather than claiming a
     # defect - and is handled by `expected_abstain`.
     wrong_reject = exclusion is None and (
@@ -1482,9 +1484,11 @@ def aggregate(scores: Sequence[CellScore]) -> dict[str, dict[str, Any]]:
                 "cells_counted": len([s for s in inc if s.unsupported_claim_rate is not None]),
                 "cells_included": len(inc),
             },
-            # the decision rule reads `wrong_accept_rate`. `severe_false_positive_rate`
-            # is reported beside it and is NOT an input to any rule: it is the
-            # model's own severity label on its own claim.
+            # the decision rule reads `wrong_accept_rate` and, since 2026-09-07,
+            # bounds `wrong_reject_rate` (arm 4 no higher than arm 3).
+            # `severe_false_positive_rate` is reported beside them and is NOT an
+            # input to any rule: it is the model's own severity label on its own
+            # claim.
             # Denominator: included cells WITH a verdict; None when none has one
             # (panel 2026-09-06, A3 + a round-2 addition extending it to
             # `wrong_reject`). `float(False)` over verdictless cells scored an
@@ -2068,9 +2072,11 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             "it for the other. An arm that never accepts cannot wrongly accept: b-s3b's arm 4 "
             "returned REVISE on all four tasks - correct on the two plan tasks, wrong on both "
             "controls - and scored wrong_accept 0 for it, moving the pre-registered rule in the "
-            "direction that authorises building. Read the two together; the rule still reads "
-            "`wrong_accept_rate` (user decision 2026-08-30) and `wrong_reject_rate` is an input "
-            "to no rule.",
+            "direction that authorises building. Since 2026-09-07 the draft rule BOUNDS the "
+            "other direction too - arm 4's `wrong_reject_rate` may be no higher than arm 3's "
+            "over the same cells (user decision, made while the rule was a draft and before "
+            "any Phase 0 campaign; until then `wrong_reject_rate` was an input to no rule, and "
+            "a summary generated before that date says so).",
             "In a paired delta, read `delta_cost_attributed_usd`, not "
             "`delta_cost_spent_usd`. The pair exists because the arms share proposals, and a "
             "shared proposal is paid for by whichever arm ran first, so spent measures campaign "
