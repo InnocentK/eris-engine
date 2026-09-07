@@ -1689,6 +1689,19 @@ def cell_dirs(campaign_dir: Path) -> list[Path]:
 # carry this text verbatim (whitespace-normalised) - asserted by
 # `test_score.py::test_the_binding_pre_registration_matches_the_scorer`, because
 # the plan previously kept stating a rule the scorer had stopped implementing.
+# The OPERATIVE decision rule, one source string. EVAL-PLAN must carry it
+# verbatim (whitespace-normalised) and every summary ships it in
+# `pre_registration_notes`, so the plan, the scorer and the summaries cannot
+# state different rules - the mechanism M1_PRE_REGISTRATION already uses. A
+# token-presence sync test preceded this and permitted material drift: the
+# rule could be rewritten around two surviving substrings (stop-time review,
+# 2026-09-07).
+DECISION_RULE = (
+    "build the orchestrator only if arm 4 beats arm 3 by >= 10 points catch rate or halves "
+    "the **wrong-ACCEPT rate** at <= 2x cost, AND arm 4's **wrong-REJECT rate** is no higher "
+    "than arm 3's over the same cells, AND arm 3 beats the incumbents."
+)
+
 M1_PRE_REGISTRATION = (
     "A validator finding NO LONGER excludes a cell (user decision 2026-09-04, on a "
     "three-family panel that was unanimous). Malformation is REPORTED - per arm as "
@@ -2067,16 +2080,18 @@ def score_campaign(campaign_dir: Path, corpus: Path, *, home: Path) -> dict[str,
             },
         },
         "pre_registration_notes": [
+            "PRE-REGISTERED RULE (draft, finalised in docs/EVAL-PLAN.md - this string is "
+            "held verbatim in both places by test): " + DECISION_RULE,
             "arm consensus is scored on the RAW summarizer verdict (enforced is also recorded)",
             "`wrong_accept_rate` sees ONE direction and `wrong_reject_rate` is reported beside "
             "it for the other. An arm that never accepts cannot wrongly accept: b-s3b's arm 4 "
             "returned REVISE on all four tasks - correct on the two plan tasks, wrong on both "
             "controls - and scored wrong_accept 0 for it, moving the pre-registered rule in the "
             "direction that authorises building. Since 2026-09-07 the draft rule BOUNDS the "
-            "other direction too - arm 4's `wrong_reject_rate` may be no higher than arm 3's "
-            "over the same cells (user decision, made while the rule was a draft and before "
-            "any Phase 0 campaign; until then `wrong_reject_rate` was an input to no rule, and "
-            "a summary generated before that date says so).",
+            "other direction too - the PRE-REGISTERED RULE note above is the one "
+            "authoritative wording (user decision, made while the rule was a draft and "
+            "before any Phase 0 campaign; until then `wrong_reject_rate` was an input to no "
+            "rule, and a summary generated before that date says so).",
             "In a paired delta, read `delta_cost_attributed_usd`, not "
             "`delta_cost_spent_usd`. The pair exists because the arms share proposals, and a "
             "shared proposal is paid for by whichever arm ran first, so spent measures campaign "
