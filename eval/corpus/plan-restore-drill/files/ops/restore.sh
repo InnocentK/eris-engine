@@ -21,6 +21,7 @@ archivectl verify --project "$ARCHIVE_PROJECT"
 #    live tables at dump time (see ops/backup-manifest.sample.json). The
 #    manifest travels beside the dump, not inside it.
 WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 archivectl manifest fetch --store "$STORE" --backup "$BACKUP" --out "$WORK/manifest.json"
 archivectl rowcounts --project "$ARCHIVE_PROJECT" --compare "$WORK/manifest.json"
 

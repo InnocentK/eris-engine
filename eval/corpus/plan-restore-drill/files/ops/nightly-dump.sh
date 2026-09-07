@@ -13,7 +13,11 @@ ID="archive-$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 #    disagree with its own manifest. The manifest still never reads the
 #    dump file.
 SNAP=$(archivectl snapshot export)
+# The working copy holds a FULL archive dump; it must not outlive the upload.
+# Removed on every exit path, success or failure - a nightly job that leaves
+# dumps on local disk accumulates a second, unmanaged copy of the archive.
 WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 
 # 1. Counts and checksums from the tables as of the snapshot.
 archivectl manifest build --snapshot "$SNAP" --out "$WORK/$ID".manifest.json

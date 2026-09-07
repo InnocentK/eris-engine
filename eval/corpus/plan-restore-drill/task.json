@@ -14,7 +14,7 @@
     {
       "path": "ops/restore.sh",
       "line_start": 1,
-      "line_end": 32
+      "line_end": 33
     },
     {
       "path": "ops/backup-manifest.sample.json",
@@ -29,7 +29,7 @@
     {
       "path": "ops/nightly-dump.sh",
       "line_start": 1,
-      "line_end": 26
+      "line_end": 30
     },
     {
       "path": "ops/drill-project.md",
