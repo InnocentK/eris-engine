@@ -93,6 +93,11 @@ def _absent_like(status: WorkerStatus, error: str | None, **kw: Any) -> WorkerRe
     [
         ("claude", "budget_tripped.json", ErrorClass.BUDGET_TRIPPED),  # T2
         ("claude", "bare_not_logged_in.json", ErrorClass.AUTH_TERMINAL),  # T3
+        # v1 capture: the vendor session ceiling (HTTP 429, "resets 5:30pm").
+        # Fell through to UNKNOWN in the live campaign; terminal by design -
+        # an in-chain retry cannot outlive a ceiling that resets on the
+        # vendor's clock, and it is NOT the harness's own BUDGET_TRIPPED.
+        ("claude", "session_limit_429.json", ErrorClass.POLICY_TERMINAL),  # v1
         ("codex", "auth_401.jsonl", ErrorClass.AUTH_TERMINAL),  # E2
         ("agy", "print_timeout.json", ErrorClass.TIMEOUT),  # A7
         ("agy", "read_denied.json", ErrorClass.POLICY_TERMINAL),  # A5
@@ -112,6 +117,9 @@ def test_pattern_table_against_captured_fixtures(
     expected: ErrorClass,
 ) -> None:
     version = {"claude": "2.1.239", "codex": "0.147.0", "agy": "1.1.18", "grok": "1.0.5"}[cli]
+    # captures added after the flag experiments live under the CLI version
+    # that actually emitted them
+    version = {"session_limit_429.json": "2.1.252"}.get(name, version)
     res = _result(tmp_path, fake_process, cli, fixture(cli, version, name))
     cls = classify(res, schema_requested=False)
     assert cls.error_class is expected, (cls, res.error)

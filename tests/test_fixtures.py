@@ -26,7 +26,15 @@ CAPTURED_FLAGTEST = "argv as recorded in scratchpad/flagtest/claude_tests.sh (fl
 RECONSTRUCTED = (
     "reconstructed by the synthesizer from the experiment script; not mechanically captured"
 )
-ARGV_SOURCES = (CAPTURED, CAPTURED_FLAGTEST, RECONSTRUCTED)
+# 2026-09-13: captures can now come from LIVE RUN LEDGERS - the strongest
+# provenance of the four (RunWriter recorded the argv mechanically, hash-
+# chained). The sidecar's note names the run id; absolute paths (which the
+# ledger records for argv[0]) stay OUT of fixtures per the hygiene tests.
+CAPTURED_LEDGER = (
+    "argv as recorded by the RunWriter ledger of the capturing run (run id in note; "
+    "argv[0] was the pinned absolute CLI path, normalised to the bare name here)"
+)
+ARGV_SOURCES = (CAPTURED, CAPTURED_FLAGTEST, RECONSTRUCTED, CAPTURED_LEDGER)
 
 
 def _fixture_files() -> list[Path]:

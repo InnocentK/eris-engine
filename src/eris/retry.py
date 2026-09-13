@@ -99,6 +99,13 @@ PATTERNS: tuple[ErrorPattern, ...] = (
     ErrorPattern("codex", r"401 Unauthorized", ErrorClass.AUTH_TERMINAL, "E2 capture"),
     ErrorPattern("agy", r"authentication failed", ErrorClass.AUTH_TERMINAL, "A8 capture"),
     # policy
+    # v1 capture (2026-09-07, runs/v1/plan-rollout-r0-indep_verify_critique):
+    # the vendor's SESSION ceiling, HTTP 429 with a reset time hours away on
+    # the vendor's clock. Terminal for this chain - an in-chain retry cannot
+    # outlive the ceiling - and NOT Eris's BUDGET_TRIPPED, which is the
+    # harness's own pre-spend check. Before this row it fell through to
+    # UNKNOWN ("unclassified failure").
+    ErrorPattern("claude", r"hit your session limit", ErrorClass.POLICY_TERMINAL, "v1 capture"),
     ErrorPattern("agy", r"permission check failed", ErrorClass.POLICY_TERMINAL, "A5/A16"),
     ErrorPattern("grok", r"403 Forbidden|permission-denied", ErrorClass.POLICY_TERMINAL, "E17"),
     ErrorPattern(None, r"survived SIGKILL", ErrorClass.POLICY_TERMINAL, "group kill failed"),

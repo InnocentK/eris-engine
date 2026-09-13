@@ -1,0 +1,29 @@
+{
+  "cli": "claude",
+  "version": "2.1.252",
+  "argv": [
+    "claude",
+    "-p",
+    "<adjudicator prompt, 38524 chars - full text in the run's ledger>",
+    "--safe-mode",
+    "--permission-mode",
+    "plan",
+    "--tools",
+    "",
+    "--no-session-persistence",
+    "--output-format",
+    "json",
+    "--model",
+    "claude-fable-5",
+    "--json-schema",
+    "{\"additionalProperties\": false, \"properties\": {\"dissent\": {\"items\": {\"additionalProperties\": false, \"properties\": {\"contested_claim_ids\": {\"items\": {\"type\": \"string\"}, \"title\": \"Contested Claim Ids\", \"type\": \"array\"}, \"evidence_refs\": {\"items\": {\"type\": \"string\"}, \"title\": \"Evidence Refs\", \"type\": \"array\"}, \"position\": {\"minLength\": 1, \"title\": \"Position\", \"type\": \"string\"}, \"proposal\": {\"anyOf\": [{\"type\": \"string\"}, {\"type\": \"null\"}], \"title\": \"Proposal\"}}, \"required\": [\"contested_claim_ids\", \"evidence_refs\", \"position\", \"proposal\"], \"title\": \"DissentOut\", \"type\": \"object\"}, \"title\": \"Dissent\", \"type\": \"array\"}, \"evidence_requests\": {\"items\": {\"additionalProperties\": false, \"properties\": {\"argv\": {\"items\": {\"type\": \"string\"}, \"minItems\": 1, \"title\": \"Argv\", \"type\": \"array\"}, \"expect_exit_code\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"null\"}], \"title\": \"Expect Exit Code\"}, \"rationale\": {\"title\": \"Rationale\", \"type\": \"string\"}}, \"required\": [\"argv\", \"expect_exit_code\", \"rationale\"], \"title\": \"RequestOut\", \"type\": \"object\"}, \"title\": \"Evidence Requests\", \"type\": \"array\"}, \"rationale\": {\"title\": \"Rationale\", \"type\": \"string\"}, \"residual_risks\": {\"items\": {\"additionalProperties\": false, \"properties\": {\"mitigation\": {\"anyOf\": [{\"type\": \"string\"}, {\"type\": \"null\"}], \"title\": \"Mitigation\"}, \"severity\": {\"enum\": [\"info\", \"low\", \"medium\", \"high\", \"critical\"], \"title\": \"Severity\", \"type\": \"string\"}, \"text\": {\"minLength\": 1, \"title\": \"Text\", \"type\": \"string\"}}, \"required\": [\"mitigation\", \"severity\", \"text\"], \"title\": \"RiskOut\", \"type\": \"object\"}, \"title\": \"Residual Risks\", \"type\": \"array\"}, \"rulings\": {\"items\": {\"additionalProperties\": false, \"properties\": {\"claim_id\": {\"minLength\": 1, \"title\": \"Claim Id\", \"type\": \"string\"}, \"evidence_refs\": {\"items\": {\"type\": \"string\"}, \"title\": \"Evidence Refs\", \"type\": \"array\"}, \"note\": {\"title\": \"Note\", \"type\": \"string\"}, \"status\": {\"enum\": [\"SUPPORTED\", \"REFUTED\", \"CONTESTED\", \"UNSUPPORTED\"], \"title\": \"ClaimStatus\", \"type\": \"string\"}}, \"required\": [\"claim_id\", \"evidence_refs\", \"note\", \"status\"], \"title\": \"RulingOut\", \"type\": \"object\"}, \"title\": \"Rulings\", \"type\": \"array\"}, \"verdict\": {\"enum\": [\"ACCEPT\", \"REVISE\", \"ESCALATE\", \"ABSTAIN\", \"REJECT\"], \"title\": \"Verdict\", \"type\": \"string\"}}, \"required\": [\"dissent\", \"evidence_requests\", \"rationale\", \"residual_risks\", \"rulings\", \"verdict\"], \"title\": \"AdjudicationOut\", \"type\": \"object\"}",
+    "--max-budget-usd",
+    "4"
+  ],
+  "argv_source": "argv as recorded by the RunWriter ledger of the capturing run (run id in note; argv[0] was the pinned absolute CLI path, normalised to the bare name here)",
+  "captured_at": "2026-09-07",
+  "captured_by": "live campaign v1 (judge worker, adjudicate stage)",
+  "redacted": true,
+  "redaction": "the adjudicator prompt (argv[2]) replaced by a length note - elided for size, nothing secret in it; the .json envelope is byte-identical to the ledger blob",
+  "note": "The vendor SESSION ceiling: is_error true, api_error_status 429, terminal_reason api_error, result 'You\u2019ve hit your session limit \u00b7 resets 5:30pm (America/New_York)', total_cost_usd 0. Captured from run plan-rollout-r0-indep_verify_critique in campaign v1 (stdout blob e52783cc51ed...). Fell through to UNKNOWN live (cell incomplete); now POLICY_TERMINAL - an in-chain retry cannot outlive a ceiling that resets on the vendor's clock, and it is not the harness's own BUDGET_TRIPPED."
+}
