@@ -9,10 +9,12 @@ network:
   dedicated: true          # its own network -
   peering: []              # - with NO peering; production's endpoints are unreachable
 service_account:
-  project_roles: []        # no roles in any other project -
+  own_project_role: editor # write INSIDE the drill project itself - it is the
+                           # restore target; without this the drill cannot run
+  other_project_roles: []  # no roles in any OTHER project - production included
   external_grants:
     - store: archive-backups
-      access: read         # - except exactly this one: READ on the backup store
+      access: read         # exactly one grant outside the project: READ on the store
 lifecycle:
   recreate_from_template: true
   teardown_after_use: true # disposable; nothing else depends on it

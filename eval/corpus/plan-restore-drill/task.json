@@ -34,12 +34,12 @@
     {
       "path": "ops/drill-project.md",
       "line_start": 1,
-      "line_end": 18
+      "line_end": 20
     },
     {
       "path": "ops/templates/drill-standing-config.yaml",
       "line_start": 1,
-      "line_end": 18
+      "line_end": 20
     }
   ]
 }
