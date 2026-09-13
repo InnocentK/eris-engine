@@ -124,7 +124,13 @@ workers:
     executable_sha256: UNPINNED
     timeout_s: 600
     max_stdout_bytes: 10000000
-  grok:
+  grok:                           # grok CLI 1.0.30, re-pinned 2026-09-13 after drift
+                                  # from the Sep 6 pin (binary replaced 2026-09-13).
+                                  # Re-verified before authorising: all emitted flags
+                                  # present, plan mode still blocks writes (T7 shape,
+                                  # stopReason cancelled), parse_grok reads the live
+                                  # envelope (model grok-4.6, cost reported; new
+                                  # additive key total_cost_usd_ticks, ignored).
     transport: cli
     cli: grok
     provider: xai
@@ -145,11 +151,17 @@ workers:
     # A host where grok authenticates another way (`grok login --device-code`
     # implies a stored token; UNVERIFIED) must remove this line or add the key.
     env_allow: [XAI_API_KEY]
-  agy:                            # Antigravity CLI 1.1.27, re-pinned 2026-09-06: its
-                                  # auto-updater replaced the 1.1.18 binary under the
-                                  # 2026-08-31 pin (the gate FAILED correctly for a day;
-                                  # user authorised the new binary). Google lineage;
-                                  # `gemini` CLI is gone.
+  agy:                            # Antigravity CLI 1.2.2, re-pinned 2026-09-13 (third
+                                  # pin: 1.1.18 -> 1.1.27 -> 1.2.2). The auto-updater
+                                  # replaced the binary MID-SESSION this time - 1.2.1
+                                  # was verified at ~18:45, the updater installed 1.2.2
+                                  # at 18:50, and `policy pin` hashed 1.2.2 at 18:51 -
+                                  # so the suite was RE-RUN against the pinned 1.2.2
+                                  # (sha checked before and after the probes: stable,
+                                  # equals the pin): flags, model listing, schema
+                                  # honoured, outside-read auto-denied, no leak.
+                                  # settings.json now holds only trustedWorkspaces -
+                                  # still no secrets. Google lineage; `gemini` is gone.
     transport: cli
     cli: agy
     provider: google
