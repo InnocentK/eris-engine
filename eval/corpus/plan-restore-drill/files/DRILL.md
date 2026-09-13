@@ -70,9 +70,13 @@ mask the other:
   old at drill time. A stale backup fails THIS result only; the restore
   still proceeds and the restore-path result is judged on its own merits.
 
-The drill as a whole passes only when both results pass. A failure of
-either kind files an incident-priority ticket the same day, and the failing
-part is re-run after the fix, in the same quarter.
+The drill as a whole passes only when both results pass IN THE SAME
+EXECUTION. A failure of either kind files an incident-priority ticket the
+same day, and after the fix the drill is re-run IN FULL, in the same
+quarter, both results judged afresh from that single execution - a
+whole-drill pass stitched from different runs' halves is a pass no actual
+drill achieved, and freshness in particular is a property of the backup at
+the time it is judged, not a step that can be re-run on its own.
 
 ## Cost and schedule
 
