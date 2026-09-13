@@ -22,9 +22,13 @@ procedure and the people who know it to drift apart.
 
 ## Method
 
-1. On the first Tuesday of the quarter, the on-call engineer picks the most
-   recent nightly backup - not a hand-picked good one - and restores it into
-   the isolated `drill` project. The drill project has no network route to
+1. On the first Tuesday of the quarter, the on-call engineer recreates the
+   isolated `drill` project from its change-controlled template (one
+   platform command; `ops/drill-project.md` describes what the template
+   pins), selects the most recent nightly backup BY THE STORE'S OWN LISTING
+   - never a hand-picked good one - and passes its id to the restore script
+   (`RESTORE_BACKUP_ID`), which refuses to run without an explicit backup id
+   precisely because restores overwrite their target. The drill project has no network route to
    production and its own credentials, which grant read access to the backup
    store only - backups live in that store, not in the production project,
    so the drill fetches its input without any production access. Nothing in
@@ -59,9 +63,9 @@ day; the drill is re-run after the fix, in the same quarter.
 
 ## Cost and schedule
 
-The drill project already exists (it is the same isolated project used for
-schema rehearsals) and is torn down after each drill, so standing cost is
-zero. Compute for one restore plus verification is under $15 at current
+The drill project is recreated on demand from a standing configuration (the
+same isolated-project pattern the schema rehearsals use) and torn down after
+each drill, so standing cost is zero. Compute for one restore plus verification is under $15 at current
 archive size, re-checked annually against archive growth. Engineer time is
 the real cost: budgeted at half a day, tracked in the drill log so the
 budget claim is checked against reality each quarter.

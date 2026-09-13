@@ -9,8 +9,12 @@ set -euo pipefail
 : "${ARCHIVE_PROJECT:?set ARCHIVE_PROJECT to the project to restore into}"
 STORE=${BACKUP_STORE:-archive-backups}
 
-# 1. Most recent nightly backup - by the store's own listing, never hand-picked.
-BACKUP=$(archivectl backups list --store "$STORE" --kind nightly --newest 1 --format id)
+# 1. The backup to restore - REQUIRED, never defaulted. A restore overwrites
+#    its target, and an incident may need an OLDER backup (the newest one can
+#    be the corrupted one), so the script fails fast rather than guessing a
+#    destructive payload. The caller selects; the drill's rule is the store's
+#    own newest-nightly listing (see DRILL.md step 1).
+BACKUP=${RESTORE_BACKUP_ID:?set RESTORE_BACKUP_ID to the id of the backup to restore}
 echo "restoring $BACKUP into $ARCHIVE_PROJECT"
 
 # 2. Restore, then the restore tool's own integrity check.

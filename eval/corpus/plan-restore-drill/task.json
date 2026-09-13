@@ -9,12 +9,12 @@
     {
       "path": "DRILL.md",
       "line_start": 1,
-      "line_end": 91
+      "line_end": 95
     },
     {
       "path": "ops/restore.sh",
       "line_start": 1,
-      "line_end": 33
+      "line_end": 37
     },
     {
       "path": "ops/backup-manifest.sample.json",
@@ -34,7 +34,7 @@
     {
       "path": "ops/drill-project.md",
       "line_start": 1,
-      "line_end": 15
+      "line_end": 18
     }
   ]
 }

@@ -49,7 +49,16 @@ both 403 (license), `agy` reports individual quota exhausted resetting in
 **2026-09-12** - and the family that raised two of the round-1 findings could
 not confirm their fixes, so the round-2 CLEAN is two-family, best-effort.
 FOLLOW-UP: on or after 2026-09-12, run the round-2 cleanliness prompt past a
-google-family model and append its verdict here. Its round-1
+google-family model and append its verdict here.
+**DONE 2026-09-13**, and the seat earned its wait: over the (by then larger)
+bundle it found two REAL defects the other families had passed - the restore
+script's newest-nightly hardcoding contradicted its unmodified-incident-script
+claim, and the plan recreated a torn-down project with no recreate step - and
+then found that BOTH first fixes introduced new defects (a destructive-by-
+default restore; recreation-from-prose inviting drift). Final state: fail-fast
+`RESTORE_BACKUP_ID:?`, recreation from a change-controlled template, google
+confirms FIXED x2 with no blocking findings. Full trail in the v1 results
+record. Its round-1
 concerns are the ones the fixes address and the other two seats re-checked.
 
 ## Mechanical changes
