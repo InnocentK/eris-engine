@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Nightly dump of the review archive. Writes the backup AND the manifest the
-# restore drill compares against. The manifest's row counts and per-record
-# checksums are computed FROM THE LIVE TABLES, before and independently of
-# the dump file, so a corruption introduced by dumping cannot also corrupt
-# the manifest (the drill's residual-risk note relies on exactly this).
+# restore drill compares against. Manifest and dump are both built from ONE
+# exported point-in-time snapshot; the manifest never reads the dump file,
+# so a corruption introduced by dumping cannot also corrupt the manifest
+# (the drill's residual-risk note relies on exactly this).
 set -euo pipefail
 STORE=${BACKUP_STORE:-archive-backups}
 ID="archive-$(date -u +%Y-%m-%dT%H:%M:%SZ)"

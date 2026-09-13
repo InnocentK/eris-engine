@@ -30,9 +30,11 @@ procedure and the people who know it to drift apart.
    - never a hand-picked good one - and passes its id to the restore script
    (`RESTORE_BACKUP_ID`), which refuses to run without an explicit backup id
    precisely because restores overwrite their target. The drill project has no network route to
-   production and its own credentials, which grant read access to the backup
-   store only - backups live in that store, not in the production project,
-   so the drill fetches its input without any production access. Nothing in
+   production and its own credentials: write authority inside the drill
+   project itself (the restore target), and outside it exactly one grant -
+   READ on the backup store. Backups live in that store, not in the
+   production project, so the drill fetches its input without any production
+   access. Nothing in
    this plan reads from or writes to the production archive.
 2. Restore uses the same script operators would use in an incident
    (`ops/restore.sh`), unmodified. If the script needs a change to work in
@@ -43,24 +45,34 @@ procedure and the people who know it to drift apart.
      time (the job already writes these into the backup manifest);
    * fifty records sampled uniformly at random compare byte-identical
      against the manifest's per-record checksums.
-4. Record wall-clock time from step 1 to the end of step 3, and the age of
-   the backup used. Both go in the drill log alongside pass/fail.
+4. Record two times, plus the age of the backup used, in the drill log
+   alongside both results from "Success criteria": the
+   restore-and-verify window (invoking
+   `ops/restore.sh` to the end of step 3 - the same window the handbook's
+   4-hour target is defined over, and the one the success criterion below
+   bounds) and, separately, total drill time from step 1, so recreation
+   overhead stays visible without muddying the target's window.
 
 ## Success criteria
 
-The drill passes when all three verifications pass and the restore
-completes within 2 hours in the drill project. Drill hardware differs from
-production's, so drill wall-clock cannot prove the published 4-hour target
-directly; requiring half the target on drill hardware is the margin held in
-its place, and the measured time is logged every quarter so the margin's
-adequacy is reviewed against archive growth rather than assumed. Backup
-freshness is judged separately: a backup older than 24 hours at drill time
-is recorded as a recovery-point finding and ticketed, and the restore still
-proceeds and is judged on its own result - one failure must not mask the
-other.
+The drill reports TWO results, judged independently so one failure cannot
+mask the other:
 
-A failed drill of either kind files an incident-priority ticket the same
-day; the drill is re-run after the fix, in the same quarter.
+* **Restore-path result** - PASS when all three verifications pass and the
+  restore-and-verify window (as logged in step 4, the handbook target's own
+  window) completes within 2 hours in the drill project. Drill hardware
+  differs from production's, so drill wall-clock cannot prove the published
+  4-hour target directly; requiring half the target on drill hardware is
+  the margin held in its place, and the measured time is logged every
+  quarter so the margin's adequacy is reviewed against archive growth
+  rather than assumed.
+* **Recovery-point result** - PASS when the backup used was under 24 hours
+  old at drill time. A stale backup fails THIS result only; the restore
+  still proceeds and the restore-path result is judged on its own merits.
+
+The drill as a whole passes only when both results pass. A failure of
+either kind files an incident-priority ticket the same day, and the failing
+part is re-run after the fix, in the same quarter.
 
 ## Cost and schedule
 
@@ -90,7 +102,8 @@ touched.
   delta rather than maintain a production-identical standby nobody else
   needs.
 * A backup could be corrupted in a way that also corrupted its manifest.
-  The manifest is written by the dump job from the live tables, not derived
-  from the dump file, so a dump-side corruption still fails the comparison;
+  The manifest is built by the dump job from the same point-in-time
+  snapshot as the dump but never from the dump file itself, so a dump-side
+  corruption still fails the comparison;
   simultaneous corruption of both by the same fault is possible and accepted
   as beyond what a drill can rule out.

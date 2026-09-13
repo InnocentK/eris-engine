@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Restore the review archive from the most recent nightly backup into the
-# project named by ARCHIVE_PROJECT. This is the script operators use in an
-# incident; the quarterly drill (docs/HANDBOOK-EXCERPT-recovery-targets.md,
-# DRILL.md) runs it UNMODIFIED against the drill project. It needs read
-# access to the backup store and write access to the target project only.
+# Restore the review archive from the backup named by RESTORE_BACKUP_ID into
+# the project named by ARCHIVE_PROJECT - both explicit, because a restore
+# overwrites its target. This is the script operators use in an incident; the
+# quarterly drill (DRILL.md) runs it UNMODIFIED, passing the most recent
+# nightly backup's id per its own selection rule. It needs read access to the
+# backup store and write access to the target project, nothing else.
 set -euo pipefail
 
 : "${ARCHIVE_PROJECT:?set ARCHIVE_PROJECT to the project to restore into}"
@@ -21,8 +22,9 @@ echo "restoring $BACKUP into $ARCHIVE_PROJECT"
 archivectl restore --store "$STORE" --backup "$BACKUP" --into "$ARCHIVE_PROJECT"
 archivectl verify --project "$ARCHIVE_PROJECT"
 
-# 3. Row counts per table against the manifest the DUMP JOB wrote from the
-#    live tables at dump time (see ops/backup-manifest.sample.json). The
+# 3. Row counts per table against the manifest the dump job built from the
+#    same point-in-time snapshot as the dump - never from the dump file
+#    (see ops/backup-manifest.sample.json and ops/nightly-dump.sh). The
 #    manifest travels beside the dump, not inside it.
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
