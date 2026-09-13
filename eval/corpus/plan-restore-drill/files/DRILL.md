@@ -23,9 +23,10 @@ procedure and the people who know it to drift apart.
 ## Method
 
 1. On the first Tuesday of the quarter, the on-call engineer recreates the
-   isolated `drill` project from its change-controlled template (one
-   platform command; `ops/drill-project.md` describes what the template
-   pins), selects the most recent nightly backup BY THE STORE'S OWN LISTING
+   isolated `drill` project from its change-controlled template
+   (`ops/templates/drill-standing-config.yaml`, applied by one platform
+   command; `ops/drill-project.md` describes what it pins), selects the
+   most recent nightly backup BY THE STORE'S OWN LISTING
    - never a hand-picked good one - and passes its id to the restore script
    (`RESTORE_BACKUP_ID`), which refuses to run without an explicit backup id
    precisely because restores overwrite their target. The drill project has no network route to

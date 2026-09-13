@@ -9,7 +9,7 @@
     {
       "path": "DRILL.md",
       "line_start": 1,
-      "line_end": 95
+      "line_end": 96
     },
     {
       "path": "ops/restore.sh",
@@ -33,6 +33,11 @@
     },
     {
       "path": "ops/drill-project.md",
+      "line_start": 1,
+      "line_end": 18
+    },
+    {
+      "path": "ops/templates/drill-standing-config.yaml",
       "line_start": 1,
       "line_end": 18
     }

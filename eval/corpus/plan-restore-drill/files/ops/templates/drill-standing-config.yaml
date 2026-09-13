@@ -1,0 +1,18 @@
+# Project template `drill-standing-config`. Change-controlled like any other
+# file in this repository; `archivectl project create drill --template
+# ops/templates/drill-standing-config.yaml` applies it verbatim, so quarterly
+# recreation cannot drift from what is written here by hand.
+# ops/drill-project.md is the human description OF this template; this file,
+# not that description, is what recreation applies.
+name: drill
+network:
+  dedicated: true          # its own network -
+  peering: []              # - with NO peering; production's endpoints are unreachable
+service_account:
+  project_roles: []        # no roles in any other project -
+  external_grants:
+    - store: archive-backups
+      access: read         # - except exactly this one: READ on the backup store
+lifecycle:
+  recreate_from_template: true
+  teardown_after_use: true # disposable; nothing else depends on it

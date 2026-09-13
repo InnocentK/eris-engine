@@ -2,10 +2,10 @@
 
 The isolated project `drill` used by schema rehearsals and the quarterly
 restore drill (DRILL.md). It is recreated with one platform command from the
-change-controlled project template `drill-standing-config`; this document
-DESCRIBES what that template pins, for reviewers - the template, not this
-file, is what recreation applies, so quarterly recreation cannot drift from
-it by hand.
+change-controlled template `ops/templates/drill-standing-config.yaml` (in
+this repository, beside this note); this document DESCRIBES what that
+template pins, for reviewers - the template, not this file, is what
+recreation applies, so quarterly recreation cannot drift from it by hand.
 
 * **No network route to production**: the template places the project in its
   own network with no peering to the production network; nothing in it can
