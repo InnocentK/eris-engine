@@ -64,6 +64,31 @@ docs must keep honoring:
 ## Boundaries that code enforces
 
 ### Worker processes (`launch.py`)
+* Automatic CLI refresh is an audit-only, fail-closed authorization path in
+  `eris.refresh`. Detection only lstats/resolves/hashes; every candidate command
+  requires authority for one exact SHA, and any identity change terminates the
+  attempt without restart or updater chase. Agy remains REVIEW_REQUIRED and is
+  never executed or repinned by refresh pending a separate stable update audit.
+  Receipts persist typed status projections only, are locally registered and
+  single-consumption, and are re-derived under policy/pins/spec/alias CAS.
+  `verify --live-probe` is the only live path: it durably claims the unique
+  CLI/candidate-SHA/manifest/policy-SHA tuple before one no-retry call. A crash,
+  failure, or prior claim never authorizes another call; raw candidate output is
+  not persisted. Scheduled use is `refresh detect --quiet` only: no candidate
+  execution, pin write, scheduler, daemon, or notification subsystem is added.
+* Machine-local `pin-state/` uses an exclusive-create lock that is never stale-
+  broken, immutable receipt/history objects, and a fsynced transaction journal.
+  A replace followed by failed directory fsync is MANIFEST_NOT_DURABLE: the
+  lock and nonterminal journal remain and no speculative rollback is attempted.
+  Windows publication refuses until ACL and no-follow semantics are implemented.
+  This does not prove vendor-byte authenticity, eliminate pathname ABA, or make
+  same-user malicious code safe.
+* Campaign refresh preflight requires a canonical repository realpath, exact
+  clean HEAD, literal `eval/run.py`, and its exact SHA. It passes exact used
+  workers plus corpus/task-file scope to the free shell gate, runs the frozen
+  dry-run argv, and rechecks source and pin identities. When preflight applies a
+  receipt, that full gate is the transaction postcheck so failure restores the
+  prior durable sidecar rather than leaving an untested publication.
 * Read-only flags per CLI, verified by experiment on 2026-08-21/22
   (`tests/fixtures/envelopes/*/*.meta.json`): claude `--safe-mode
   --permission-mode plan --tools <list>`; codex `exec -s read-only --ephemeral

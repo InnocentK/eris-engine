@@ -463,19 +463,30 @@ def pin_executables(
     *,
     which: Callable[[str], str | None] | None = None,
 ) -> PinReport:
-    """Compute sha256 of every declared executable and write ``pins.yaml``.
+    """Bootstrap missing pins without overwriting an existing changed pin.
 
-    Uses only ``which`` (injectable) and hashlib; never runs anything.
-    Workers whose executable cannot be found are reported as missing and
-    left UNPINNED (a recorded absence, never a substitution).
+    Uses only ``which`` (injectable) and hashlib; never runs anything. Normal
+    drift must go through the receipted ``policy refresh`` path.
     """
     which = which or shutil.which  # resolved at call time (see doctor.run_doctor)
     loaded = load_policy(policy_path, pins_path)
     pins_path = loaded.pins_path
     pinned: dict[str, str] = {}
     missing: list[str] = []
-    workers_out: dict[str, dict[str, str]] = {}
-    verify_out: dict[str, dict[str, str]] = {}
+    try:
+        existing = yaml.safe_load(pins_path.read_bytes()) if pins_path.exists() else {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise PolicyError(f"cannot read existing pins for bootstrap: {exc}") from exc
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise PolicyError("existing pins must be a mapping")
+    refuse_secret_shaped(existing)
+    workers_out = existing.setdefault("workers", {})
+    verify_out = existing.setdefault("verify", {})
+    if not isinstance(workers_out, dict) or not isinstance(verify_out, dict):
+        raise PolicyError("existing pins workers/verify must be mappings")
+    changed = False
     ts = now_ts()
     for name, w in loaded.policy.workers.items():
         if w.transport is not Transport.CLI or w.cli is None:
@@ -485,7 +496,20 @@ def pin_executables(
             missing.append(name)
             continue
         digest = sha256_file(Path(exe))
-        workers_out[name] = {"executable": str(Path(exe)), "sha256": digest, "pinned_at": ts}
+        prior = workers_out.get(name)
+        if isinstance(prior, Mapping) and isinstance(prior.get("sha256"), str):
+            if prior["sha256"] != digest:
+                raise PolicyError(
+                    f"existing pin for {name!r} changed; use `eris policy refresh` "
+                    "with a verified receipt instead of blind overwrite"
+                )
+        else:
+            workers_out[name] = {
+                "executable": str(Path(exe)),
+                "sha256": digest,
+                "pinned_at": ts,
+            }
+            changed = True
         pinned[name] = digest
     for name, cmd in loaded.policy.verify.commands.items():
         exe_path = Path(cmd.executable)
@@ -493,10 +517,30 @@ def pin_executables(
             missing.append(f"verify.{name}")
             continue
         digest = sha256_file(exe_path)
-        verify_out[name] = {"executable": str(exe_path), "sha256": digest, "pinned_at": ts}
+        prior = verify_out.get(name)
+        if isinstance(prior, Mapping) and isinstance(prior.get("sha256"), str):
+            if prior["sha256"] != digest:
+                raise PolicyError(
+                    f"existing pin for verify.{name!r} changed; use `eris policy refresh` "
+                    "with a verified receipt instead of blind overwrite"
+                )
+        else:
+            verify_out[name] = {
+                "executable": str(exe_path),
+                "sha256": digest,
+                "pinned_at": ts,
+            }
+            changed = True
         pinned[f"verify.{name}"] = digest
-    payload = {"workers": workers_out, "verify": verify_out}
-    pins_path.write_text(yaml.safe_dump(payload, sort_keys=True), encoding="utf-8")
+    if changed:
+        existing["manifest_version"] = 1
+        payload = yaml.safe_dump(existing, sort_keys=True).encode("utf-8")
+        try:
+            from eris.refresh import bootstrap_write_pins
+
+            bootstrap_write_pins(pins_path, payload)
+        except (OSError, RuntimeError) as exc:
+            raise PolicyError(f"cannot publish bootstrap pins safely: {exc}") from exc
     return PinReport(pinned, missing, pins_path)
 
 

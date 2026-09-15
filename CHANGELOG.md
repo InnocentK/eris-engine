@@ -2,6 +2,24 @@
 
 ## 0.5.0 - Phase 0 harness beta integration boundary (2026-09-15)
 
+### Post-0.5.0 unreleased candidate (not part of the 0.5.0 release)
+
+* Add strict `eris policy refresh detect|verify|apply|preflight` operational
+  contracts with exact source-runner binding, campaign-derived worker scope,
+  provider-specific audit-only manifests, typed non-secret receipts, transitive
+  alias groups, and explicit exact-SHA execution authority. Agy stays provider-
+  local REVIEW_REQUIRED and is never chased or automatically published.
+* Add registered single-consumption receipt CAS, content-addressed sidecar
+  history, exclusive-create locking, fsynced mode-0600 atomic replacement,
+  rollback after durable publication, and MANIFEST_NOT_DURABLE refusal after an
+  unproved directory fsync. Windows publication remains a documented refusal.
+* Restrict `policy pin` to bootstrap missing entries; a changed existing pin
+  now directs the operator to receipted refresh. The live precondition gate can
+  accept explicit `ERIS_USED_WORKERS` and exact corpus/task-file scope, so unused
+  CLI drift and unused Grok credentials no longer block or consume quota.
+
+### 0.5.0 release contents
+
 This is a beta boundary for the evaluation harness, not the Eris engine, a
 public 1.0 release, or Phase 0/build-rule evidence. The five scored
 control/plan tasks remain a validation subset of the planned corpus, and E1

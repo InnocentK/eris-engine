@@ -15,6 +15,9 @@ ENVFILE=${ENVFILE:-.env}
 # running the printed command instead of trusting it (2026-08-31).
 CAMPAIGN_IDS=${CAMPAIGN_IDS-"b-s1 b-s3"}
 SINGLE_RUN_IDS=${SINGLE_RUN_IDS-"b-s0"}
+ERIS_CORPUS=${ERIS_CORPUS-"eval/corpus"}
+ERIS_TASK_FILES_JSON=${ERIS_TASK_FILES_JSON-"[]"}
+export ERIS_CORPUS ERIS_TASK_FILES_JSON
 IDS="$CAMPAIGN_IDS $SINGLE_RUN_IDS"
 fail=0
 chk() { if [ "$1" -eq 0 ]; then echo "  PASS  $2"; else echo "  FAIL  $2"; fail=1; fi; }
@@ -49,12 +52,16 @@ grep -vE "^(OK|doctor:)" "$TMPD"/pf.out || true
 # given campaign spawns - equal today, and a WARN on a declared-but-unused CLI
 # worker would fail the gate early rather than silently (round-2 addition,
 # recorded).
+if [ -n "${ERIS_USED_WORKERS+x}" ]; then
+USED=$("$PY" -c "import re, sys; print('|'.join(re.escape(x) for x in sys.argv[1].split(',') if x))" "$ERIS_USED_WORKERS")
+else
 USED=$("$PY" -c "import sys, re; sys.path.insert(0,'src')
 from pathlib import Path
 from eris.policy import load_policy
 from eris.schemas import Transport
 p = load_policy(Path('$POLICY')).policy
 print('|'.join(re.escape(n) for n, w in p.workers.items() if w.transport is Transport.CLI))")
+fi
 if [ -n "$USED" ]; then
     # Empty USED is skipped OUTRIGHT rather than interpolated (panel
     # 2026-09-06, D1): `worker\.()\b` is implementation-defined - BSD grep
@@ -79,7 +86,7 @@ fi
 # verbatim and NOTHING hashes the binary at load time, so a stale pin loads as
 # pinned=True. Five deliberately corrupted pins all passed that check
 # (2026-08-31), while the binaries had genuinely changed under it.
-"$PY" - "$POLICY" <<'PY' >"$TMPD"/pins.out 2>&1
+"$PY" - "$POLICY" "${ERIS_USED_WORKERS-}" "${ERIS_USED_WORKERS+x}" <<'PY' >"$TMPD"/pins.out 2>&1
 import sys
 sys.path.insert(0, "src")
 from pathlib import Path
@@ -88,9 +95,13 @@ from eris.policy import load_policy
 from eris.schemas import Transport
 
 bad = []
+selected = set(sys.argv[2].split(',')) if sys.argv[3] else None
 for name, w in sorted(load_policy(Path(sys.argv[1])).policy.workers.items()):
     if w.transport is not Transport.CLI:
         print(f"{name}: {w.transport.value} transport, no executable to pin")
+        continue
+    if selected is not None and name not in selected:
+        print(f"{name}: unused by this campaign; drift is reported separately")
         continue
     try:
         digest, real = preflight_executable(w)
@@ -112,11 +123,15 @@ chk $? "every CLI worker passes the launch-time pin check (stale pin = refusal m
 # the grep did not (final §9.9 reviewer, 2026-09-06, verified against
 # `eris.redact.parse_dotenv`). A gate stricter than the thing it guards trains
 # an operator to bypass it; a looser one spends money. Same parser, no gap.
+if [ -z "${ERIS_USED_WORKERS+x}" ] || echo ",${ERIS_USED_WORKERS}," | grep -q ',grok,'; then
 [ -f "$ENVFILE" ] && "$PY" -c "import sys; sys.path.insert(0,'src')
 from pathlib import Path
 from eris.redact import parse_dotenv
 sys.exit(0 if parse_dotenv(Path('$ENVFILE').read_text()).get('XAI_API_KEY') else 1)"
 chk $? "$ENVFILE parses (the runtime's own parser) with a NON-EMPTY XAI_API_KEY"
+else
+chk 0 "XAI_API_KEY not required (grok is unused by this campaign)"
+fi
 
 # Resolved ABSOLUTE and shell-QUOTED. A runs_dir containing a space is valid
 # (`runs_dir: "my runs"`), and an unquoted relative path turned the stop command
@@ -136,12 +151,25 @@ chk $? "runs_dir resolved from the policy: ${RUNS:-<unresolved>}"
 # run refuses with "snapshot ... is not a directory" - after the campaign has
 # started. Nothing in the earlier gate looked at them.
 "$PY" - <<'PY' >"$TMPD"/snap.out 2>&1
+import json
+import os
 import sys
 sys.path.insert(0, ".")
 from pathlib import Path
 from eval.make_control_snapshot import corpus_task_dirs, snapshot_matches_files
+
+task_files = json.loads(os.environ["ERIS_TASK_FILES_JSON"])
+corpus = os.environ["ERIS_CORPUS"]
+if not isinstance(task_files, list) or any(not isinstance(path, str) for path in task_files):
+    raise SystemExit("ERIS_TASK_FILES_JSON must be a JSON list of paths")
+if task_files:
+    task_dirs = [Path(path).resolve().parent for path in task_files]
+elif corpus:
+    task_dirs = corpus_task_dirs(Path(corpus))
+else:
+    raise SystemExit("campaign scope has neither task files nor a corpus")
 bad = []
-for d in corpus_task_dirs(Path("eval/corpus")):
+for d in task_dirs:
     state = snapshot_matches_files(d)
     if state is None:
         print(f"{d.name}: NO SNAPSHOT - run `.venv/bin/python eval/make_control_snapshot.py eval/corpus --all`")

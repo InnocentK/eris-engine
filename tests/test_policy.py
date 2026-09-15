@@ -376,6 +376,28 @@ def test_pin_verify_commands(tmp_path: Path) -> None:
     assert load_policy(policy_path).policy.verify.commands["git"].pinned
 
 
+def test_policy_pin_refuses_blind_overwrite_and_identical_repin_is_byte_stable(
+    tmp_path: Path,
+) -> None:
+    exe = fake_executable(tmp_path, "claude")
+    data = minimal_policy()
+    workers = data["workers"]
+    assert isinstance(workers, dict)
+    workers["claude"]["executable"] = str(exe)
+    policy_path = write(tmp_path, data)
+    first = pin_executables(policy_path, which=lambda _name: None)
+    before = first.pins_path.read_bytes()
+
+    second = pin_executables(policy_path, which=lambda _name: None)
+    assert second.pinned["claude"] == hashlib.sha256(exe.read_bytes()).hexdigest()
+    assert first.pins_path.read_bytes() == before
+
+    exe.write_bytes(b"changed bytes")
+    with pytest.raises(PolicyError, match="policy refresh"):
+        pin_executables(policy_path, which=lambda _name: None)
+    assert first.pins_path.read_bytes() == before
+
+
 def test_secret_in_pins_file_refuses(tmp_path: Path) -> None:
     policy_path = write(tmp_path, minimal_policy())
     (tmp_path / "pins.yaml").write_text(

@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv
 venv/
 
 # Tool caches
@@ -39,4 +40,5 @@ eval/snapshots/
 
 # Machine-specific executable pins written by `eris policy pin`
 policies/pins.yaml
+policies/pin-state/
 reviews/*/snapshot/
