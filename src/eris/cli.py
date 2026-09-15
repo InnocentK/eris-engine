@@ -115,7 +115,12 @@ def _cmd_refresh_preflight(args: argparse.Namespace) -> int:
 
             def full_postcheck() -> None:
                 nonlocal result
-                result = preflight(spec, load_policy(Path(spec.policy_path)))
+                result = preflight(
+                    spec,
+                    load_policy(Path(spec.policy_path)),
+                    state_dir=state,
+                    active_receipt_sha256=args.receipt,
+                )
 
             apply_refresh(
                 spec,
@@ -129,7 +134,7 @@ def _cmd_refresh_preflight(args: argparse.Namespace) -> int:
                     "refresh apply returned without running the full preflight postcheck"
                 )
         else:
-            result = preflight(spec, loaded)
+            result = preflight(spec, loaded, state_dir=state)
     except RefreshNotDurable as exc:
         print(json.dumps({"status": "MANIFEST_NOT_DURABLE", "error": str(exc)}), file=sys.stderr)
         return 1

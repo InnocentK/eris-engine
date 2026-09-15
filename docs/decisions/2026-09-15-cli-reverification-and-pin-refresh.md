@@ -62,7 +62,10 @@ exist.
 - Verification requires explicit exact-SHA authority. Candidate output is
   bounded in memory and projected into allowlisted booleans/enums/counts; raw
   stdout/stderr, auth/account data, usernames, and arbitrary model text are not
-  persisted. A durable claim is written before any optional live probe.
+  persisted. Candidate-reported model identity is length/syntax bounded,
+  secret-shaped or unsafe values project to `UNKNOWN`, and the final receipt
+  projection is secret-scanned before registration. A durable claim is written
+  before any optional live probe.
 - Apply accepts only a locally registered canonical receipt digest, reparses
   and re-hashes it, re-derives scope, aliases, observations, version decision,
   and all CAS inputs, then consumes the receipt before mutation.
@@ -82,8 +85,11 @@ exist.
 - Bootstrap `policy pin` may fill missing entries only. Existing changed pins
   refuse; normal drift uses refresh.
 - Preflight validates the exact clean source candidate, refreshes only an
-  enabled eligible path, reruns selected launch-time checks, the scoped free
-  gate, and the exact frozen dry-run, then rechecks all identities.
+  enabled eligible path, and refuses retained locks or nonterminal/uncertain
+  transaction journals before any no-receipt campaign gate. It passes every
+  selected CLI/API id to doctor and policy-derived credential filtering, keeps
+  a separate CLI-only pin scope, runs the exact frozen dry-run, then rechecks
+  all identities.
 
 ## Rejected alternatives
 
@@ -123,6 +129,12 @@ Candidate validation at exact worktree base `5dab66f7ae92ca6bd09ebbbed8c0b049a19
   PASS — Ruff check and format clean; mypy clean for 21 source and 4 eval
   files; 1,321 tests passed; 93.58% total coverage against a 90% floor;
   `pip-audit` reported no known vulnerabilities.
+- Final-review remediation used TDD for each reported gap. The exact focused
+  refresh/policy/cache/launch/hermeticity/doctor/invariants command passed with
+  exit 0; `bash -n eval/live_preconditions.sh` and `git diff --check` passed.
+  Full `task ci` passed: Ruff check/format clean, mypy clean for 21 source and 4
+  eval files, 1,326 tests passed, 93.51% total coverage against the 90% floor,
+  and `pip-audit` reported no known vulnerabilities.
 
 No live provider, network, campaign, pin publication, merge, push, tag, or
 release was performed. The suite injected every process/probe behavior.
@@ -137,9 +149,16 @@ named safety/portability tests. All are remediated: unsafe paths now refuse at
 every boundary, aliases use executable identity only, canonical argv produces a
 typed forbidden-token check, agy refusal is re-derived by apply, and tests now
 cover identity replacement, Windows refusal, exclusive-lock contention, and
-cache invalidation after a pin SHA change. Advisor confirmation and the later
-independent final review remain pending at this handoff. Known residuals are same-user malicious vendor
-bytes, absent independently trusted vendor checksums, possible network/model
+cache invalidation after a pin SHA change. The independent final review later
+returned REVISE for three gaps: retained MANIFEST_NOT_DURABLE state did not gate
+a fresh preflight, API workers were
+absent from doctor scope and Grok credentials were keyed to one logical id, and
+candidate-reported model identity could reach failed receipts unscreened. The
+bounded remediation adds state-first refusal, all-transport/CLI-separated
+scopes with policy-derived credentials, and bounded/secret-scanned receipt
+identity. Confirmation review and the exact-revision gate remain pending. Known
+residuals are same-user malicious vendor bytes, absent independently trusted
+vendor checksums, possible network/model
 spend by arbitrary candidate bytes, UNKNOWN Codex/agy executed identity,
 incomplete secret-shape detection, pathname ABA/hash-to-exec races, and weaker
 power-loss semantics on unsupported filesystems. These can only block or require

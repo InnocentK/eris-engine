@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from eris.cli import build_parser
 from eris.cli import main as eris_main
-from eris.policy import LoadedPolicy, Policy
+from eris.policy import LoadedPolicy, Policy, load_policy
 from eris.refresh import (
     CampaignSpecV1,
     CheckStatus,
@@ -28,8 +28,10 @@ from eris.refresh import (
     apply,
     classify_version,
     detect,
+    doctor_output_allows_preflight,
     preflight,
     provider_manifest,
+    required_worker_credentials,
     verification_manifest,
     verify,
 )
@@ -687,6 +689,47 @@ def test_live_probe_is_claimed_durably_before_call_and_never_retried(
     assert probe_calls == 1
 
 
+def test_secret_shaped_mismatched_live_probe_identity_is_not_persisted(tmp_path: Path) -> None:
+    loaded = _loaded_policy(tmp_path)
+    candidate_path = tmp_path / "bin" / "shared-claude"
+    candidate_path.write_bytes(b"new-claude")
+    candidate = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    Path(spec.env_file).write_text("", encoding="utf-8")
+    manifest = provider_manifest("claude")
+    offline = CannedRunner(
+        [
+            b"2.1.274 (Claude Code)",
+            " ".join(sorted(manifest.required_help_tokens)).encode(),
+            b'{"loggedIn":true}',
+        ]
+    )
+    secret_identity = "sk-proj-" + "S" * 32
+
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=tmp_path / "pin-state",
+        runner=offline,
+        live_probe=True,
+        live_probe_runner=lambda call: LiveProbeResult(
+            False,
+            "PROBE_CONTRACT_FAILED",
+            secret_identity,
+            None,
+            True,
+        ),
+    )
+
+    assert registered.receipt.decision is Decision.REVIEW_REQUIRED
+    assert registered.receipt.model_executed == "UNKNOWN"
+    assert secret_identity.encode() not in registered.path.read_bytes()
+
+
 def test_verify_authority_mismatch_or_unused_worker_executes_nothing(tmp_path: Path) -> None:
     loaded = _loaded_policy(tmp_path)
     spec = CampaignSpecV1.model_validate(
@@ -1215,6 +1258,69 @@ def test_replace_then_directory_fsync_failure_retains_lock_without_rollback(
     assert journal["phase"] == "REPLACING"
 
 
+def test_fresh_no_receipt_preflight_refuses_retained_not_durable_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eris.refresh as refresh_module
+
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(
+            tmp_path,
+            policy_path=str(loaded.path.resolve()),
+            arms=["single"],
+            panel=["claude"],
+            critics=[],
+        )
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    real_fsync_dir = refresh_module._fsync_dir
+
+    def fail_pins_directory(path: Path) -> None:
+        if Path(path) == loaded.pins_path.parent:
+            raise OSError("injected directory fsync failure")
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(refresh_module, "_fsync_dir", fail_pins_directory)
+    with pytest.raises(RefreshNotDurable):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+    # A later invocation reloads the newly visible pins. The retained lock and
+    # REPLACING journal must still refuse before any shell or dry-run command.
+    reloaded = load_policy(loaded.path, loaded.pins_path)
+    assert reloaded.pins_sha256 != loaded.pins_sha256
+    spec_path = tmp_path / "campaign.json"
+    spec_path.write_bytes(spec.canonical_bytes())
+    rc = eris_main(
+        [
+            "policy",
+            "refresh",
+            "preflight",
+            "--campaign-spec",
+            str(spec_path),
+            "--state-dir",
+            str(state),
+        ]
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["status"] == "MANIFEST_NOT_DURABLE"
+    assert "retained refresh lock" in payload["error"]
+    assert json.loads((state / "transaction.json").read_bytes())["phase"] == "REPLACING"
+
+
 def test_path_only_verification_tool_receipt_can_update_only_verify_section(
     tmp_path: Path,
 ) -> None:
@@ -1279,17 +1385,174 @@ def test_preflight_runs_exact_source_scope_shell_gate_and_frozen_dry_run(
         ]
     )
 
-    result = preflight(spec, loaded, runner=runner)
+    result = preflight(spec, loaded, state_dir=tmp_path / "pin-state", runner=runner)
     assert result["status"] == "PREFLIGHT_PASS"
     shell_argv, shell_env, shell_cwd = runner.calls[3]
     assert shell_argv == ["/bin/bash", str(repo / "eval" / "live_preconditions.sh")]
-    assert shell_env["ERIS_USED_WORKERS"] == "claude,judge"
+    assert shell_env["ERIS_USED_WORKERS"] == "claude"
+    assert shell_env["ERIS_USED_CLI_WORKERS"] == "claude,judge"
     assert shell_env["ERIS_CORPUS"] == spec.corpus
     assert json.loads(shell_env["ERIS_TASK_FILES_JSON"]) == []
     assert shell_env["CAMPAIGN_IDS"] == spec.campaign_id
     assert shell_env["SINGLE_RUN_IDS"] == ""
     assert shell_cwd == repo
     assert runner.calls[4][0] == spec.campaign_argv(python=sys.executable)
+
+
+@pytest.mark.parametrize(
+    "journal",
+    [
+        {"journal_version": 1, "phase": "PREPARED", "receipt_sha256": "a" * 64},
+        {"phase": "COMMITTED"},
+    ],
+)
+def test_preflight_refuses_nonterminal_or_uncertain_journal_before_commands(
+    tmp_path: Path, journal: dict[str, object]
+) -> None:
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(
+            tmp_path,
+            policy_path=str(loaded.path.resolve()),
+            arms=["single"],
+            panel=["claude"],
+            critics=[],
+        )
+    )
+    state = tmp_path / "pin-state"
+    state.mkdir(mode=0o700)
+    transaction = state / "transaction.json"
+    transaction.write_text(
+        json.dumps(journal, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    transaction.chmod(0o600)
+    runner = CannedRunner([b"unused"] * 8)
+
+    with pytest.raises(RefreshNotDurable, match="journal"):
+        preflight(spec, loaded, state_dir=state, runner=runner)
+
+    assert runner.calls == []
+
+
+def test_preflight_scopes_api_warnings_and_cli_credentials_by_exact_worker_policy(
+    tmp_path: Path,
+) -> None:
+    from eris.doctor import run_doctor
+
+    loaded = _loaded_policy(tmp_path)
+    worker_type = type(loaded.policy.workers["claude"])
+    api_used = worker_type.model_validate(
+        {
+            "transport": "api",
+            "provider": "openai",
+            "model": "gpt-test",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "executable_sha256": "UNPINNED",
+            "timeout_s": 60,
+            "max_stdout_bytes": 1000,
+        }
+    )
+    grok_path = tmp_path / "bin" / "grok"
+    renamed_grok = loaded.policy.workers["grok"].model_copy(
+        update={
+            "executable_sha256": hashlib.sha256(grok_path.read_bytes()).hexdigest(),
+            "env_allow": ["XAI_API_KEY"],
+        }
+    )
+    workers = {
+        "claude": loaded.policy.workers["claude"],
+        "judge": loaded.policy.workers["judge"],
+        "xai-cli": renamed_grok,
+        "api-used": api_used,
+        "api-unused": api_used,
+    }
+    loaded = LoadedPolicy(
+        loaded.policy.model_copy(
+            update={
+                "vendors_allowed": [*loaded.policy.vendors_allowed, "openai"],
+                "workers": workers,
+            }
+        ),
+        loaded.path,
+        loaded.sha256,
+        loaded.pins_path,
+        loaded.pins_sha256,
+    )
+    repo = tmp_path / "repo"
+    spec = CampaignSpecV1.model_validate(
+        _spec(
+            tmp_path,
+            policy_path=str(loaded.path.resolve()),
+            arms=["single"],
+            panel=["claude", "api-used", "xai-cli"],
+            critics=[],
+        )
+    )
+    runner = CannedRunner(
+        [
+            (str(repo.resolve()) + "\n").encode(),
+            (spec.candidate_revision + "\n").encode(),
+            b"",
+            b"preconditions passed",
+            b"dry run",
+            (str(repo.resolve()) + "\n").encode(),
+            (spec.candidate_revision + "\n").encode(),
+            b"",
+        ]
+    )
+
+    preflight(spec, loaded, state_dir=tmp_path / "pin-state", runner=runner)
+
+    shell_env = runner.calls[3][1]
+    assert shell_env["ERIS_USED_WORKERS"] == "claude,api-used,xai-cli"
+    assert shell_env["ERIS_USED_CLI_WORKERS"] == "claude,judge,xai-cli"
+    assert required_worker_credentials(loaded.policy, spec.used_worker_ids()) == {
+        "api-used": ("OPENAI_API_KEY",),
+        "xai-cli": ("XAI_API_KEY",),
+    }
+    verify_commands = {
+        name: command.model_copy(
+            update={
+                "executable_sha256": hashlib.sha256(
+                    Path(command.executable).read_bytes()
+                ).hexdigest()
+            }
+        )
+        for name, command in loaded.policy.verify.commands.items()
+    }
+    policy_for_doctor = loaded.policy.model_copy(
+        update={
+            "runs_dir": str(tmp_path / "doctor-runs"),
+            "api_hosts_allowed": ["api.openai.com"],
+            "verify": loaded.policy.verify.model_copy(update={"commands": verify_commands}),
+        }
+    )
+    loaded.path.write_text(
+        yaml.safe_dump(policy_for_doctor.model_dump(mode="json")), encoding="utf-8"
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    env_file.chmod(0o600)
+    doctor_output = run_doctor(
+        policy_path=loaded.path,
+        env_file=env_file,
+        home=tmp_path,
+        user_resolver=lambda: "test-user",
+    ).render()
+    assert "WARN worker.api-used:" in doctor_output
+    assert "WARN worker.api-unused:" in doctor_output
+    assert "WARN worker.xai-cli.env:" in doctor_output
+    declared_worker_ids = tuple(loaded.policy.workers)
+    assert not doctor_output_allows_preflight(
+        doctor_output, spec.used_worker_ids(), declared_worker_ids
+    )
+    assert doctor_output_allows_preflight(doctor_output, ("claude",), declared_worker_ids)
+    assert doctor_output_allows_preflight(
+        "WARN worker.api-unused.env: missing key\ndoctor: WARN",
+        ("api",),
+        ("api", "api-unused"),
+    )
 
 
 def test_live_preconditions_uses_explicit_campaign_scope_without_running_bash() -> None:
@@ -1370,7 +1633,15 @@ def test_refresh_preflight_receipt_keeps_full_gate_inside_apply_rollback_boundar
     monkeypatch.setattr(cli, "_refresh_inputs", lambda _args: (spec, loaded, state))
     monkeypatch.setattr(policy_module, "load_policy", lambda _path: loaded)
 
-    def fake_preflight(_spec: object, _loaded: object) -> dict[str, str]:
+    def fake_preflight(
+        _spec: object,
+        _loaded: object,
+        *,
+        state_dir: Path,
+        active_receipt_sha256: str,
+    ) -> dict[str, str]:
+        assert state_dir == state
+        assert active_receipt_sha256 == "b" * 64
         calls.append("preflight")
         return {"status": "PREFLIGHT_PASS", "campaign_spec_sha256": spec.sha256}
 

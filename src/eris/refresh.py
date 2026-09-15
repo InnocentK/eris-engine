@@ -35,8 +35,9 @@ from eris.launch import (
     run_worker,
     spawn,
 )
-from eris.policy import LoadedPolicy, load_policy, refuse_secret_shaped, sha256_file
-from eris.schemas import SHA256_PATTERN, Arm, Stage, WorkerStatus, now_ts
+from eris.policy import LoadedPolicy, Policy, load_policy, refuse_secret_shaped, sha256_file
+from eris.redact import looks_secret_shaped
+from eris.schemas import SHA256_PATTERN, Arm, Stage, Transport, WorkerStatus, now_ts
 
 
 class RefreshError(RuntimeError):
@@ -447,8 +448,8 @@ class VerifyReceiptV1(_StrictModel):
     probe_count: int = Field(strict=True, ge=0, le=1)
     reported_cost_usd: float | None = Field(default=None, ge=0)
     cost_ceiling_enforced: StrictBool
-    model_requested: str | None
-    model_executed: str
+    model_requested: str | None = Field(default=None, max_length=128)
+    model_executed: str = Field(pattern=r"^(?:UNKNOWN|[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127})$")
     created_at: str
 
     @model_validator(mode="after")
@@ -509,9 +510,20 @@ class LiveProbeRunner(Protocol):
     def __call__(self, call: WorkerCall) -> LiveProbeResult: ...
 
 
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
+
+
+def _project_candidate_model_identity(value: object) -> str:
+    if not isinstance(value, str) or _MODEL_ID_RE.fullmatch(value) is None:
+        return "UNKNOWN"
+    if looks_secret_shaped(value):
+        return "UNKNOWN"
+    return value
+
+
 def _default_live_probe_runner(call: WorkerCall) -> LiveProbeResult:
     result = run_worker(call)
-    model = result.model_executed or "UNKNOWN"
+    model = _project_candidate_model_identity(result.model_executed)
     exact_text = (result.text or "").strip() == "REFRESH_PROBE_OK"
     identity_ok = call.policy.cli == "codex" or model == call.policy.model
     cost_ok = True
@@ -615,6 +627,120 @@ def _read_regular_nofollow(
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+_TERMINAL_TRANSACTION_PHASES = frozenset(
+    {"BLOCKED", "BOOTSTRAP_BLOCKED", "BOOTSTRAP_COMMITTED", "COMMITTED", "ROLLED_BACK"}
+)
+_TERMINAL_PHASE_SHA_FIELD = {
+    "BLOCKED": "old_pins_sha256",
+    "BOOTSTRAP_COMMITTED": "new_pins_sha256",
+    "COMMITTED": "new_pins_sha256",
+    "ROLLED_BACK": "old_pins_sha256",
+}
+
+
+def _transaction_record(path: Path) -> dict[str, Any]:
+    raw = _read_regular_nofollow(path, permissions="private")
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_object_no_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token}")
+            ),
+        )
+    except (ValueError, UnicodeError) as exc:
+        raise RefreshNotDurable(f"refresh transaction state {path} is unreadable: {exc}") from exc
+    if not isinstance(value, dict) or _canonical_json_bytes(value) != raw:
+        raise RefreshNotDurable(f"refresh transaction state {path} is not canonical JSON")
+    return value
+
+
+def _sha_field(record: dict[str, Any], name: str) -> bool:
+    value = record.get(name)
+    return isinstance(value, str) and re.fullmatch(SHA256_PATTERN, value) is not None
+
+
+def _terminal_journal_is_certain(journal: dict[str, Any]) -> bool:
+    phase = journal.get("phase")
+    if (
+        journal.get("journal_version") != 1
+        or not _sha_field(journal, "receipt_sha256")
+        or phase not in _TERMINAL_TRANSACTION_PHASES
+    ):
+        return False
+    required_sha = _TERMINAL_PHASE_SHA_FIELD.get(str(phase))
+    return required_sha is None or _sha_field(journal, required_sha)
+
+
+def _assert_preflight_transaction_clear(
+    state_dir: Path, *, active_receipt_sha256: str | None = None
+) -> None:
+    """Refuse retained or ambiguous refresh state before any campaign gate.
+
+    ``active_receipt_sha256`` is only for the post-publication gate running
+    inside ``apply``. It admits that exact writer only after its replacement
+    and transaction journal are both durably recorded.
+    """
+    state_dir = Path(state_dir)
+    try:
+        state = os.lstat(state_dir)
+    except FileNotFoundError:
+        if active_receipt_sha256 is not None:
+            raise RefreshNotDurable(
+                "active refresh transaction state disappeared before postcheck"
+            ) from None
+        return
+    if (
+        not stat.S_ISDIR(state.st_mode)
+        or stat.S_ISLNK(state.st_mode)
+        or state.st_uid != os.getuid()
+        or stat.S_IMODE(state.st_mode) & 0o077
+    ):
+        raise RefreshNotDurable(
+            f"refresh state directory {state_dir} is not an owner-private real directory"
+        )
+
+    lock_path = state_dir / "refresh.lock"
+    journal_path = state_dir / "transaction.json"
+    try:
+        os.lstat(lock_path)
+    except FileNotFoundError:
+        lock = None
+    else:
+        lock = _transaction_record(lock_path)
+    try:
+        os.lstat(journal_path)
+    except FileNotFoundError:
+        journal = None
+    else:
+        journal = _transaction_record(journal_path)
+
+    if active_receipt_sha256 is None:
+        if lock is not None:
+            raise RefreshNotDurable(
+                f"retained refresh lock {lock_path} blocks no-receipt preflight; inspect it manually"
+            )
+        if journal is not None and not _terminal_journal_is_certain(journal):
+            raise RefreshNotDurable(
+                f"nonterminal or uncertain refresh journal {journal_path} blocks preflight"
+            )
+        return
+
+    if (
+        lock is None
+        or journal is None
+        or lock.get("lock_version") != 1
+        or lock.get("receipt_sha256") != active_receipt_sha256
+        or journal.get("journal_version") != 1
+        or journal.get("receipt_sha256") != active_receipt_sha256
+        or journal.get("phase") != "REPLACED_DURABLE"
+        or not _sha_field(journal, "new_pins_sha256")
+    ):
+        raise RefreshNotDurable(
+            "active refresh transaction is not the exact durably replaced receipt expected by postcheck"
+        )
 
 
 def _write_once_private(path: Path, data: bytes) -> None:
@@ -1011,18 +1137,24 @@ def verify(
                 unexpected = {
                     path.relative_to(probe_root) for path in probe_root.rglob("*")
                 } - baseline
-                passed = outcome.passed and not marker.exists() and not unexpected
+                projected_model = _project_candidate_model_identity(outcome.model_executed)
+                identity_ok = item.cli == "codex" or projected_model == model_requested
+                passed = outcome.passed and identity_ok and not marker.exists() and not unexpected
                 checks.append(
                     CheckResultV1(
                         name="live_probe",
                         status=CheckStatus.PASS if passed else CheckStatus.FAIL,
-                        code="OK" if passed else outcome.code,
+                        code=(
+                            "OK"
+                            if passed
+                            else (outcome.code if not outcome.passed else "MODEL_IDENTITY_MISMATCH")
+                        ),
                     )
                 )
                 probe_count = 1
                 reported_cost_usd = outcome.reported_cost_usd
                 cost_ceiling_enforced = outcome.cost_ceiling_enforced
-                model_executed = outcome.model_executed
+                model_executed = projected_model
             finally:
                 shutil.rmtree(probe_root)
 
@@ -1057,6 +1189,7 @@ def verify(
         created_at=now_ts(),
     )
     _ensure_state_dir(Path(state_dir))
+    refuse_secret_shaped(receipt.model_dump(mode="json"))
     data = receipt.canonical_bytes()
     digest = hashlib.sha256(data).hexdigest()
     path = Path(state_dir) / "receipts" / f"{digest}.json"
@@ -1666,6 +1799,57 @@ def _run_checked(
     return result
 
 
+def required_worker_credentials(
+    policy: Policy, worker_ids: tuple[str, ...]
+) -> dict[str, tuple[str, ...]]:
+    """Credential names required by the exact selected worker policies."""
+    required: dict[str, tuple[str, ...]] = {}
+    for worker_id in worker_ids:
+        worker = policy.workers.get(worker_id)
+        if worker is None:
+            raise RefreshError(f"campaign selects unknown worker {worker_id!r}")
+        names = list(worker.env_allow)
+        if (
+            worker.transport is Transport.API
+            and worker.api_key_env is not None
+            and worker.api_key_env not in names
+        ):
+            names.append(worker.api_key_env)
+        if names:
+            required[worker_id] = tuple(names)
+    return required
+
+
+def doctor_output_allows_preflight(
+    output: str,
+    worker_ids: tuple[str, ...],
+    declared_worker_ids: tuple[str, ...],
+) -> bool:
+    """Apply the shell gate's exact-worker WARN policy without regex ambiguity."""
+    selected = set(worker_ids)
+    declared = sorted(declared_worker_ids, key=len, reverse=True)
+    for line in output.splitlines():
+        if line.startswith(("FAIL", "ERROR")):
+            return False
+        if not line.startswith("WARN "):
+            continue
+        check_name = line.removeprefix("WARN ").split(":", 1)[0]
+        if not check_name.startswith("worker."):
+            continue
+        matched = next(
+            (
+                worker_id
+                for worker_id in declared
+                if check_name == f"worker.{worker_id}"
+                or check_name.startswith(f"worker.{worker_id}.")
+            ),
+            None,
+        )
+        if matched is None or matched in selected:
+            return False
+    return True
+
+
 def _validate_source_candidate(
     spec: CampaignSpecV1, loaded: LoadedPolicy, runner: CommandRunner
 ) -> None:
@@ -1719,9 +1903,15 @@ def _validate_source_candidate(
 
 
 def preflight(
-    spec: CampaignSpecV1, loaded: LoadedPolicy, *, runner: CommandRunner = _default_runner
+    spec: CampaignSpecV1,
+    loaded: LoadedPolicy,
+    *,
+    state_dir: Path,
+    active_receipt_sha256: str | None = None,
+    runner: CommandRunner = _default_runner,
 ) -> dict[str, str]:
     """Run exact source, selected pin, scoped free, and frozen dry-run gates."""
+    _assert_preflight_transaction_clear(state_dir, active_receipt_sha256=active_receipt_sha256)
     if os.name == "nt":
         raise RefreshError("preflight shell gate is refused on Windows in this milestone")
     _validate_source_candidate(spec, loaded, runner)
@@ -1742,7 +1932,8 @@ def preflight(
                 "PY": sys.executable,
                 "POLICY": spec.policy_path,
                 "ENVFILE": spec.env_file,
-                "ERIS_USED_WORKERS": ",".join(
+                "ERIS_USED_WORKERS": ",".join(spec.used_worker_ids()),
+                "ERIS_USED_CLI_WORKERS": ",".join(
                     item.logical_id for item in report.items if item.used and item.kind == "worker"
                 ),
                 "ERIS_CORPUS": spec.corpus or "",
@@ -1788,8 +1979,10 @@ __all__ = [
     "apply",
     "classify_version",
     "detect",
+    "doctor_output_allows_preflight",
     "preflight",
     "provider_manifest",
+    "required_worker_credentials",
     "used_verify_commands",
     "verification_manifest",
     "verify",

@@ -37,43 +37,52 @@ trap 'rm -rf "$TMPD"' EXIT
 "$PY" eval/run.py preflight --policy "$POLICY" --env-file "$ENVFILE" >"$TMPD"/pf.out 2>&1
 pf_rc=$?
 grep -vE "^(OK|doctor:)" "$TMPD"/pf.out || true
-# Scoped to the workers this campaign actually spawns - the CLI panel and the
-# judge. `openai-api` is an api-transport worker with no key configured and it
-# WARNs every time; failing the gate on it would block a run for a worker that
-# is never called, which is a false alarm and trains an operator to ignore the
-# gate.
-# Ids are REGEX-ESCAPED (they may contain `.`, which bare in an ERE matched
-# fooXbar for foo.bar) and the id is anchored with `[.:]` - the doctor writes
-# `worker.<id>: msg` and `worker.<id>.<subfield>: msg`, and `\b` both
-# over-matched (worker.grok also prefixes worker.grok2? no - but foo.bar
-# matched fooXbar) and UNDER-matched an id ending in a non-word character,
-# where no boundary exists before the `:` (panel 2026-09-06, D2 + the raiser's
-# counter). NOTE this is every CLI worker the POLICY declares, not the subset a
-# given campaign spawns - equal today, and a WARN on a declared-but-unused CLI
-# worker would fail the gate early rather than silently (round-2 addition,
-# recorded).
+# Scope doctor WARNs to every exact worker this campaign can spawn, including
+# API transports. The refresh preflight also supplies a separate CLI-only set
+# below for executable pin checks. Standalone use retains the historical
+# all-declared-CLI fallback so an unused API worker does not become a false
+# blocker when no campaign scope was supplied.
 if [ -n "${ERIS_USED_WORKERS+x}" ]; then
-USED=$("$PY" -c "import re, sys; print('|'.join(re.escape(x) for x in sys.argv[1].split(',') if x))" "$ERIS_USED_WORKERS")
+USED_IDS=$ERIS_USED_WORKERS
 else
-USED=$("$PY" -c "import sys, re; sys.path.insert(0,'src')
+USED_IDS=$("$PY" -c "import sys; sys.path.insert(0,'src')
 from pathlib import Path
 from eris.policy import load_policy
 from eris.schemas import Transport
 p = load_policy(Path('$POLICY')).policy
-print('|'.join(re.escape(n) for n, w in p.workers.items() if w.transport is Transport.CLI))")
+print(','.join(n for n, w in p.workers.items() if w.transport is Transport.CLI))")
 fi
-if [ -n "$USED" ]; then
-    # Empty USED is skipped OUTRIGHT rather than interpolated (panel
-    # 2026-09-06, D1): `worker\.()\b` is implementation-defined - BSD grep
-    # matches it against EVERY worker WARN (false FAIL), ugrep errors and the
-    # `!` turned that error into a silent pass (false PASS). Both observed on
-    # this machine, one per grep on PATH.
-    [ "$pf_rc" -eq 0 ] && ! grep -qE "^(FAIL|ERROR)" "$TMPD"/pf.out \
-        && ! grep -qE "^WARN worker\.($USED)[.:]" "$TMPD"/pf.out
-    chk $? "preflight: exit 0, no FAIL/ERROR, no WARN for a worker this run uses ($USED)"
+if [ -n "$USED_IDS" ]; then
+    "$PY" - "$TMPD/pf.out" "$USED_IDS" "$POLICY" <<'PY'
+import sys
+sys.path.insert(0, "src")
+from pathlib import Path
+from eris.policy import load_policy
+from eris.refresh import doctor_output_allows_preflight
+
+output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+workers = tuple(worker for worker in sys.argv[2].split(",") if worker)
+declared = tuple(load_policy(Path(sys.argv[3])).policy.workers)
+raise SystemExit(0 if doctor_output_allows_preflight(output, workers, declared) else 1)
+PY
+    doctor_scope_rc=$?
+    [ "$pf_rc" -eq 0 ] && [ "$doctor_scope_rc" -eq 0 ]
+    chk $? "preflight: exit 0, no FAIL/ERROR, no WARN for a worker this run uses ($USED_IDS)"
 else
-    [ "$pf_rc" -eq 0 ] && ! grep -qE "^(FAIL|ERROR)" "$TMPD"/pf.out
-    chk $? "preflight: exit 0, no FAIL/ERROR (no CLI workers declared, so no WARN scope)"
+    "$PY" - "$TMPD/pf.out" "$POLICY" <<'PY'
+import sys
+sys.path.insert(0, "src")
+from pathlib import Path
+from eris.policy import load_policy
+from eris.refresh import doctor_output_allows_preflight
+
+output = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+declared = tuple(load_policy(Path(sys.argv[2])).policy.workers)
+raise SystemExit(0 if doctor_output_allows_preflight(output, (), declared) else 1)
+PY
+    doctor_scope_rc=$?
+    [ "$pf_rc" -eq 0 ] && [ "$doctor_scope_rc" -eq 0 ]
+    chk $? "preflight: exit 0, no FAIL/ERROR (no workers selected, so no WARN scope)"
 fi
 
 # Calls the REAL launch-time gate, `launch.preflight_executable`, once per CLI
@@ -86,7 +95,7 @@ fi
 # verbatim and NOTHING hashes the binary at load time, so a stale pin loads as
 # pinned=True. Five deliberately corrupted pins all passed that check
 # (2026-08-31), while the binaries had genuinely changed under it.
-"$PY" - "$POLICY" "${ERIS_USED_WORKERS-}" "${ERIS_USED_WORKERS+x}" <<'PY' >"$TMPD"/pins.out 2>&1
+"$PY" - "$POLICY" "${ERIS_USED_CLI_WORKERS-}" "${ERIS_USED_CLI_WORKERS+x}" <<'PY' >"$TMPD"/pins.out 2>&1
 import sys
 sys.path.insert(0, "src")
 from pathlib import Path
@@ -114,24 +123,32 @@ sys.exit(1 if bad else 0)
 PY
 chk $? "every CLI worker passes the launch-time pin check (stale pin = refusal mid-campaign)"
 
-# THE SAME PARSER the runtime uses, requiring a non-empty value. Two prior
-# versions of this check were each wrong one way: a name-only grep passed
-# `XAI_API_KEY=` (panel 2026-09-06, D4 - launch keeps empty values and checks
-# name presence only, so the empty string would be handed to grok as its
-# credential), and the `^XAI_API_KEY=..*` grep that replaced it REFUSED syntax
-# the runtime accepts - `parse_dotenv` reads `export XAI_API_KEY='quoted'`,
-# the grep did not (final §9.9 reviewer, 2026-09-06, verified against
-# `eris.redact.parse_dotenv`). A gate stricter than the thing it guards trains
-# an operator to bypass it; a looser one spends money. Same parser, no gap.
-if [ -z "${ERIS_USED_WORKERS+x}" ] || echo ",${ERIS_USED_WORKERS}," | grep -q ',grok,'; then
-[ -f "$ENVFILE" ] && "$PY" -c "import sys; sys.path.insert(0,'src')
+# Check every selected worker's policy-declared credential names with the SAME
+# parser as runtime. This deliberately keys on selected policy entries, not a
+# logical id such as `grok`; renamed Grok CLIs and selected API workers retain
+# their requirements, while unused API workers remain nonblocking.
+"$PY" - "$POLICY" "$ENVFILE" "$USED_IDS" <<'PY'
+import sys
+sys.path.insert(0, "src")
 from pathlib import Path
+from eris.policy import load_policy
 from eris.redact import parse_dotenv
-sys.exit(0 if parse_dotenv(Path('$ENVFILE').read_text()).get('XAI_API_KEY') else 1)"
-chk $? "$ENVFILE parses (the runtime's own parser) with a NON-EMPTY XAI_API_KEY"
-else
-chk 0 "XAI_API_KEY not required (grok is unused by this campaign)"
-fi
+from eris.refresh import required_worker_credentials
+
+policy = load_policy(Path(sys.argv[1])).policy
+env_path = Path(sys.argv[2])
+values = parse_dotenv(env_path.read_text(encoding="utf-8")) if env_path.is_file() else {}
+workers = tuple(worker for worker in sys.argv[3].split(",") if worker)
+missing = {
+    worker: [name for name in names if not values.get(name)]
+    for worker, names in required_worker_credentials(policy, workers).items()
+}
+missing = {worker: names for worker, names in missing.items() if names}
+for worker, names in missing.items():
+    print(f"{worker}: missing non-empty credential names {names}")
+raise SystemExit(1 if missing else 0)
+PY
+chk $? "every selected worker has each non-empty policy-declared credential"
 
 # Resolved ABSOLUTE and shell-QUOTED. A runs_dir containing a space is valid
 # (`runs_dir: "my runs"`), and an unquoted relative path turned the stop command

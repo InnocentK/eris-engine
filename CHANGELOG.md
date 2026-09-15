@@ -14,12 +14,18 @@
   history, exclusive-create locking, fsynced mode-0600 atomic replacement,
   rollback after durable publication, and MANIFEST_NOT_DURABLE refusal after an
   unproved directory fsync. Missing, special, hardlinked, or changing candidate
-  paths refuse before publication; Windows publication remains a documented
-  refusal.
+  paths refuse before publication; a later no-receipt preflight also refuses
+  any retained lock or nonterminal/uncertain journal before campaign commands.
+  Windows publication remains a documented refusal.
 * Restrict `policy pin` to bootstrap missing entries; a changed existing pin
   now directs the operator to receipted refresh. The live precondition gate can
-  accept explicit `ERIS_USED_WORKERS` and exact corpus/task-file scope, so unused
-  CLI drift and unused Grok credentials no longer block or consume quota.
+  accept explicit all-transport worker and separate CLI pin scopes plus exact
+  corpus/task-file scope. Credential requirements come from each selected
+  worker policy, so used API and renamed Grok workers fail closed while unused
+  API workers remain nonblocking.
+* Bound candidate-reported live-probe model identities, project unsafe values to
+  `UNKNOWN`, and secret-scan the complete canonical receipt projection before
+  registration, including failed and REVIEW_REQUIRED probes.
 
 ### 0.5.0 release contents
 
