@@ -33,6 +33,6 @@ jobs:
           mypy
           mypy --ignore-missing-imports eval
       - name: Test with coverage floor
-        run: python -m pytest --cov --cov-report=term-missing --cov-fail-under=80
+        run: python -m pytest --cov --cov-report=term-missing --cov-fail-under=90
       - name: pip-audit (blocking)
         run: pip-audit -r requirements.txt --strict --progress-spinner off

@@ -389,16 +389,23 @@ evidence of cleanliness.
 Lives in `cache/` (policy `cache_dir`, gitignored, refused when equal to or
 under `runs/`). Entry bytes come out of `RunWriter.put_blob` (redacted) and
 the entry file is named by their sha256; blobs are copied from the run's
-blob files and re-hashed. Write-once (`O_EXCL`): a different entry under the
-same key is a `conflict`, never an overwrite. A HIT needs the current
-executable pin, key + prompt match, same campaign (unless
-`--reuse-across-campaigns`), status ok, `scan_hits == 0` (a contaminated
-entry is never reused), a known model, the current schema version, the
-entry hash == name and every blob re-hashing; every file is `lstat`-checked
-and opened `O_NOFOLLOW`; a key, entry or blob that IS a symlink is refused
-whatever it points at (an alias inside the cache root is still an alias),
-and every path must RESOLVE under the cache root's realpath (an ancestor
-symlink is refused); any failure is a reasoned miss and a fresh call.
+blob files and re-hashed. Default pointers are write-once (`O_EXCL`) under
+`keys/campaigns/<epoch>/<idempotency_key>`, where `<epoch>` is a domain-
+separated sha256 of the campaign id; the reserved no-campaign epoch is
+`none`. A different entry under the same campaign-scoped key is a `conflict`,
+never an overwrite. The legacy unscoped `keys/<idempotency_key>` pointer is
+the explicit first-writer-wins cross-campaign index only: its prior-campaign
+entry or refusal cannot block publication or use of the current campaign's
+pointer, and default lookup never falls back to it. A HIT needs the current
+executable pin, key + prompt match, the selected pointer's campaign (unless
+`--reuse-across-campaigns` explicitly selects the unscoped index), status ok,
+`scan_hits == 0` (a contaminated entry is never reused), a known model, the
+current schema version, the entry hash == name and every blob re-hashing;
+every file is `lstat`-checked and opened `O_NOFOLLOW`; a key, entry or blob
+that IS a symlink is refused whatever it points at (an alias inside the cache
+root is still an alias), and every path must RESOLVE under the cache root's
+realpath (an ancestor symlink is refused); any lookup failure is a reasoned
+miss and a fresh call.
 A replay whose blob changes under the reusing run's redactor (a secret
 learned later) is refused. Without `O_NOFOLLOW` (Windows) the cache refuses
 to construct (documented; M2c adds a portable fallback).

@@ -9,6 +9,10 @@ explicit human gates.
 
 ## Status: Phase 0 (evaluation harness) — no engine yet
 
+Version 0.5.0 is a beta integration boundary for this harness. It is not a
+public 1.0 release, a completed Phase 0 corpus, or evidence that the
+pre-registered build rule has cleared.
+
 Eris deliberately does not ship an orchestrator until a pre-registered
 experiment shows that *independent proposals → adversarial critique →
 mechanical verification → evidence-bound adjudication* beats a single strong

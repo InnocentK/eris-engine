@@ -1132,6 +1132,8 @@ def store_pending_cache(
             "idempotency_key": pending.invocation.idempotency_key,
             "entry_sha256": res.entry_sha256,
             "existing_sha256": res.existing_sha256,
+            "cross_campaign_outcome": res.cross_campaign_outcome,
+            "cross_campaign_existing_sha256": res.cross_campaign_existing_sha256,
             "scan_hits": hits,
         }
         ctx.writer.append(f"cache.{res.outcome}", payload)

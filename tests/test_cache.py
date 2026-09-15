@@ -128,6 +128,9 @@ class World:
         return self.cache.entries_dir / self.stored.entry_sha256
 
     def key_path(self) -> Path:
+        return self.cache._campaign_key_path(self.result.idempotency_key, self.campaign)
+
+    def cross_campaign_key_path(self) -> Path:
         return self.cache.keys_dir / self.result.idempotency_key
 
 
@@ -183,7 +186,7 @@ def test_store_then_hit_replays_blobs_and_records_reuse(
         ({"executable_sha256": "UNPINNED"}, "unpinned or disabled"),
         ({"executable_sha256": None}, "unpinned or disabled"),
         ({"prompt_sha256": "f" * 64}, "prompt_sha256 mismatch"),
-        ({"campaign_id": "camp-2"}, "campaign"),
+        ({"campaign_id": "camp-2"}, "missing"),
         ({"idempotency_key": "0" * 64}, "missing"),
         ({"idempotency_key": "not-a-key"}, "not a sha256"),
     ],
@@ -214,6 +217,7 @@ def test_reuse_across_campaigns_flag_and_fresh(
         ),
         CacheHit,
     )
+    assert w.cross_campaign_key_path().read_text().strip() == w.stored.entry_sha256
     fresh = Cache(tmp_path / "cache", runs_dir=tmp_path / "runs", fresh=True)
     miss = fresh.lookup(
         idempotency_key=w.result.idempotency_key,
@@ -251,6 +255,75 @@ def test_reuse_across_campaigns_flag_and_fresh(
     other.close()
     again.close()
     assert res.outcome == "conflict" and res.existing_sha256 == w.stored.entry_sha256
+
+
+def test_campaign_epoch_names_are_confined_and_none_is_reserved(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = World(tmp_path, fake_process, campaign=None)
+    none_path = w.key_path()
+    assert none_path.parent.name == "none"
+    assert isinstance(w.lookup(), CacheHit)
+    assert isinstance(w.lookup(campaign_id="none"), CacheMiss)
+
+    hostile_id = "none/../../outside\n\N{SNOWMAN}"
+    other = _writer(tmp_path, "other-campaign")
+    blobs = {k: other.put_blob(v.path.read_bytes()) for k, v in w.blobs.items()}
+    stored = w.cache.store(
+        other,
+        result=w.result,
+        invocation=w.invocation,
+        key_material=idempotency_material(w.call),
+        prompt_sha256=w.prompt_sha,
+        blobs=blobs,
+        scan_hits=0,
+        campaign_id=hostile_id,
+    )
+    other.close()
+    hostile_path = w.cache._campaign_key_path(w.result.idempotency_key, hostile_id)
+    assert stored.outcome == "stored"
+    assert hostile_path.is_file() and hostile_path.parent != none_path.parent
+    assert hostile_path.parent.name.startswith("sha256-")
+    assert len(hostile_path.parent.name) == len("sha256-") + 64
+    assert "none" not in hostile_path.parent.name and "outside" not in hostile_path.parent.name
+    assert hostile_path.resolve().is_relative_to(w.cache.campaign_keys_dir.resolve())
+    hit = w.lookup(campaign_id=hostile_id)
+    assert isinstance(hit, CacheHit) and hit.entry["campaign_id"] == hostile_id
+
+
+def test_bad_cross_campaign_index_cannot_block_a_campaign_scoped_store(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = World(tmp_path, fake_process, campaign="v2")
+    outside = tmp_path / "outside-pointer"
+    outside.write_text(w.stored.entry_sha256 + "\n")
+    w.cross_campaign_key_path().unlink()
+    w.cross_campaign_key_path().symlink_to(outside)
+
+    fresh_result = run_worker(
+        w.call,
+        popen=fake_process(stdout=grok_ok('{"verdict": "fresh-v3"}')),
+        killpg=lambda *_: None,
+    )
+    run = _writer(tmp_path, "v3")
+    blobs = {"stdout": run.put_blob(fresh_result.stdout)}
+    invocation = _invocation(fresh_result, blobs, w.prompt_sha)
+    stored = w.cache.store(
+        run,
+        result=fresh_result,
+        invocation=invocation,
+        key_material=idempotency_material(w.call),
+        prompt_sha256=w.prompt_sha,
+        blobs=blobs,
+        scan_hits=0,
+        campaign_id="v3",
+    )
+    run.close()
+
+    assert stored.outcome == "stored" and stored.cross_campaign_outcome == "refused"
+    hit = w.lookup(campaign_id="v3")
+    assert isinstance(hit, CacheHit) and hit.result.text == '{"verdict": "fresh-v3"}'
+    assert w.cross_campaign_key_path().is_symlink()
 
 
 def test_contaminated_failed_or_modelless_entries_never_hit(

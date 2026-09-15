@@ -1,10 +1,15 @@
 # Phase 0 evaluation plan
 
-Status: the harness is RUNNABLE as of 0.3.0 (`eval/run.py run|campaign`,
-`eval/score.py`); the per-category decision rule and a USD ceiling from a
-3-task pilot are still to be finalised, and the corpus keys are Milestone 2c.
-This file records what is settled, what the experiments showed, and what must
-still run before any scored corpus run.
+Status: the 0.5.0 Phase 0 harness is RUNNABLE (`eval/run.py run|campaign`,
+`eval/score.py`). Five scored `control`/`plan` tasks and their sibling keys now
+exist and have supported validation campaigns v1-v3; they are a validation
+subset, not the planned 25-30 task Phase 0 corpus. v3 completed 10/10 cells but
+did not produce a valid paired arm effect because only one proposal per pair
+was shared; 0.5.0 fixes that cache-epoch defect without changing v3. The draft
+decision rule, final corpus, and portable containment remain unfinished, so no
+campaign to date is Phase 0/build-rule evidence. This file records what is
+settled, what the experiments showed, and what must still run before a scored
+Phase 0 corpus campaign.
 
 **This file is where the pre-registration lives** — the rule in it is still
 marked draft, but this is the document that carries it. Earlier drafts pointed

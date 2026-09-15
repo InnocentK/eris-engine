@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.0 - Phase 0 harness beta integration boundary (2026-09-15)
+
+This is a beta boundary for the evaluation harness, not the Eris engine, a
+public 1.0 release, or Phase 0/build-rule evidence. The five scored
+control/plan tasks remain a validation subset of the planned corpus, and E1
+portable containment remains unbuilt. Licensing remains undecided and all
+rights reserved.
+
+* v3 completed its declared 10-cell validation matrix at exact revision
+  `b9c21a4eb3e9fdd34e78eab70300ada2790ac8a2`, cost-complete at $17.359096,
+  with no missing or unexpected cell. It did NOT produce a valid paired arm
+  effect: all five arm-4/arm-3 pairs failed because legacy v2 write-once cache
+  pointers prevented the fresh v3 proposals from being published for their
+  sibling arm. W1 was confirmed; W2 was not triggered; W3 measured a split
+  ACCEPT/REVISE; W4 and W5 were falsified as their stated conjunctions. The
+  build rule did not clear, the flip test fired for arm 4, and scan-clean is
+  not containment proof.
+* Default cache pointers are now campaign-epoch scoped using a domain-separated
+  sha256 path component, with an explicit reserved no-campaign epoch. The
+  legacy unscoped pointer remains the first-writer-wins index used only by
+  explicit `--reuse-across-campaigns`; it cannot block a current-campaign
+  pointer and default lookup never falls back to it. Idempotency keys, entry
+  and blob content addressing, write-once conflict behavior, tamper/symlink
+  refusals, schema version, prompts, keys, metrics, predictions, and the
+  decision rule are unchanged.
+* A regression seeded by a prior campaign proves the current campaign can
+  publish fresh proposals and its critique sibling replays byte-identical
+  proposal blobs. Unit coverage also pins same-campaign conflicts, explicit
+  cross-campaign reuse, the reserved `None` epoch, hostile campaign-id path
+  confinement, and a malformed cross-campaign index that cannot block a
+  scoped store.
+* Live docs now state the actual five-task validation-corpus status and preserve
+  the README's "no engine yet" boundary. GitHub's coverage gate is raised from
+  80% to the canonical 90% floor already enforced by `pyproject.toml` and
+  `Taskfile.yml`; supported Python remains `>=3.12` with CI on 3.12 and 3.14.
+
 ## 0.4.4 - worker identity is configured, not guessed from argv (2026-09-15)
 
 v2's four incomplete cells shared one cause: the vendor session ceiling -

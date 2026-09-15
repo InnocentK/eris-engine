@@ -72,6 +72,8 @@ class Fleet:
         self.ceiling = 50.0
         self.popens: list[ScriptedPopen] = []
         self.writers: dict[str, RunWriter] = {}
+        self.campaign_id = "camp"
+        self.run_prefix: str | None = None
 
     def stop_check(self) -> bool:
         if self.stop_after_calls is not None and len(self.spy.calls) >= self.stop_after_calls:
@@ -79,7 +81,10 @@ class Fleet:
         return self.stop
 
     def open(self, spec: CellSpec, *, resume: bool = False) -> tuple[StageContext, Any]:
-        run_dir = self.tmp / "runs" / spec.run_id
+        runs_dir = self.tmp / "runs"
+        if self.run_prefix is not None:
+            runs_dir /= self.run_prefix
+        run_dir = runs_dir / spec.run_id
         writer = RunWriter(run_dir, Redactor(), run_id=spec.run_id, resume=resume).open()
         self.writers[spec.run_id] = writer
         popen = ScriptedPopen({"rev-parse": b"f" * 40 + b"\n"})
@@ -103,7 +108,7 @@ class Fleet:
             path_env="/usr/bin:/bin",
             runner=self.spy,
             cache=self.cache,
-            campaign_id="camp",
+            campaign_id=self.campaign_id,
         )
         return ctx, env
 
@@ -285,6 +290,56 @@ def test_paired_ablation_one_set_of_propose_spawns_across_arms_3_3b_4(tmp_path: 
     assert all(
         kw["cwd"] == str(fleet.snapshot.resolve()) for p in fleet.popens for _a, kw in p.calls
     )
+
+
+def test_paired_ablation_uses_current_campaign_entries_when_legacy_pointers_are_old(
+    tmp_path: Path,
+) -> None:
+    """A prior campaign's write-once pointers must not prevent a new campaign
+    from publishing proposals for its sibling critique arm to replay."""
+    v2_grok = {**GOOD_PROPOSAL, "summary": "v2 grok"}
+    v3_grok = {**GOOD_PROPOSAL, "summary": "v3 grok"}
+    unpaired_grok = {**GOOD_PROPOSAL, "summary": "unpaired grok"}
+    v2_codex = {**GOOD_PROPOSAL, "summary": "v2 codex", "findings": []}
+    v3_codex = {**GOOD_PROPOSAL, "summary": "v3 codex", "findings": []}
+    unpaired_codex = {**GOOD_PROPOSAL, "summary": "unpaired codex", "findings": []}
+    fleet = Fleet(
+        tmp_path,
+        answers(
+            {
+                ("grok", "propose"): [v2_grok, v3_grok, unpaired_grok],
+                ("codex", "propose"): [v2_codex, v3_codex, unpaired_codex],
+                ("codex", "critique"): [GOOD_CRITIQUE],
+                ("judge", "adjudicate"): [ADJ_ANY, ADJ_ANY, ADJ_ANY],
+            }
+        ),
+    )
+
+    fleet.campaign_id = "v2"
+    fleet.run_prefix = "v2"
+    _old, old_view, _ = fleet.run(spec(Arm.INDEP_VERIFY))
+
+    fleet.campaign_id = "v3"
+    fleet.run_prefix = "v3"
+    current, current_view, _ = fleet.run(spec(Arm.INDEP_VERIFY))
+    sibling, sibling_view, _ = fleet.run(spec(Arm.INDEP_VERIFY_CRITIQUE))
+
+    def propose_blobs(view: LedgerView) -> set[str]:
+        return {
+            str(inv["stdout_sha256"])
+            for inv in view.payloads("invocation.finished")
+            if inv["stage"] == "propose"
+        }
+
+    assert current.propose_keys == sibling.propose_keys
+    assert propose_blobs(current_view) != propose_blobs(old_view)
+    assert propose_blobs(sibling_view) == propose_blobs(current_view)
+    reused = [
+        inv
+        for inv in sibling_view.payloads("invocation.finished")
+        if inv["stage"] == "propose" and inv["reused_from"] is not None
+    ]
+    assert len(reused) == 2
 
 
 def test_single_arm_reuses_the_panel_proposal_via_cache(tmp_path: Path) -> None:

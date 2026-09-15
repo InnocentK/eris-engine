@@ -350,8 +350,23 @@ def test_run_one_cell_end_to_end(tmp_path: Path) -> None:
     assert kinds.index("arm.finished") < kinds.index("cache.stored") < len(kinds) - 1
     assert kinds.count("scan.result") == 2  # #1 decides the ArmRun + cache scan_hits; #2 is final
     for e in view.of_kind("cache.stored"):
-        assert set(e.payload) <= {"idempotency_key", "entry_sha256", "existing_sha256", "scan_hits"}
-        assert all(v is None or isinstance(v, int) or len(str(v)) == 64 for v in e.payload.values())
+        assert set(e.payload) <= {
+            "idempotency_key",
+            "entry_sha256",
+            "existing_sha256",
+            "cross_campaign_outcome",
+            "cross_campaign_existing_sha256",
+            "scan_hits",
+        }
+        assert e.payload["cross_campaign_outcome"] in {"stored", "exists", "conflict", "refused"}
+        for key in (
+            "idempotency_key",
+            "entry_sha256",
+            "existing_sha256",
+            "cross_campaign_existing_sha256",
+        ):
+            value = e.payload[key]
+            assert value is None or len(value) == 64
     assert "scan.patterns" in kinds and view.payloads("scan.patterns")[0]["pattern_count"] >= 1
     # grok ran in its sanitized copy (no AGENTS.md), git ran on the ORIGINAL
     grok_calls = [kw for argv, kw in popen.calls if Path(argv[0]).name == "grok"]

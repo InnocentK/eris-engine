@@ -4,7 +4,8 @@ Lives in the policy's ``cache_dir`` (``cache/``, gitignored) and NEVER under
 ``runs/`` (refused at construction). Layout::
 
     <root>/entries/<sha256 of the entry bytes>   the entry (redacted JSON)
-    <root>/keys/<idempotency_key>                -> the entry's sha256 (text)
+    <root>/keys/campaigns/<epoch>/<key>          -> current-campaign entry sha256
+    <root>/keys/<idempotency_key>                -> cross-campaign entry sha256
     <root>/blobs/sha256/<sha256>                 redacted worker output bytes
 
 Every byte written here comes out of :meth:`eris.writer.RunWriter.put_blob`
@@ -17,15 +18,18 @@ regular file whose bytes hash to its name; ``schema_version`` is current;
 the ``idempotency_key``, ``prompt_sha256`` and ``executable_sha256`` match
 the caller's (the current pin - an unpinned or re-pinned worker never hits);
 ``status == ok``; ``scan_hits == 0`` (a contaminated entry is never reused);
-``model_executed`` is known; the campaign matches unless
-``reuse_across_campaigns``; every referenced blob is a regular file that
+``model_executed`` is known; the default pointer is scoped to the campaign
+epoch, while ``reuse_across_campaigns`` selects only the legacy unscoped
+cross-campaign pointer; every referenced blob is a regular file that
 hashes to its name. Files are ``lstat``-checked and opened ``O_NOFOLLOW``.
 Any failure is a :class:`CacheMiss` with a reason (the caller writes
 ``cache.refused{reason}`` and makes a fresh call).
 
-Writes are once-only (``O_EXCL``). A key that already points at a DIFFERENT
-entry is a ``conflict``: nothing is overwritten. ``fresh=True`` skips the
-lookup and still stores when the key is absent.
+Writes are once-only (``O_EXCL``). A campaign-scoped key that already points
+at a DIFFERENT entry is a ``conflict``: nothing is overwritten. The unscoped
+cross-campaign pointer remains first-writer-wins but cannot block publication
+of another campaign's scoped pointer. ``fresh=True`` skips the lookup and still
+stores when the scoped key is absent.
 
 On a hit :func:`replay_hit` copies the blobs into the run through
 ``put_blob`` (hash must match), re-appends the cached ``Invocation`` with
@@ -63,6 +67,7 @@ from eris.writer import BlobRef, RunWriter
 
 MAX_ENTRY_BYTES = 64 << 20  # an entry larger than this is not a cache entry
 BLOB_KINDS: tuple[str, ...] = ("stdout", "stderr", "output_file")
+NO_CAMPAIGN_EPOCH = "none"
 
 
 class CacheError(RuntimeError):
@@ -132,6 +137,8 @@ class StoreResult:
     outcome: str  # "stored" | "exists" | "conflict"
     entry_sha256: str
     existing_sha256: str | None = None
+    cross_campaign_outcome: str | None = None
+    cross_campaign_existing_sha256: str | None = None
 
 
 class CacheMissError(Exception):
@@ -193,6 +200,19 @@ def _is_under(child: Path, parent: Path) -> bool:
     return True
 
 
+def _campaign_epoch(campaign_id: str | None) -> str:
+    """Return a path-safe, collision-resistant namespace for one campaign.
+
+    ``none`` is reserved for calls outside a campaign. Real campaign ids are
+    domain-separated before hashing, so even the literal id ``"none"`` cannot
+    alias that reserved epoch and path separators never enter the layout.
+    """
+    if campaign_id is None:
+        return NO_CAMPAIGN_EPOCH
+    material = b"eris-cache-campaign\x00" + campaign_id.encode("utf-8")
+    return f"sha256-{sha256_hex(material)}"
+
+
 class Cache:
     def __init__(
         self,
@@ -227,6 +247,10 @@ class Cache:
         return self.root / "keys"
 
     @property
+    def campaign_keys_dir(self) -> Path:
+        return self.keys_dir / "campaigns"
+
+    @property
     def blobs_dir(self) -> Path:
         return self.root / "blobs" / "sha256"
 
@@ -250,11 +274,48 @@ class Cache:
             refuse(f"{path} resolves outside the cache root {root} (ancestor symlink?)")
         return path
 
-    def _ensure_dirs(self) -> None:
-        for d in (self.entries_dir, self.keys_dir, self.blobs_dir):
+    def _campaign_key_path(self, key: str, campaign_id: str | None) -> Path:
+        return self.campaign_keys_dir / _campaign_epoch(campaign_id) / key
+
+    def _lookup_key_path(self, key: str, campaign_id: str | None) -> Path:
+        if self.reuse_across_campaigns:
+            return self.keys_dir / key
+        return self._campaign_key_path(key, campaign_id)
+
+    def _ensure_dirs(self, campaign_id: str | None) -> None:
+        epoch_dir = self.campaign_keys_dir / _campaign_epoch(campaign_id)
+        for d in (
+            self.entries_dir,
+            self.keys_dir,
+            self.blobs_dir,
+            self.campaign_keys_dir,
+            epoch_dir,
+        ):
             if d.is_symlink():
                 raise CacheError(f"cache path {d} is a symlink; refusing")
             d.mkdir(parents=True, exist_ok=True)
+
+    def _publish_cross_campaign_pointer(
+        self, key: str, entry_sha256: str
+    ) -> tuple[str, str | None]:
+        """Publish the first-writer-wins unscoped index without blocking the
+        campaign-scoped pointer when that legacy index is stale or malformed."""
+        path = self.keys_dir / key
+        try:
+            path = self._inside(path, miss=False)
+            if path.is_symlink() or path.exists():
+                existing = _read_regular_nofollow(path, 256).decode("ascii").strip()
+                if not is_sha256(existing):
+                    return "refused", None
+                return ("exists" if existing == entry_sha256 else "conflict"), existing
+            if _write_once(path, (entry_sha256 + "\n").encode("ascii")):
+                return "stored", None
+            existing = _read_regular_nofollow(path, 256).decode("ascii").strip()
+            if not is_sha256(existing):
+                return "refused", None
+            return ("exists" if existing == entry_sha256 else "conflict"), existing
+        except (CacheError, CacheMissError, OSError, UnicodeError):
+            return "refused", None
 
     # ------------------------------------------------------------------ lookup
 
@@ -283,7 +344,9 @@ class Cache:
         self, key: str, prompt_sha256: str, executable_sha256: str, campaign_id: str | None
     ) -> CacheHit:
         pointer = (
-            _read_regular_nofollow(self._inside(self.keys_dir / key, miss=True), 256)
+            _read_regular_nofollow(
+                self._inside(self._lookup_key_path(key, campaign_id), miss=True), 256
+            )
             .decode("ascii")
             .strip()
         )
@@ -317,8 +380,7 @@ class Cache:
             raise CacheMissError("entry has no model_executed")
         if not self.reuse_across_campaigns and entry.get("campaign_id") != campaign_id:
             raise CacheMissError(
-                f"entry campaign {entry.get('campaign_id')!r} != {campaign_id!r} "
-                "(pass --reuse-across-campaigns to allow)"
+                f"campaign-scoped entry {entry.get('campaign_id')!r} != {campaign_id!r}"
             )
         invocation = Invocation.model_validate(entry.get("invocation"))
         if invocation.idempotency_key != key or invocation.status is not WorkerStatus.OK:
@@ -381,17 +443,29 @@ class Cache:
         data = ref.path.read_bytes()
         if sha256_hex(data) != ref.sha256:
             raise CacheRefused("the run's entry blob does not hash to its name")
-        self._ensure_dirs()
-        for d in (self.entries_dir, self.keys_dir, self.blobs_dir):
+        self._ensure_dirs(campaign_id)
+        campaign_key_dir = self._campaign_key_path(invocation.idempotency_key, campaign_id).parent
+        for d in (
+            self.entries_dir,
+            self.keys_dir,
+            self.blobs_dir,
+            self.campaign_keys_dir,
+            campaign_key_dir,
+        ):
             self._inside(d, miss=False)
-        key_path = self._inside(self.keys_dir / invocation.idempotency_key, miss=False)
+        key_path = self._inside(
+            self._campaign_key_path(invocation.idempotency_key, campaign_id), miss=False
+        )
         if key_path.is_symlink() or key_path.exists():
             try:
                 existing = _read_regular_nofollow(key_path, 256).decode("ascii").strip()
             except CacheMissError as exc:
                 return StoreResult("conflict", ref.sha256, f"unreadable: {exc}")
             if existing == ref.sha256:
-                return StoreResult("exists", ref.sha256, existing)
+                cross_outcome, cross_existing = self._publish_cross_campaign_pointer(
+                    invocation.idempotency_key, ref.sha256
+                )
+                return StoreResult("exists", ref.sha256, existing, cross_outcome, cross_existing)
             return StoreResult("conflict", ref.sha256, existing)
         _write_once(self.entries_dir / ref.sha256, data)  # same name = same bytes
         for kind, bref in blobs.items():
@@ -407,10 +481,21 @@ class Cache:
                 _write_once(target, blob_bytes)
         if not _write_once(key_path, (ref.sha256 + "\n").encode("ascii")):
             existing = _read_regular_nofollow(key_path, 256).decode("ascii").strip()
-            return StoreResult(
+            scoped = StoreResult(
                 "exists" if existing == ref.sha256 else "conflict", ref.sha256, existing
             )
-        return StoreResult("stored", ref.sha256)
+        else:
+            scoped = StoreResult("stored", ref.sha256)
+        cross_outcome, cross_existing = self._publish_cross_campaign_pointer(
+            invocation.idempotency_key, ref.sha256
+        )
+        return StoreResult(
+            scoped.outcome,
+            scoped.entry_sha256,
+            scoped.existing_sha256,
+            cross_outcome,
+            cross_existing,
+        )
 
 
 # --------------------------------------------------------------------------- replay
