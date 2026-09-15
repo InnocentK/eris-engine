@@ -59,11 +59,25 @@ the vendor to run the requested model as a non-authoring helper AND the
 true author's cumulative to diverge from the result count AND an exact
 token coincidence - and no capture has ever shown even the divergence
 alone. No mechanical closure exists in the envelope (it would need per-call
-attribution the vendor does not emit), so the assumption is held OPENLY: a
-tripwire test walks every claude capture and fails the moment any
-multi-model envelope stops having exactly one counter match, forcing this
-rule back to review rather than letting the assumption rot silently. The
-xai seat accepts the residual as named.
+attribution the vendor does not emit), so the assumption is held OPENLY - and, as of the
+second stop-time correction, WITHOUT any monitoring claim: the residual's
+envelope signature (the requested model matching uniquely while another
+model authored) is indistinguishable from the healthy case, so NO
+capture-level test can monitor it. Two tripwire versions overclaimed - the
+first checked uniqueness, which holds exactly when the residual fires; the
+second claimed the "precondition" was requested-counter divergence, which is
+a different failure - and both corrections are part of this record. What
+remains in the suite is an honestly-named counter-SHAPE stability check:
+if the vendor's counter shape stops supporting the identity rule, the rule
+returns to review. The residual itself is accepted on its bound alone
+(never-observed vendor behaviour, twice over, plus an exact coincidence),
+with the openai seat's dissent standing and the xai seat accepting the
+residual as named. RATIFIED by the user 2026-09-14, presented with the collapsed
+monitoring claim and all three options (accept openly; block to always-None
+per the dissent; split evidence from cache): accept openly, unmonitored -
+the residual's bound (two never-observed vendor behaviours plus an exact
+token coincidence) carries the decision on its own, with no monitoring
+pretence attached.
 
 ## Re-pin
 

@@ -1075,39 +1075,62 @@ def make_call(tmp_path: Path, policy: WorkerPolicy, **kw: Any) -> WorkerCall:
     return WorkerCall(**base)
 
 
-def test_every_multi_model_capture_has_the_primary_matching_the_result() -> None:
-    """TRIPWIRE for the veto's stated residual (2026-09-14). The recorded
-    `model_executed` can still be wrong only if the vendor ever runs the
-    REQUESTED model as a non-authoring helper whose counter coincidentally
-    equals the result's while the true author's cumulative diverges. That
-    requires primary-divergence, which no capture has ever shown: in every
-    multi-model envelope on file, exactly one model matches the result's
-    output_tokens and it is the highest-cost primary of the call. This test
-    walks ALL claude captures so the assumption breaks LOUDLY the moment a
-    new capture contradicts it - at which point the identity rule must be
-    revisited, not patched around (openai's standing dissent is that the
-    residual should block today; adjudicated against on the evidence bound,
-    dissent recorded in the 2026-09-14 decision record).
+def test_captured_counter_shape_still_supports_the_identity_rule() -> None:
+    """Vendor counter-shape stability check - NOT a residual tripwire, and it
+    says so. Two prior versions overclaimed: the first checked uniqueness
+    (which holds exactly when the residual fires), the second claimed to
+    monitor the residual's "precondition" - but the residual's envelope
+    signature (requested model matching uniquely while another model
+    authored) is INDISTINGUISHABLE from the healthy case, so NO capture-level
+    test can monitor it, at all (both caught by stop-time review). What this
+    checks, exactly: in every non-error multi-model capture whose sidecar
+    recorded a requested model, the requested model is present, its own
+    outputTokens equals the result's usage.output_tokens, and it is the
+    unique such match - the counter SHAPE the identity rule operates on. If a
+    capture breaks this shape, the rule's operating conditions changed and it
+    goes back to review. The unmonitorable residual itself is accepted
+    OPENLY, with dissent, in the 2026-09-14 decision record. Captures that
+    lack a usable result counter are COUNTED and reported, not silently
+    skipped.
     """
     import json as _json
 
     root = Path(__file__).resolve().parent / "fixtures" / "envelopes" / "claude"
     checked = 0
-    for f in sorted(root.rglob("*.json")):
-        if f.name.endswith(".meta.json"):
+    unusable: list[str] = []
+    for meta_path in sorted(root.rglob("*.meta.json")):
+        meta = _json.loads(meta_path.read_text())
+        argv = meta.get("argv", [])
+        if "--model" not in argv:
             continue
-        d = _json.loads(f.read_text())
+        requested = argv[argv.index("--model") + 1]
+        d = _json.loads(meta_path.with_name(meta_path.name.replace(".meta", "")).read_text())
         mu = d.get("modelUsage") or {}
+        if len(mu) < 2 or d.get("is_error"):
+            continue
         out = (d.get("usage") or {}).get("output_tokens")
-        if len(mu) < 2 or not isinstance(out, int) or d.get("is_error"):
+        if not isinstance(out, int):
+            unusable.append(meta_path.name)
             continue
         checked += 1
-        matches = [m for m, u in mu.items() if isinstance(u, dict) and u.get("outputTokens") == out]
-        assert len(matches) == 1, (
-            f"{f.name}: {len(matches)} models match the result count - the "
-            "identity's uniqueness assumption broke on a real capture"
+        assert requested in mu, f"{meta_path.name}: requested model absent from modelUsage"
+        got = (mu[requested] or {}).get("outputTokens")
+        assert got == out, (
+            f"{meta_path.name}: requested {requested} outputTokens {got} != result {out} - "
+            "the counter shape the identity rule relies on changed; revisit the rule"
         )
-    assert checked >= 2, "tripwire walked nothing - the multi-model captures moved?"
+        others = [
+            m for m, u in mu.items() if m != requested and (u or {}).get("outputTokens") == out
+        ]
+        assert not others, f"{meta_path.name}: {others} also match - uniqueness broke"
+    assert not unusable, (
+        f"multi-model captures with no usable result counter: {unusable} - the shape check "
+        "cannot see them; decide explicitly rather than skip silently"
+    )
+    assert checked >= 1, (
+        "shape check walked no captures - every re-pin probe records --model, so this count "
+        "must never reach zero"
+    )
 
 
 def test_model_executed_is_the_unique_output_token_match_amid_helpers(tmp_path: Path) -> None:
