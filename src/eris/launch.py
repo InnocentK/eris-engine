@@ -738,13 +738,40 @@ def _duration_ms_or_none(value: Any) -> int | None:
 
 
 def _pick_model(model_usage: Any) -> tuple[str | None, list[str]]:
-    """``model_executed`` is known only when ``modelUsage`` names EXACTLY one
-    model; with several (e.g. a helper model plus the primary) it is None -
-    recorded as unknown, never guessed. All names go to ``models_used``."""
+    """``model_executed`` from the name list alone is known only when
+    ``modelUsage`` names EXACTLY one model; with several (e.g. a helper model
+    plus the primary) this returns None and, for claude, the caller then
+    tries ``_executor_by_output_tokens`` - authorship by the vendor's own
+    counters, never by the request. All names go to ``models_used``; nothing
+    is ever guessed."""
     if not isinstance(model_usage, dict) or not model_usage:
         return None, []
     names = [str(k) for k in model_usage]
     return (names[0] if len(names) == 1 else None), names
+
+
+def _executor_by_output_tokens(
+    model_usage: dict[str, Any], output_tokens: int | None
+) -> str | None:
+    """Among SEVERAL models in ``modelUsage``, the UNIQUE one whose own
+    ``outputTokens`` equals the envelope's result ``usage.output_tokens`` is
+    the author of the result - mechanical authorship evidence from the
+    vendor's own counters, with the REQUESTED model never consulted (a
+    three-family panel, 2026-09-14, rejected requested-appears-in-usage as
+    unsupported and converged on this identity instead; claude 2.1.272 runs
+    a haiku helper on every call, so the several-names case is now every
+    call). No unique match - counters absent, zero-output ties, a future CLI
+    breaking the identity - degrades to None, never to a wrong name.
+    Verified on the captured 2.1.272 envelope: helper 17 output tokens,
+    primary 450 == result 450."""
+    if output_tokens is None:
+        return None
+    matches = [
+        name
+        for name, u in model_usage.items()
+        if isinstance(u, dict) and _int_or_none(u.get("outputTokens")) == output_tokens
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _structured_from_text(text: str | None) -> Any:
@@ -823,6 +850,8 @@ def parse_claude(stdout: bytes) -> Envelope:
         reasoning_tokens=_int_or_none(details.get("thinking_tokens")),
     )
     model, names = _pick_model(data.get("modelUsage"))
+    if model is None and len(names) > 1:
+        model = _executor_by_output_tokens(_dict(data.get("modelUsage")), usage.output_tokens)
     if data.get("is_error") is True:
         # F1: an error envelope still carries usage and cost (T2: the
         # --max-budget-usd cap tripped at $0.129 on a $0.10 cap - the spend is

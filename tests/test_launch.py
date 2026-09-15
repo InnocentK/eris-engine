@@ -796,12 +796,17 @@ def test_parse_claude_control_fixture() -> None:
     assert env.usage.reasoning_tokens == 0 and env.parse_mode == "json"
 
 
-def test_parse_claude_safemode_two_models_means_unknown_model() -> None:
-    """modelUsage lists a helper model AND the primary: which one 'executed'
-    is not observable from the envelope, so it is None (never guessed)."""
+def test_parse_claude_two_models_resolve_by_output_token_identity() -> None:
+    """modelUsage lists a helper model AND the primary. Until 2026-09-14 this
+    was None ("which one executed is not observable"); the output-token
+    identity made it observable - the model whose own outputTokens equals the
+    result's usage.output_tokens authored the result (here: fable 4 == 4,
+    helper 8). The change was forced when claude 2.1.272 began running a
+    helper on EVERY call, turning None-on-two-names into None-always, which
+    refused the cache and broke the paired design."""
     env = parse_claude(fixture("claude", "2.1.239", "safemode.json"))
     assert env.text == "ok"
-    assert env.model_executed is None
+    assert env.model_executed == "claude-fable-5"
     assert set(env.models_used) == {"claude-haiku-4-5-20251001", "claude-fable-5"}
     assert env.cost_usd == 0.080129
     single = parse_claude(fixture("claude", "2.1.239", "control.json"))
@@ -907,7 +912,8 @@ def test_parse_grok_schema_fixture_prefers_structured_output() -> None:
 def test_parse_claude_schema_and_notools_fixtures() -> None:
     env = parse_claude(fixture("claude", "2.1.239", "schema.json"))
     assert not env.is_error and env.structured == {"answer": "ok", "n": 7}
-    assert env.text == '{"answer":"ok","n":7}' and env.model_executed is None  # two models
+    # two models; the output-token identity names the author (2026-09-14)
+    assert env.text == '{"answer":"ok","n":7}' and env.model_executed == "claude-fable-5"
     env = parse_claude(fixture("claude", "2.1.239", "notools_text.json"))
     assert env.text == "ok" and not env.is_error and env.cost_usd == 0.041041
 
@@ -1067,6 +1073,74 @@ def make_call(tmp_path: Path, policy: WorkerPolicy, **kw: Any) -> WorkerCall:
     }
     base.update(kw)
     return WorkerCall(**base)
+
+
+def test_model_executed_is_the_unique_output_token_match_amid_helpers(tmp_path: Path) -> None:
+    """claude 2.1.272 runs a haiku helper on EVERY call (captured fixture), so
+    `modelUsage` always names two models. The executor is the UNIQUE model
+    whose own outputTokens equals the result's usage.output_tokens - the
+    vendor's counters as authorship evidence. A three-family panel
+    (2026-09-14) REJECTED the first proposed rule (requested-appears-in-
+    usage) as unsupported - a vendor could route the main turn elsewhere
+    while the requested model does a side task - and converged on this
+    identity, which never consults the request and degrades to None, not to
+    a wrong name. Without either rule, every 2.1.272 claude call refused the
+    cache and broke the paired design the claude+grok panel exists for.
+    """
+    import json as _json
+
+    raw = fixture("claude", "2.1.272", "helper_plus_primary.json")
+    env = parse_claude(raw)
+    # helper 17 output tokens, primary 450 == result 450: unique match
+    assert env.model_executed == "claude-fable-5"
+    assert set(env.models_used) == {"claude-haiku-4-5-20251001", "claude-fable-5"}
+
+    # the request is NEVER consulted: a run that requested some other model
+    # still records the counter-matched author, which is exactly how
+    # A9-style silent substitution stays visible in the multi-model case
+    policy = make_policy(tmp_path, cli="claude", provider="anthropic", model="claude-opus-5")
+    res = run_worker(
+        make_call(tmp_path, policy),
+        popen=FakeProcessFactory(stdout=raw),
+        killpg=lambda *_: None,
+    )
+    assert res.model_requested == "claude-opus-5"
+    assert res.model_executed == "claude-fable-5"
+
+    # break the identity: no per-model counter equals the result's - None,
+    # never a guess (the degradation direction the panel required)
+    d = _json.loads(raw)
+    d["modelUsage"]["claude-fable-5"]["outputTokens"] = 451
+    env2 = parse_claude(_json.dumps(d).encode())
+    assert env2.model_executed is None
+
+    # a TIE (two models both matching) is not unique - also None
+    d = _json.loads(raw)
+    d["modelUsage"]["claude-haiku-4-5-20251001"]["outputTokens"] = 450
+    env3 = parse_claude(_json.dumps(d).encode())
+    assert env3.model_executed is None
+
+    # counters ABSENT on the result side: no identity to check - None
+    d = _json.loads(raw)
+    del d["usage"]["output_tokens"]
+    assert parse_claude(_json.dumps(d).encode()).model_executed is None
+
+    # counters absent on the PER-MODEL side: nothing can match - None
+    d = _json.loads(raw)
+    for u in d["modelUsage"].values():
+        u.pop("outputTokens", None)
+    assert parse_claude(_json.dumps(d).encode()).model_executed is None
+
+    # exactly ONE reported name still wins even when it differs from the
+    # request - the single-name defaulting detection is unchanged
+    raw_single = fixture("claude", "2.1.239", "control.json")
+    policy2 = make_policy(tmp_path, cli="claude", provider="anthropic", model="claude-fable-5")
+    res3 = run_worker(
+        make_call(tmp_path, policy2),
+        popen=FakeProcessFactory(stdout=raw_single),
+        killpg=lambda *_: None,
+    )
+    assert res3.model_executed == "claude-opus-5"
 
 
 def test_idempotency_key_excludes_arm_includes_repeat(tmp_path: Path) -> None:

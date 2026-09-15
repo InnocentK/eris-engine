@@ -34,7 +34,10 @@ CAPTURED_LEDGER = (
     "argv as recorded by the RunWriter ledger of the capturing run (run id in note; "
     "argv[0] was the pinned absolute CLI path, normalised to the bare name here)"
 )
-ARGV_SOURCES = (CAPTURED, CAPTURED_FLAGTEST, RECONSTRUCTED, CAPTURED_LEDGER)
+CAPTURED_PROBE = (
+    "argv as written and executed by the maintaining session's re-pin probe (exact, single command)"
+)
+ARGV_SOURCES = (CAPTURED, CAPTURED_FLAGTEST, RECONSTRUCTED, CAPTURED_LEDGER, CAPTURED_PROBE)
 
 
 def _fixture_files() -> list[Path]:

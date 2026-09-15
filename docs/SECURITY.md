@@ -134,9 +134,13 @@ docs must keep honoring:
   lock, and removed in `finally`. A cleanup failure is reported as
   `cleanup_error` and becomes a `run.error` event (exit code 4), never
   silent. Oversize files are capped and flagged `output_file_truncated`.
-* `model_executed` is taken from the envelope only when it names exactly one
-  model; otherwise it is `None` (never guessed). agy and codex emit no model
-  id at all: `model_executed` is always `None` for them.
+* `model_executed` (claude): exactly one envelope-reported name -> that
+  name; several names -> the unique model whose own `outputTokens` equals
+  the result's `usage.output_tokens` (authorship by the vendor's counters,
+  the request never consulted; panel-reviewed 2026-09-14, added when claude
+  2.1.272 began running a haiku helper on every call); no unique match ->
+  `None`, never guessed. agy and codex emit no model id at all:
+  `model_executed` is always `None` for them.
 * A worker's prompt may not start with `-`.
 
 ### Antigravity `agy` 1.1.18 (Google lineage, M2a)

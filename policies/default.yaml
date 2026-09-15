@@ -48,6 +48,14 @@ workers:
                                   # model under a binary whose hash still matched its pin, the
                                   # one drift the pin check cannot see. `--model claude-fable-5`
                                   # was executed against this CLI before pinning (S0-2).
+                                  # Binary re-pinned 2026-09-14 at 2.1.272 (auto-updated from
+                                  # the Sep 6 pin; user authorised after re-verification:
+                                  # flags, plan-mode write-block, parse_claude on the live
+                                  # envelope, sha bracketed and equal to the pin). 2.1.272
+                                  # runs a haiku HELPER on every call - modelUsage always
+                                  # names two models - which forced the panel-reviewed
+                                  # output-token-identity rule in parse_claude; see
+                                  # SECURITY.md and the 2026-09-14 decision record.
     executable_sha256: UNPINNED
     timeout_s: 600
     max_stdout_bytes: 10000000
