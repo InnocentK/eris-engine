@@ -136,11 +136,13 @@ docs must keep honoring:
   silent. Oversize files are capped and flagged `output_file_truncated`.
 * `model_executed` (claude): exactly one envelope-reported name -> that
   name; several names -> the unique model whose own `outputTokens` equals
-  the result's `usage.output_tokens` (authorship by the vendor's counters,
-  the request never consulted; panel-reviewed 2026-09-14, added when claude
-  2.1.272 began running a haiku helper on every call); no unique match ->
-  `None`, never guessed. agy and codex emit no model id at all:
-  `model_executed` is always `None` for them.
+  the result's `usage.output_tokens` (authorship by the vendor's counters;
+  panel-reviewed 2026-09-14, added when claude 2.1.272 began running a
+  haiku helper on every call), recorded on the RESULT only when the match
+  is ALSO the requested model - a veto against the identity crowning a
+  coincidence-matching helper (stop-time review, same day); no unique
+  match, or a vetoed one -> `None`, never guessed. agy and codex emit no
+  model id at all: `model_executed` is always `None` for them.
 * A worker's prompt may not start with `-`.
 
 ### Antigravity `agy` 1.1.18 (Google lineage, M2a)

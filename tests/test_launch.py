@@ -1075,6 +1075,41 @@ def make_call(tmp_path: Path, policy: WorkerPolicy, **kw: Any) -> WorkerCall:
     return WorkerCall(**base)
 
 
+def test_every_multi_model_capture_has_the_primary_matching_the_result() -> None:
+    """TRIPWIRE for the veto's stated residual (2026-09-14). The recorded
+    `model_executed` can still be wrong only if the vendor ever runs the
+    REQUESTED model as a non-authoring helper whose counter coincidentally
+    equals the result's while the true author's cumulative diverges. That
+    requires primary-divergence, which no capture has ever shown: in every
+    multi-model envelope on file, exactly one model matches the result's
+    output_tokens and it is the highest-cost primary of the call. This test
+    walks ALL claude captures so the assumption breaks LOUDLY the moment a
+    new capture contradicts it - at which point the identity rule must be
+    revisited, not patched around (openai's standing dissent is that the
+    residual should block today; adjudicated against on the evidence bound,
+    dissent recorded in the 2026-09-14 decision record).
+    """
+    import json as _json
+
+    root = Path(__file__).resolve().parent / "fixtures" / "envelopes" / "claude"
+    checked = 0
+    for f in sorted(root.rglob("*.json")):
+        if f.name.endswith(".meta.json"):
+            continue
+        d = _json.loads(f.read_text())
+        mu = d.get("modelUsage") or {}
+        out = (d.get("usage") or {}).get("output_tokens")
+        if len(mu) < 2 or not isinstance(out, int) or d.get("is_error"):
+            continue
+        checked += 1
+        matches = [m for m, u in mu.items() if isinstance(u, dict) and u.get("outputTokens") == out]
+        assert len(matches) == 1, (
+            f"{f.name}: {len(matches)} models match the result count - the "
+            "identity's uniqueness assumption broke on a real capture"
+        )
+    assert checked >= 2, "tripwire walked nothing - the multi-model captures moved?"
+
+
 def test_model_executed_is_the_unique_output_token_match_amid_helpers(tmp_path: Path) -> None:
     """claude 2.1.272 runs a haiku helper on EVERY call (captured fixture), so
     `modelUsage` always names two models. The executor is the UNIQUE model
@@ -1095,9 +1130,12 @@ def test_model_executed_is_the_unique_output_token_match_amid_helpers(tmp_path: 
     assert env.model_executed == "claude-fable-5"
     assert set(env.models_used) == {"claude-haiku-4-5-20251001", "claude-fable-5"}
 
-    # the request is NEVER consulted: a run that requested some other model
-    # still records the counter-matched author, which is exactly how
-    # A9-style silent substitution stays visible in the multi-model case
+    # the counter identity ATTRIBUTES; the request VETOES (stop-time review,
+    # 2026-09-14): in the multi-model case a counter-matched author that is
+    # not the requested model records None on the RESULT - a false helper
+    # attribution would need primary-divergence (never observed) AND the
+    # helper being the requested model. The guard suppresses names, never
+    # supplies them; the envelope keeps the unguarded counter verdict.
     policy = make_policy(tmp_path, cli="claude", provider="anthropic", model="claude-opus-5")
     res = run_worker(
         make_call(tmp_path, policy),
@@ -1105,7 +1143,17 @@ def test_model_executed_is_the_unique_output_token_match_amid_helpers(tmp_path: 
         killpg=lambda *_: None,
     )
     assert res.model_requested == "claude-opus-5"
-    assert res.model_executed == "claude-fable-5"
+    assert res.model_executed is None
+
+    # matched AND requested: recorded - this is the case that restores the
+    # cache for every 2.1.272 campaign call
+    policy_ok = make_policy(tmp_path, cli="claude", provider="anthropic", model="claude-fable-5")
+    res_ok = run_worker(
+        make_call(tmp_path, policy_ok),
+        popen=FakeProcessFactory(stdout=raw),
+        killpg=lambda *_: None,
+    )
+    assert res_ok.model_executed == "claude-fable-5"
 
     # break the identity: no per-model counter equals the result's - None,
     # never a guess (the degradation direction the panel required)

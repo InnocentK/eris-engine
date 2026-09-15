@@ -1519,11 +1519,26 @@ def _execute(
         status = WorkerStatus.OK
         error = None
         warning = envelope.error  # F3: "OK with error" is a warning, not a failure
+    # Multi-model guard (stop-time review, 2026-09-14): the output-token
+    # identity in parse_claude can in principle misattribute - a helper whose
+    # counter coincidentally equals the result's while the primary's
+    # cumulative diverges (never observed in any capture, but not excludable
+    # from one envelope). When the envelope named SEVERAL models, the
+    # counter-derived author is therefore recorded only if it is ALSO the
+    # requested model: the counters carry the authorship claim, the request
+    # only VETOES, so a false helper attribution now needs two independent
+    # anomalies and the guard can only ever suppress a name, never supply
+    # one. The single-name path is untouched - that is where A9-style
+    # defaulting is seen, and it stays visible. The envelope (and its blob in
+    # the ledger) keeps the unguarded counter verdict.
+    model_executed = envelope.model_executed
+    if len(envelope.models_used) > 1 and model_executed is not None and model_executed != w.model:
+        model_executed = None
     return WorkerResult(
         worker_id=call.worker_id,
         provider=w.provider,
         model_requested=w.model,
-        model_executed=envelope.model_executed,
+        model_executed=model_executed,
         status=status,
         error=error,
         text=envelope.text,

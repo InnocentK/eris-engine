@@ -35,6 +35,36 @@ Also recorded, not silent: the Invocation ledger row does not carry
 `models_used` (the helper list lives only in the stdout blob, which is
 hashed into the ledger). Known, deliberate for now.
 
+## Postscript, same day: the veto the stop gate forced
+
+The identity as first landed could in principle crown a HELPER: a helper
+whose counter coincidentally equals the result's while the primary's
+cumulative diverges (multi-call turns). Never observed - every capture has
+the primary matching exactly - but not excludable from one envelope, and my
+first hardening attempt (gate on `num_turns == 1`) was falsified by the data
+before landing: the 2.1.272 capture itself says `num_turns: 2` while the
+identity holds. What landed instead: on the recorded result, a multi-name
+counter match is kept only when it IS the requested model. The counters
+still carry the authorship claim; the request only vetoes - it can suppress
+a name, never supply one - so a false helper attribution now requires
+primary-divergence AND the helper being the requested model, two
+independent anomalies. The envelope and its hashed blob keep the unguarded
+counter verdict, so the evidence of what the vendor reported is never
+thinned. Veto deletion is mutation-caught.
+
+**Standing dissent (openai seat), recorded:** the residual path - the
+requested model itself being the coincidence-matching helper - should block
+the rule today. Adjudicated against, on the evidence bound: that path needs
+the vendor to run the requested model as a non-authoring helper AND the
+true author's cumulative to diverge from the result count AND an exact
+token coincidence - and no capture has ever shown even the divergence
+alone. No mechanical closure exists in the envelope (it would need per-call
+attribution the vendor does not emit), so the assumption is held OPENLY: a
+tripwire test walks every claude capture and fails the moment any
+multi-model envelope stops having exactly one counter match, forcing this
+rule back to review rather than letting the assumption rot silently. The
+xai seat accepts the residual as named.
+
 ## Re-pin
 
 claude 2.1.272 pinned (with judge, same binary) after behavioural
