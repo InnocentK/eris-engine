@@ -69,7 +69,11 @@ exist.
 - Publication uses an exclusive-create lock that is never automatically
   broken, immutable content-addressed history, mode-0600 same-directory temp,
   file fsync, strict reload/secret scan/authorized-diff, `os.replace`, and
-  directory fsync. Uncertain durability remains visibly blocked.
+  directory fsync. An existing owner-owned, single-link, non-group/other-
+  writable legacy pins file (including mode 0644) may be read; successful
+  replacement hardens it to mode 0600. Private transaction, receipt, history,
+  and lock state remains strictly owner-private. Uncertain durability remains
+  visibly blocked.
 - Bootstrap `policy pin` may fill missing entries only. Existing changed pins
   refuse; normal drift uses refresh.
 - Preflight validates the exact clean source candidate, refreshes only an
@@ -99,11 +103,15 @@ this milestone.
 
 Candidate validation at exact worktree base `5dab66f7ae92ca6bd09ebbbed8c0b049a19ca498`:
 
-- Focused refresh/policy/cache/launch/hermeticity/doctor/invariant suite: PASS.
+- The first post-commit focused gate found four failures: apply incorrectly
+  treated the historically mode-0644 non-secret pins sidecar as private state.
+  The remediation separated pins permissions from private state permissions,
+  added legacy-hardening and writable/symlink/hardlink/special/foreign-owner/
+  private-state refusal tests, and reran the exact focused command: PASS.
 - `bash -n eval/live_preconditions.sh`: PASS.
 - `git diff --check`: PASS.
 - Exact `task ci`: PASS — Ruff check and format clean; mypy clean for 21 source
-  and 4 eval files; 1,302 tests passed; 93.42% total coverage against a 90%
+  and 4 eval files; 1,310 tests passed; 93.49% total coverage against a 90%
   floor; `pip-audit` reported no known vulnerabilities.
 
 No live provider, network, campaign, pin publication, merge, push, tag, or

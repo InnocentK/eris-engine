@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -597,6 +600,8 @@ def test_apply_consumes_registered_receipt_and_updates_alias_group_atomically(
     tmp_path: Path,
 ) -> None:
     loaded = _loaded_policy(tmp_path)
+    loaded.pins_path.chmod(0o644)
+    assert stat.S_IMODE(loaded.pins_path.stat().st_mode) == 0o644
     task = tmp_path / "task.json"
     task.write_text(
         json.dumps({"task_id": "t", "question": "q", "category": "plan", "snapshot": "snapshot"}),
@@ -630,10 +635,140 @@ def test_apply_consumes_registered_receipt_and_updates_alias_group_atomically(
     assert pins["workers"]["judge"]["sha256"] == candidate
     assert pins["workers"]["claude"]["realpath"].endswith("shared-claude")
     assert result.new_pins_sha256 == hashlib.sha256(loaded.pins_path.read_bytes()).hexdigest()
+    assert stat.S_IMODE(loaded.pins_path.stat().st_mode) == 0o600
     assert (state / "consumed" / registered.sha256).is_file()
     assert (state / "history" / f"{loaded.pins_sha256}.yaml").is_file()
 
     with pytest.raises(RuntimeError, match="consumed"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o646, 0o666])
+def test_apply_refuses_group_or_other_writable_pins(tmp_path: Path, mode: int) -> None:
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    loaded.pins_path.chmod(mode)
+
+    with pytest.raises(RuntimeError, match="group/other writable"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+
+def test_apply_refuses_symlinked_pins(tmp_path: Path) -> None:
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    target = tmp_path / "pins-target.yaml"
+    loaded.pins_path.replace(target)
+    loaded.pins_path.symlink_to(target.name)
+
+    with pytest.raises(RuntimeError, match="cannot safely open regular file"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+
+@pytest.mark.parametrize("replacement", ["hardlink", "directory"])
+def test_apply_refuses_hardlinked_or_special_pins(tmp_path: Path, replacement: str) -> None:
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    if replacement == "hardlink":
+        os.link(loaded.pins_path, tmp_path / "pins-hardlink.yaml")
+    else:
+        loaded.pins_path.unlink()
+        loaded.pins_path.mkdir()
+
+    with pytest.raises(RuntimeError, match="regular file with exactly one hard link"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+
+def test_apply_refuses_pins_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eris.refresh as refresh_module
+
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    real_fstat = os.fstat
+    pins_identity = (loaded.pins_path.stat().st_dev, loaded.pins_path.stat().st_ino)
+
+    def foreign_owner(fd: int) -> os.stat_result | SimpleNamespace:
+        observed = real_fstat(fd)
+        if (observed.st_dev, observed.st_ino) != pins_identity:
+            return observed
+        return SimpleNamespace(
+            st_mode=observed.st_mode,
+            st_nlink=observed.st_nlink,
+            st_uid=observed.st_uid + 1,
+        )
+
+    monkeypatch.setattr(refresh_module.os, "fstat", foreign_owner)
+    with pytest.raises(RuntimeError, match="owned by the current user"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+
+def test_apply_keeps_registered_receipts_owner_private(tmp_path: Path) -> None:
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    (state / "receipts" / f"{registered.sha256}.json").chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="private state file"):
         apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
 
 

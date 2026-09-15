@@ -580,7 +580,11 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _read_regular_nofollow(path: Path, *, private: bool = False) -> bytes:
+def _read_regular_nofollow(
+    path: Path,
+    *,
+    permissions: Literal["ordinary", "pins", "private"] = "ordinary",
+) -> bytes:
     if not hasattr(os, "O_NOFOLLOW"):
         raise RefreshError("safe no-follow reads are unsupported on this platform")
     try:
@@ -591,7 +595,11 @@ def _read_regular_nofollow(path: Path, *, private: bool = False) -> bytes:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
             raise RefreshError(f"{path} must be a regular file with exactly one hard link")
-        if private and stat.S_IMODE(st.st_mode) & 0o077:
+        if permissions in {"pins", "private"} and st.st_uid != os.getuid():
+            raise RefreshError(f"{path} must be owned by the current user")
+        if permissions == "pins" and stat.S_IMODE(st.st_mode) & 0o022:
+            raise RefreshError(f"pins sidecar {path} is group/other writable")
+        if permissions == "private" and stat.S_IMODE(st.st_mode) & 0o077:
             raise RefreshError(f"private state file {path} has group/other permissions")
         with os.fdopen(fd, "rb") as handle:
             fd = -1
@@ -608,7 +616,7 @@ def _write_once_private(path: Path, data: bytes) -> None:
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
-        existing = _read_regular_nofollow(path, private=True)
+        existing = _read_regular_nofollow(path, permissions="private")
         if existing != data:
             raise RefreshError(f"content-addressed state collision at {path}") from None
         return
@@ -1103,7 +1111,7 @@ def _registered_receipt(state_dir: Path, receipt_sha256: str) -> VerifyReceiptV1
     path = state_dir / "receipts" / f"{receipt_sha256}.json"
     if path.is_symlink() or not path.is_file():
         raise RefreshError(f"receipt {receipt_sha256} is not registered in local state")
-    raw = _read_regular_nofollow(path, private=True)
+    raw = _read_regular_nofollow(path, permissions="private")
     if hashlib.sha256(raw).hexdigest() != receipt_sha256:
         raise RefreshError("registered receipt bytes do not hash to their name")
     receipt = VerifyReceiptV1.model_validate(_load_strict_json(path))
@@ -1164,7 +1172,7 @@ def apply(
     if receipt.installation_id != hashlib.sha256(str(state_dir.resolve()).encode()).hexdigest():
         raise RefreshError("receipt belongs to a different local installation")
     policy_now = hashlib.sha256(_read_regular_nofollow(loaded.path)).hexdigest()
-    pins_raw = _read_regular_nofollow(loaded.pins_path, private=True)
+    pins_raw = _read_regular_nofollow(loaded.pins_path, permissions="pins")
     pins_now = hashlib.sha256(pins_raw).hexdigest()
     if policy_now != loaded.sha256 or pins_now != loaded.pins_sha256:
         raise RefreshError("policy or pins changed after receipt creation")
@@ -1273,7 +1281,7 @@ def apply(
                     "postcheck failed and rollback could not be proved"
                 ) from rollback_exc
             restored = hashlib.sha256(
-                _read_regular_nofollow(loaded.pins_path, private=True)
+                _read_regular_nofollow(loaded.pins_path, permissions="pins")
             ).hexdigest()
             if restored != pins_now:
                 raise RefreshError("postcheck failed and restored pins hash is wrong") from exc
