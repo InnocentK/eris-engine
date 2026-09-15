@@ -26,7 +26,15 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from eris.arms import ARM_ORDER, ARM_STEPS, JUDGED_ARMS
 from eris.evidence import TaskSpec
-from eris.launch import WorkerCall, build_env, resolve_user, run_worker, spawn
+from eris.launch import (
+    LaunchRefused,
+    WorkerCall,
+    build_env,
+    plan_call,
+    resolve_user,
+    run_worker,
+    spawn,
+)
 from eris.policy import LoadedPolicy, load_policy, refuse_secret_shaped, sha256_file
 from eris.schemas import SHA256_PATTERN, Arm, Stage, WorkerStatus, now_ts
 
@@ -721,9 +729,21 @@ def _reobserve_exact(item: Observation, authorized_sha256: str) -> Observation:
         item.expected_sha256,
         item.used,
     )
+    _require_safe_candidate(current)
     if current.sha256 != authorized_sha256 or current.realpath != item.realpath:
         raise RefreshError("candidate identity changed; exact-SHA authority is no longer valid")
     return current
+
+
+def _require_safe_candidate(item: Observation) -> None:
+    if (
+        item.status in (DriftStatus.MISSING, DriftStatus.UNSAFE_PATH)
+        or not item.regular_file
+        or item.realpath is None
+        or item.file_identity is None
+        or item.sha256 is None
+    ):
+        raise RefreshError("candidate path is unavailable or unsafe")
 
 
 def verify(
@@ -745,10 +765,12 @@ def verify(
         raise RefreshError(f"unknown worker {worker_id!r}")
     if not item.used:
         raise RefreshError(f"worker {worker_id!r} is unused by this campaign")
+    _require_safe_candidate(item)
     if item.sha256 != authorized_sha256:
         raise RefreshError("candidate SHA does not match the explicit authority")
-    if item.realpath is None or item.cli is None:
+    if item.cli is None:
         raise RefreshError("candidate path is unavailable or unsafe")
+    assert item.realpath is not None
     if item.kind == "worker":
         manifest: ProviderManifest | VerificationManifest = provider_manifest(item.cli)
     else:
@@ -856,6 +878,46 @@ def verify(
                 )
             )
             if isinstance(manifest, ProviderManifest):
+                worker = loaded.policy.workers[worker_id].model_copy(
+                    update={
+                        "executable": str(Path(candidate_realpath).expanduser()),
+                        "executable_sha256": authorized_sha256,
+                    }
+                )
+                manifest_call = WorkerCall(
+                    worker_id=worker_id,
+                    policy=worker,
+                    prompt="REFRESH_MANIFEST_CHECK",
+                    cwd=scratch,
+                    task_id="refresh-manifest",
+                    stage=Stage.PROPOSE,
+                    repeat_index=0,
+                    policy_sha256=loaded.sha256,
+                    user=resolve_user(),
+                    scratch_dir=scratch,
+                    home=str(scratch),
+                    tmpdir=str(scratch),
+                    path_env=loaded.policy.path_env,
+                    secrets={name: "REFRESH_MANIFEST_PLACEHOLDER" for name in worker.env_allow},
+                    snapshot_sha=hashlib.sha256(b"refresh-manifest-empty-cwd-v1").hexdigest(),
+                )
+                try:
+                    plan = plan_call(manifest_call)
+                    forbidden_ok = all(
+                        token.lower() not in arg.lower()
+                        for index, arg in enumerate(plan.argv)
+                        if index != plan.prompt_index
+                        for token in manifest.forbidden_tokens
+                    )
+                except LaunchRefused:
+                    forbidden_ok = False
+                checks.append(
+                    CheckResultV1(
+                        name="canonical_argv",
+                        status=CheckStatus.PASS if forbidden_ok else CheckStatus.FAIL,
+                        code="OK" if forbidden_ok else "FORBIDDEN_FLAG",
+                    )
+                )
                 if manifest.auth_argv is None:
                     checks.append(
                         CheckResultV1(name="auth", status=CheckStatus.UNKNOWN, code="AUTH_UNKNOWN")
@@ -1179,6 +1241,16 @@ def apply(
 
     report = detect(spec, loaded)
     item = next((entry for entry in report.items if entry.logical_id == receipt.worker_id), None)
+    if item is not None:
+        _require_safe_candidate(item)
+        if item.cli != receipt.cli:
+            raise RefreshError("receipt CLI does not match the current policy")
+        if item.kind == "worker" and item.cli is not None:
+            manifest = provider_manifest(item.cli)
+            if manifest.execution_forbidden:
+                raise RefreshError(
+                    f"{item.cli} execution is forbidden pending a stable provider audit"
+                )
     if (
         item is None
         or item.sha256 != receipt.candidate_sha256
@@ -1544,14 +1616,13 @@ def detect(spec: CampaignSpecV1, loaded: LoadedPolicy) -> DetectionReport:
     for left in range(len(observed)):
         for right in range(left + 1, len(observed)):
             a, b = observed[left], observed[right]
-            same_worker_cli = a.kind == b.kind == "worker" and a.cli == b.cli
             same_file = (
                 a.realpath is not None
                 and a.realpath == b.realpath
                 and a.file_identity is not None
                 and a.file_identity == b.file_identity
             )
-            if same_worker_cli or same_file:
+            if same_file:
                 union(left, right)
     groups: dict[int, list[int]] = {}
     for index in range(len(observed)):

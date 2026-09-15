@@ -20,7 +20,13 @@ from eris.cache import (
     CacheUnsupported,
     replay_hit,
 )
-from eris.launch import WorkerResult, idempotency_material, invocation_id_for, run_worker
+from eris.launch import (
+    WorkerResult,
+    idempotency_key,
+    idempotency_material,
+    invocation_id_for,
+    run_worker,
+)
 from eris.redact import Redactor
 from eris.schemas import SCHEMA_VERSION, Invocation, Transport, WorkerStatus, sha256_hex
 from eris.validate import validate_events
@@ -200,6 +206,30 @@ def test_hit_requirements_each_refuse(
     w = World(tmp_path, fake_process)
     miss = w.lookup(**override)
     assert isinstance(miss, CacheMiss) and reason in miss.reason, miss
+
+
+def test_a_refreshed_executable_pin_cannot_reuse_the_old_cache_entry(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    w = World(tmp_path, fake_process)
+    refreshed_sha = "e" * 64
+    refreshed_policy = w.policy.model_copy(update={"executable_sha256": refreshed_sha})
+    refreshed_call = make_call(tmp_path, refreshed_policy)
+    refreshed_key = idempotency_key(refreshed_call)
+    assert refreshed_key != w.result.idempotency_key
+
+    miss_for_new_key = w.cache.lookup(
+        idempotency_key=refreshed_key,
+        prompt_sha256=w.prompt_sha,
+        executable_sha256=refreshed_sha,
+        campaign_id=w.campaign,
+    )
+    assert isinstance(miss_for_new_key, CacheMiss)
+    assert "missing" in miss_for_new_key.reason
+
+    miss_for_stale_key = w.lookup(executable_sha256=refreshed_sha)
+    assert isinstance(miss_for_stale_key, CacheMiss)
+    assert "executable_sha256 differs" in miss_for_stale_key.reason
 
 
 def test_reuse_across_campaigns_flag_and_fresh(

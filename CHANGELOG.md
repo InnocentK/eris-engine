@@ -6,13 +6,16 @@
 
 * Add strict `eris policy refresh detect|verify|apply|preflight` operational
   contracts with exact source-runner binding, campaign-derived worker scope,
-  provider-specific audit-only manifests, typed non-secret receipts, transitive
-  alias groups, and explicit exact-SHA execution authority. Agy stays provider-
-  local REVIEW_REQUIRED and is never chased or automatically published.
+  provider-specific audit-only manifests, canonical required/forbidden argv
+  checks, typed non-secret receipts, executable-identity alias groups, and
+  explicit exact-SHA execution authority. Agy stays provider-local
+  REVIEW_REQUIRED and is never executed, chased, or automatically published.
 * Add registered single-consumption receipt CAS, content-addressed sidecar
   history, exclusive-create locking, fsynced mode-0600 atomic replacement,
   rollback after durable publication, and MANIFEST_NOT_DURABLE refusal after an
-  unproved directory fsync. Windows publication remains a documented refusal.
+  unproved directory fsync. Missing, special, hardlinked, or changing candidate
+  paths refuse before publication; Windows publication remains a documented
+  refusal.
 * Restrict `policy pin` to bootstrap missing entries; a changed existing pin
   now directs the operator to receipted refresh. The live precondition gate can
   accept explicit `ERIS_USED_WORKERS` and exact corpus/task-file scope, so unused

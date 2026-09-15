@@ -23,6 +23,7 @@ from eris.refresh import (
     DriftStatus,
     LiveProbeResult,
     RefreshNotDurable,
+    VerifyReceiptV1,
     VersionClass,
     apply,
     classify_version,
@@ -300,6 +301,41 @@ def test_detect_is_read_only_arm_aware_and_closes_alias_groups(tmp_path: Path) -
     assert all(item.version == "UNKNOWN" for item in report.items)
 
 
+def test_same_cli_on_distinct_executables_is_not_an_alias_group(tmp_path: Path) -> None:
+    loaded = _loaded_policy(tmp_path)
+    judge_locator = Path(loaded.policy.workers["judge"].executable or "")
+    distinct_judge = tmp_path / "bin" / "distinct-judge"
+    distinct_judge.write_bytes((tmp_path / "bin" / "shared-claude").read_bytes())
+    distinct_judge.chmod(0o755)
+    judge_locator.unlink()
+    judge_locator.symlink_to(distinct_judge.name)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+
+    report = detect(spec, loaded)
+    by_id = {item.logical_id: item for item in report.items}
+    assert by_id["claude"].alias_group == ("claude",)
+    assert by_id["judge"].alias_group == ("judge",)
+    assert by_id["judge"].used is False
+    assert by_id["judge"].status is DriftStatus.UNUSED_DRIFT
+
+    state = tmp_path / "pin-state"
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=by_id["claude"].sha256 or "",
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    assert registered.receipt.logical_ids == ["claude"]
+    before = yaml.safe_load(loaded.pins_path.read_text(encoding="utf-8"))["workers"]["judge"]
+    apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+    after = yaml.safe_load(loaded.pins_path.read_text(encoding="utf-8"))["workers"]["judge"]
+    assert after == before
+
+
 def test_detect_treats_changed_realpath_with_identical_bytes_as_path_only_drift(
     tmp_path: Path,
 ) -> None:
@@ -505,6 +541,88 @@ def test_verify_changed_claude_projects_typed_checks_and_never_persists_raw_outp
     assert all(call[1] is not None and "PYTHONPATH" not in call[1] for call in runner.calls)
 
 
+def test_verify_projects_forbidden_canonical_argv_as_a_failed_manifest_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eris.refresh as refresh_module
+
+    loaded = _loaded_policy(tmp_path)
+    candidate_path = tmp_path / "bin" / "shared-claude"
+    candidate_path.write_bytes(b"new-claude")
+    candidate = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    manifest = provider_manifest("claude")
+    runner = CannedRunner(
+        [
+            b"2.1.274 (Claude Code)",
+            " ".join(sorted(manifest.required_help_tokens)).encode(),
+            b'{"loggedIn":true}',
+        ]
+    )
+    monkeypatch.setattr(
+        refresh_module,
+        "plan_call",
+        lambda _call: SimpleNamespace(
+            argv=[str(candidate_path), "--bare", "REFRESH_MANIFEST_CHECK"],
+            prompt_index=2,
+        ),
+    )
+
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=tmp_path / "pin-state",
+        runner=runner,
+    )
+
+    check = next(item for item in registered.receipt.checks if item.name == "canonical_argv")
+    assert check.status is CheckStatus.FAIL
+    assert check.code == "FORBIDDEN_FLAG"
+    assert registered.receipt.decision is Decision.REVIEW_REQUIRED
+
+
+def test_verify_stops_when_candidate_identity_changes_during_a_check(tmp_path: Path) -> None:
+    loaded = _loaded_policy(tmp_path)
+    candidate_path = tmp_path / "bin" / "shared-claude"
+    candidate_path.write_bytes(b"new-claude")
+    authorized_sha = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    calls = 0
+
+    def replacing_runner(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        cwd: Path,
+        timeout_s: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> CommandResult:
+        nonlocal calls
+        calls += 1
+        candidate_path.write_bytes(b"replacement-during-verification")
+        return CommandResult(0, b"2.1.274", b"", False, False, False)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        verify(
+            spec,
+            loaded,
+            worker_id="claude",
+            authorized_sha256=authorized_sha,
+            state_dir=tmp_path / "pin-state",
+            runner=replacing_runner,
+        )
+
+    assert calls == 1
+    assert not (tmp_path / "pin-state" / "receipts").exists()
+
+
 def test_live_probe_is_claimed_durably_before_call_and_never_retried(
     tmp_path: Path,
 ) -> None:
@@ -594,6 +712,76 @@ def test_verify_authority_mismatch_or_unused_worker_executes_nothing(tmp_path: P
             runner=runner,
         )
     assert runner.calls == []
+
+
+@pytest.mark.parametrize("unsafe_shape", ["hardlink", "fifo"])
+def test_verify_refuses_unsafe_candidate_paths_before_execution(
+    tmp_path: Path, unsafe_shape: str
+) -> None:
+    if unsafe_shape == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo is unavailable on this platform")
+    loaded = _loaded_policy(tmp_path)
+    locator = Path(loaded.policy.workers["claude"].executable or "")
+    candidate = tmp_path / "bin" / "shared-claude"
+    authorized_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    if unsafe_shape == "hardlink":
+        os.link(candidate, tmp_path / "bin" / "shared-claude-hardlink")
+    else:
+        locator.unlink()
+        os.mkfifo(locator)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    runner = CannedRunner([])
+
+    with pytest.raises(RuntimeError, match="unavailable or unsafe"):
+        verify(
+            spec,
+            loaded,
+            worker_id="claude",
+            authorized_sha256=authorized_sha,
+            state_dir=tmp_path / "pin-state",
+            runner=runner,
+        )
+
+    assert runner.calls == []
+    assert not (tmp_path / "pin-state" / "receipts").exists()
+
+
+@pytest.mark.parametrize("unsafe_shape", ["hardlink", "fifo"])
+def test_apply_rederives_and_refuses_candidate_paths_that_became_unsafe(
+    tmp_path: Path, unsafe_shape: str
+) -> None:
+    if unsafe_shape == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo is unavailable on this platform")
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = tmp_path / "bin" / "shared-claude"
+    authorized_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=authorized_sha,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    prior_pins = loaded.pins_path.read_bytes()
+    if unsafe_shape == "hardlink":
+        os.link(candidate, tmp_path / "bin" / "shared-claude-hardlink")
+    else:
+        locator = Path(loaded.policy.workers["claude"].executable or "")
+        locator.unlink()
+        os.mkfifo(locator)
+
+    with pytest.raises(RuntimeError, match="unavailable or unsafe"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+    assert loaded.pins_path.read_bytes() == prior_pins
+    assert not (state / "consumed" / registered.sha256).exists()
 
 
 def test_apply_consumes_registered_receipt_and_updates_alias_group_atomically(
@@ -802,6 +990,158 @@ def test_apply_refuses_unregistered_and_noneligible_receipts(tmp_path: Path) -> 
     assert registered.receipt.decision is Decision.REVIEW_REQUIRED
     with pytest.raises(RuntimeError, match="not eligible"):
         apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+
+def test_apply_refuses_windows_before_any_state_or_pin_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eris.refresh as refresh_module
+
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    prior = loaded.pins_path.read_bytes()
+    monkeypatch.setattr(refresh_module.os, "name", "nt")
+
+    with pytest.raises(RuntimeError, match="refused on Windows"):
+        apply(spec, loaded, receipt_sha256="a" * 64, state_dir=tmp_path / "pin-state")
+
+    assert loaded.pins_path.read_bytes() == prior
+    assert not (tmp_path / "pin-state").exists()
+
+
+def test_apply_exclusive_create_lock_refuses_a_concurrent_writer(tmp_path: Path) -> None:
+    loaded = _loaded_policy(tmp_path)
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["claude"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    candidate = hashlib.sha256((tmp_path / "bin" / "shared-claude").read_bytes()).hexdigest()
+    registered = verify(
+        spec,
+        loaded,
+        worker_id="claude",
+        authorized_sha256=candidate,
+        state_dir=state,
+        runner=CannedRunner([]),
+    )
+    prior = loaded.pins_path.read_bytes()
+    lock = state / "refresh.lock"
+    lock.write_text("concurrent writer", encoding="utf-8")
+    lock.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="never automatically broken"):
+        apply(spec, loaded, receipt_sha256=registered.sha256, state_dir=state)
+
+    assert loaded.pins_path.read_bytes() == prior
+    assert lock.read_text(encoding="utf-8") == "concurrent writer"
+    assert not (state / "consumed" / registered.sha256).exists()
+
+
+def test_agy_verify_and_apply_are_both_refused_without_execution_or_pin_write(
+    tmp_path: Path,
+) -> None:
+    loaded = _loaded_policy(tmp_path)
+    agy_path = tmp_path / "bin" / "agy"
+    agy_path.write_bytes(b"agy")
+    agy_path.chmod(0o755)
+    agy_sha = hashlib.sha256(agy_path.read_bytes()).hexdigest()
+    agy_worker = loaded.policy.workers["claude"].model_copy(
+        update={
+            "cli": "agy",
+            "provider": "google",
+            "model": "gemini-3-pro-preview",
+            "executable": str(agy_path),
+            "executable_sha256": agy_sha,
+        }
+    )
+    loaded = LoadedPolicy(
+        loaded.policy.model_copy(
+            update={
+                "vendors_allowed": [*loaded.policy.vendors_allowed, "google"],
+                "workers": {**loaded.policy.workers, "agy": agy_worker},
+            }
+        ),
+        loaded.path,
+        loaded.sha256,
+        loaded.pins_path,
+        loaded.pins_sha256,
+    )
+    pins = yaml.safe_load(loaded.pins_path.read_text(encoding="utf-8"))
+    pins["workers"]["agy"] = {
+        "executable": str(agy_path),
+        "realpath": str(agy_path.resolve()),
+        "sha256": agy_sha,
+        "version": "1.1.18",
+        "pinned_at": "2026-09-15T00:00:00Z",
+    }
+    loaded.pins_path.write_text(yaml.safe_dump(pins, sort_keys=True), encoding="utf-8")
+    loaded = LoadedPolicy(
+        loaded.policy,
+        loaded.path,
+        loaded.sha256,
+        loaded.pins_path,
+        hashlib.sha256(loaded.pins_path.read_bytes()).hexdigest(),
+    )
+    spec = CampaignSpecV1.model_validate(
+        _spec(tmp_path, arms=["single"], panel=["agy"], critics=[])
+    )
+    state = tmp_path / "pin-state"
+    runner = CannedRunner([])
+
+    with pytest.raises(RuntimeError, match="execution is forbidden"):
+        verify(
+            spec,
+            loaded,
+            worker_id="agy",
+            authorized_sha256=agy_sha,
+            state_dir=state,
+            runner=runner,
+        )
+    assert runner.calls == []
+
+    state.mkdir(mode=0o700)
+    receipts = state / "receipts"
+    receipts.mkdir(mode=0o700)
+    forged = VerifyReceiptV1(
+        manifest_version=1,
+        installation_id=hashlib.sha256(str(state.resolve()).encode()).hexdigest(),
+        helper_revision=spec.candidate_revision,
+        campaign_spec_sha256=spec.sha256,
+        policy_sha256=loaded.sha256,
+        old_pins_sha256=loaded.pins_sha256,
+        logical_ids=["agy"],
+        worker_id="agy",
+        cli="agy",
+        candidate_sha256=agy_sha,
+        previous_sha256=agy_sha,
+        candidate_realpath=str(agy_path.resolve()),
+        previous_version="1.1.18",
+        candidate_version="1.1.18",
+        version_class=VersionClass.PATH_ONLY,
+        checks=[],
+        decision=Decision.ELIGIBLE,
+        stable_bracket=True,
+        probe_count=0,
+        reported_cost_usd=None,
+        cost_ceiling_enforced=False,
+        model_requested="gemini-3-pro-preview",
+        model_executed="UNKNOWN",
+        created_at="2026-09-15T00:00:00Z",
+    )
+    raw = forged.canonical_bytes()
+    receipt_sha = hashlib.sha256(raw).hexdigest()
+    receipt_path = receipts / f"{receipt_sha}.json"
+    receipt_path.write_bytes(raw)
+    receipt_path.chmod(0o600)
+    prior = loaded.pins_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="execution is forbidden"):
+        apply(spec, loaded, receipt_sha256=receipt_sha, state_dir=state)
+
+    assert loaded.pins_path.read_bytes() == prior
+    assert not (state / "consumed" / receipt_sha).exists()
 
 
 def test_apply_postcheck_failure_restores_prior_generation_and_consumes_receipt(

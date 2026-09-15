@@ -66,6 +66,11 @@ exist.
 - Apply accepts only a locally registered canonical receipt digest, reparses
   and re-hashes it, re-derives scope, aliases, observations, version decision,
   and all CAS inputs, then consumes the receipt before mutation.
+- Candidate safety is re-derived at verify, around every candidate execution,
+  and again at apply. Missing, special, hardlinked, or identity-changing paths
+  refuse. Alias closure is based on shared realpath plus device/inode identity,
+  never merely a common CLI label. Generated canonical argv is checked against
+  each provider manifest's forbidden-token set and recorded as a typed result.
 - Publication uses an exclusive-create lock that is never automatically
   broken, immutable content-addressed history, mode-0600 same-directory temp,
   file fsync, strict reload/secret scan/authorized-diff, `os.replace`, and
@@ -110,16 +115,29 @@ Candidate validation at exact worktree base `5dab66f7ae92ca6bd09ebbbed8c0b049a19
   private-state refusal tests, and reran the exact focused command: PASS.
 - `bash -n eval/live_preconditions.sh`: PASS.
 - `git diff --check`: PASS.
-- Exact `task ci`: PASS — Ruff check and format clean; mypy clean for 21 source
-  and 4 eval files; 1,310 tests passed; 93.49% total coverage against a 90%
-  floor; `pip-audit` reported no known vulnerabilities.
+- Advisor-remediation focused command (`test_refresh`, `test_policy`,
+  `test_cache`, `test_launch`, `test_hermeticity`, `test_doctor`, and
+  `test_invariants_doc`): PASS.
+- The first remediation `task ci` stopped at Ruff's import-format check; the
+  import block was corrected before any later gate. Final exact `task ci`:
+  PASS — Ruff check and format clean; mypy clean for 21 source and 4 eval
+  files; 1,321 tests passed; 93.58% total coverage against a 90% floor;
+  `pip-audit` reported no known vulnerabilities.
 
 No live provider, network, campaign, pin publication, merge, push, tag, or
 release was performed. The suite injected every process/probe behavior.
 
 ## Review, residual risk, and rollback
 
-Implementation model/family: GPT-5.6/OpenAI. The required xAI advisor and later
+Implementation model/family: GPT-5.6/OpenAI. The required xAI advisor round 1
+reproduced two High findings: unsafe hardlinked candidates
+could reach verify/apply, and same-CLI/different-file workers were incorrectly
+grouped. It also raised a Medium dead forbidden-token manifest field and missing
+named safety/portability tests. All are remediated: unsafe paths now refuse at
+every boundary, aliases use executable identity only, canonical argv produces a
+typed forbidden-token check, agy refusal is re-derived by apply, and tests now
+cover identity replacement, Windows refusal, exclusive-lock contention, and
+cache invalidation after a pin SHA change. Advisor confirmation and the later
 independent final review remain pending at this handoff. Known residuals are same-user malicious vendor
 bytes, absent independently trusted vendor checksums, possible network/model
 spend by arbitrary candidate bytes, UNKNOWN Codex/agy executed identity,
