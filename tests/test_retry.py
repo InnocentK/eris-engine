@@ -5,6 +5,7 @@ between attempts; writer errors propagate)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -141,6 +142,67 @@ def test_pattern_table_is_data_and_every_entry_names_a_class() -> None:
     assert classify(res, schema_requested=False).error_class is ErrorClass.AUTH_TERMINAL
     res = _absent_like(WorkerStatus.FAILED, "something 401 Unauthorized", argv=["/x/grok"])
     assert classify(res, schema_requested=False).error_class is ErrorClass.UNKNOWN
+
+
+def test_versioned_executable_no_prefix_error_classifies_by_policy_cli(
+    tmp_path: Path, fake_process: Callable[..., FakeProcessFactory]
+) -> None:
+    """v2 live regression (runs/v2/plan-restore-drill-r0-indep_verify): the
+    pinned claude executable is the VERSIONED file `.../claude/versions/2.1.272`
+    and the session-limit error is verbatim vendor text with NO `claude:`
+    prefix, so both identity fallbacks (argv[0] basename, error prefix) failed
+    and the known ceiling fell through to UNKNOWN, losing the cell. The
+    canonical identity is the configured `policy.cli`, carried on the result;
+    it must classify POLICY_TERMINAL for the worker `claude` AND the judge
+    (adjudicate stage) running the SAME versioned binary. The old fixtures
+    masked this: their fake executable was literally named `claude`."""
+    exe = tmp_path / "versions" / "2.1.272"
+    exe.parent.mkdir(exist_ok=True)
+    exe.write_bytes(b"#!/bin/sh\n")
+    stdout = fixture("claude", "2.1.252", "session_limit_429.json")
+    for worker_id, stage in (("claude", Stage.PROPOSE), ("judge", Stage.ADJUDICATE)):
+        policy = make_policy(
+            tmp_path,
+            "claude",
+            provider="anthropic",
+            model=None,
+            executable=str(exe),
+            executable_sha256=hashlib.sha256(exe.read_bytes()).hexdigest(),
+        )
+        res = run_worker(
+            make_call(tmp_path, policy, worker_id=worker_id, stage=stage),
+            popen=fake_process(stdout=stdout, returncode=0),
+            killpg=lambda *_: None,
+        )
+        # the live shape, asserted so a fixture rename cannot re-mask the bug
+        assert res.argv[0].rsplit("/", 1)[-1] == "2.1.272"
+        assert res.error is not None and "hit your session limit" in res.error
+        assert not res.error.startswith("claude:")  # verbatim vendor text
+        cls = classify(res, schema_requested=False, stage=stage)
+        assert cls.error_class is ErrorClass.POLICY_TERMINAL and cls.terminal, (
+            worker_id,
+            cls,
+            res.error,
+        )
+        assert res.cli == "claude"  # canonical identity stamped by run_worker
+    # isolation is preserved under canonical identity: the same error text on
+    # a NON-claude worker does not fire the claude-scoped pattern, whatever
+    # its argv[0] basename says
+    other = _absent_like(
+        WorkerStatus.FAILED,
+        "You've hit your session limit · resets 3:10am (America/New_York)",
+        argv=["/x/versions/2.1.272"],
+        cli="grok",
+    )
+    assert classify(other, schema_requested=False).error_class is ErrorClass.UNKNOWN
+    # canonical identity outranks a lying basename in BOTH directions
+    named_claude = _absent_like(
+        WorkerStatus.FAILED,
+        "You've hit your session limit · resets 3:10am (America/New_York)",
+        argv=["/x/claude"],
+        cli="grok",
+    )
+    assert classify(named_claude, schema_requested=False).error_class is ErrorClass.UNKNOWN
 
 
 # --------------------------------------------------------------------------- status rules

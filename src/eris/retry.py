@@ -83,7 +83,9 @@ JUDGE_STAGES: frozenset[Stage] = frozenset({Stage.ADJUDICATE, Stage.SUMMARIZE})
 
 @dataclass(frozen=True)
 class ErrorPattern:
-    """``cli`` None = any worker; ``regex`` is searched in the error text."""
+    """``cli`` None = any worker; matched against the CANONICAL worker
+    identity (:func:`_cli_of`: the configured ``policy.cli`` carried on the
+    result). ``regex`` is searched in the error text."""
 
     cli: str | None
     regex: str
@@ -192,8 +194,19 @@ def classify(
 
 
 def _cli_of(result: WorkerResult, argv0_name: str | None) -> str | None:
-    """The worker CLI name: from the error prefix (``claude: …``) when the
-    parser set one, else from argv[0]'s basename."""
+    """The worker CLI identity, canonical first: ``result.cli`` is the
+    configured ``policy.cli`` that selected the parser producing this result,
+    stamped by ``run_worker``/``_absent``. The error prefix (``claude: …``)
+    and argv[0]'s basename are FALLBACKS for results that predate the field
+    (hand-built fixtures; cache replays are status OK and never reach the
+    pattern table). Neither fallback is trustworthy alone - live v2
+    (runs/v2/plan-restore-drill-r0-indep_verify): the pinned claude
+    executable is the versioned file ``.../claude/versions/2.1.272`` and the
+    session-limit result is verbatim vendor text with no prefix, so the
+    basename said ``2.1.272``, the prefix said nothing, and a known ceiling
+    fell through to UNKNOWN."""
+    if result.cli is not None:
+        return result.cli
     error = result.error or ""
     for name in ("claude", "codex", "agy", "grok"):
         if error.startswith(name + ":"):

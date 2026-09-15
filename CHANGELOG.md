@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.4 - worker identity is configured, not guessed from argv (2026-09-15)
+
+v2's four incomplete cells shared one cause: the vendor session ceiling -
+named POLICY_TERMINAL since the v1 capture - fell through to UNKNOWN again,
+because the classifier could not tell the failing worker was claude. The
+claude 2.1.272 re-pin resolves to the versioned executable
+`~/.local/share/claude/versions/2.1.272` (preflight deliberately executes
+the hashed realpath), so argv[0]'s basename said `2.1.272`; the session-limit
+error is verbatim vendor text, so there was no `claude:` prefix. Both
+identity fallbacks failed at once, live, and the fixture suite never noticed
+because its fake executables are files literally named `claude`.
+
+* `WorkerResult.cli`: the configured `policy.cli` that selected the parser,
+  stamped at both construction sites (`run_worker`, `_absent`). The retry
+  classifier's CLI-scoped patterns now match THIS canonical identity;
+  error-prefix and basename guessing survive only as fallbacks for results
+  that predate the field. The canonical identity also vetoes a lying
+  basename: a non-claude worker whose argv[0] is literally `claude` no
+  longer fires claude's patterns. The pattern table itself is unchanged.
+* Regression test reproduces the live shape end-to-end through `run_worker`
+  (versioned basename, captured session-limit envelope, no prefix) for both
+  the worker `claude` and the configured `judge` on the same binary;
+  verified failing at the pre-fix revision with the exact live
+  misclassification.
+* v2 scored and frozen; W1-W5 adjudicated in
+  `docs/decisions/2026-09-15-v2-results-and-session-limit-identity.md`
+  (W1/W2/W4/W5 falsified wholly or as conjunctions, W3 indeterminate -
+  trigger not reached). `runs/v2` and `summaries/v2.json` are untouched.
+
 ## 0.4.3 - the scorer is bound to what it scored (2026-08-30)
 
 Two multi-family review rounds against Phase A - a three-family panel (OpenAI /

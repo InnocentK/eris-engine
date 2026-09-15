@@ -1284,6 +1284,16 @@ class WorkerResult:
     stderr_truncated: bool
     timed_out: bool
     parse_mode: str
+    # Canonical worker identity: the configured ``policy.cli`` that selected
+    # the parser producing this result. The retry classifier keys its
+    # CLI-scoped patterns on THIS, never on argv[0]'s basename - the pinned
+    # claude executable is the versioned file ``.../claude/versions/2.1.272``,
+    # and a verbatim vendor error carries no ``claude:`` prefix, so identity
+    # guessed from either misrouted a known session ceiling to UNKNOWN (v2,
+    # runs/v2/plan-restore-drill-r0-indep_verify). None only for shapes that
+    # predate the field: cache replays (status OK, never pattern-classified)
+    # and hand-built test results.
+    cli: str | None = None
     models_used: list[str] = field(default_factory=list)
     output_file: bytes | None = None  # codex `-o` last message: read into memory, file deleted
     output_file_truncated: bool = False  # True when the `-o` file exceeded max_stdout_bytes
@@ -1323,6 +1333,7 @@ def _absent(call: WorkerCall, status: WorkerStatus, error: str, key: str = "") -
         stderr_truncated=False,
         timed_out=False,
         parse_mode="none",
+        cli=call.policy.cli,
     )
 
 
@@ -1558,6 +1569,7 @@ def _execute(
         stderr_truncated=spawned.stderr_truncated,
         timed_out=spawned.timed_out,
         parse_mode=envelope.parse_mode,
+        cli=w.cli,
         models_used=envelope.models_used,
         output_file=output_file,
         output_file_truncated=output_truncated,
