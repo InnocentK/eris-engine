@@ -141,23 +141,26 @@ release was performed. The suite injected every process/probe behavior.
 
 ## Review, residual risk, and rollback
 
-Implementation model/family: GPT-5.6/OpenAI. The required xAI advisor round 1
-reproduced two High findings: unsafe hardlinked candidates
-could reach verify/apply, and same-CLI/different-file workers were incorrectly
+Implementation model/family: GPT-5.6/OpenAI. The required xAI advisor completed
+after one changes-request round and reproduced two High findings: unsafe
+hardlinked candidates could reach verify/apply, and same-CLI/different-file
+workers were incorrectly
 grouped. It also raised a Medium dead forbidden-token manifest field and missing
 named safety/portability tests. All are remediated: unsafe paths now refuse at
 every boundary, aliases use executable identity only, canonical argv produces a
 typed forbidden-token check, agy refusal is re-derived by apply, and tests now
 cover identity replacement, Windows refusal, exclusive-lock contention, and
-cache invalidation after a pin SHA change. The independent final review later
-returned REVISE for three gaps: retained MANIFEST_NOT_DURABLE state did not gate
-a fresh preflight, API workers were
+cache invalidation after a pin SHA change. The independent OpenAI final review
+later returned REVISE for three gaps: retained MANIFEST_NOT_DURABLE state did
+not gate a fresh preflight, API workers were
 absent from doctor scope and Grok credentials were keyed to one logical id, and
 candidate-reported model identity could reach failed receipts unscreened. The
 bounded remediation adds state-first refusal, all-transport/CLI-separated
 scopes with policy-derived credentials, and bounded/secret-scanned receipt
-identity. Confirmation review and the exact-revision gate remain pending. Known
-residuals are same-user malicious vendor bytes, absent independently trusted
+identity. The confirmation review returned SHIP-to-final-gate after mechanically
+confirming those remediations, and the exact xAI gate returned
+`SHIP_TO_HUMAN_INTEGRATION_DECISION`. Known residuals are same-user malicious
+vendor bytes, absent independently trusted
 vendor checksums, possible network/model
 spend by arbitrary candidate bytes, UNKNOWN Codex/agy executed identity,
 incomplete secret-shape detection, pathname ABA/hash-to-exec races, and weaker
@@ -170,6 +173,8 @@ machine-local sidecar recovery uses the named content-addressed prior generation
 and requires an operator to prove the expected SHA before removing any retained
 lock/journal.
 
-Recommendation: REVISE pending the xAI advisor, independent final review, and
-exact-revision gate. The implementation and local gates are complete; no
-integration or publication is authorized.
+Recommendation: `SHIP_TO_HUMAN_INTEGRATION_DECISION`. This is a recommendation
+for a fresh human integration decision, not integration authority: local
+integration remains unperformed. The rollout remains audit-only, agy remains
+quarantined as `REVIEW_REQUIRED`, and no provider patch auto-publication or
+provider enablement is authorized.
