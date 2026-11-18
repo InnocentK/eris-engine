@@ -64,5 +64,5 @@ only in `.env` (see `.env.example`).
 
 ## License
 
-Not yet decided — see `docs/decisions/`. Treat as all rights reserved until a
-license file is added.
+Copyright 2026 Innocent Kironji. Licensed under the Apache License, Version 2.0;
+see `LICENSE`.
