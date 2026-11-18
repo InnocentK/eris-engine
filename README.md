@@ -39,6 +39,11 @@ harness in this repository exists to run that experiment honestly:
   `campaign` / `campaign status`; `eval/score.py` — the read-only scorer;
   `eval/prompts/` — the frozen stage prompts.
 
+**Results so far:** the question above is not answered yet. See
+[`docs/decisions/2026-11-18-results-to-date.md`](docs/decisions/2026-11-18-results-to-date.md)
+for what six pilot and validation campaigns measured and what they found
+wrong with the harness itself.
+
 See `docs/PROTOCOL.md` for the protocol, `docs/EVAL-PLAN.md` for the
 experiment, `docs/SECURITY.md` for the threat model, and `AGENTS.md` for how
 work is done here.
